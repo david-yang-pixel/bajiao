@@ -195,3 +195,61 @@
    - 飞书/企微 Webhook 发送连通性测试。
 3. **E2E / 页面联调**：
    - 控制台启动后，添加一条持仓记录，验证前后端数据通信与实时走势刷新。
+
+---
+
+## 7. 容器化与 Docker 部署设计 (Docker Deployment Architecture)
+
+为了实现开箱即用、一键启停和云服务器/NAS/本地主机的便捷运维，系统采用 **标准化 Docker + Docker Compose** 架构。
+
+### 7.1 镜像打包方案（多阶段构建 Multi-stage Build）
+- **构建阶段 (Stage 1: Frontend Builder)**：
+  - 基于 Node.js 轻量镜像，执行前端静态资源打包（`pnpm run build`），生成紧凑的高性能前端文件。
+- **运行阶段 (Stage 2: Python Runner)**：
+  - 基于官方轻量级 `python:3.11-slim` 镜像。
+  - 安装 Python 依赖（FastAPI, Uvicorn, APScheduler, httpx, pandas 等）。
+  - 将构建好的前端产物打包至后端静态资源目录，由 FastAPI 直接挂载托管（统一对外暴露单个端口，无需额外配置复杂的 Nginx 反代）。
+  - 启动命令：`uvicorn app.main:app --host 0.0.0.0 --port 8000`。
+
+### 7.2 数据持久化与卷挂载 (Volume Mapping)
+容器运行为无状态，所有业务数据与日志通过宿主机卷挂载持久化：
+- `./data:/app/data`：挂载 SQLite 数据库文件（如 `data/bstocks.db`），保证容器重启、更新或迁移时持仓数据与监控配置永不丢失。
+- `./logs:/app/logs`：持久化调度与告警日志，方便排查。
+
+### 7.3 Docker Compose 配置规范 (`docker-compose.yml`)
+```yaml
+version: '3.8'
+
+services:
+  bstocks-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: binance-bstocks-bot
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+```
+
+### 7.4 环境变量配置 (`.env.example`)
+提供完备的环境变量模板，用户仅需在 `.env` 中填写必要凭据即可一键拉起：
+- `APP_PORT=8000`
+- `LLM_API_KEY=sk-xxx`
+- `LLM_BASE_URL=https://api.openai.com/v1` (支持自定义代理或 DeepSeek/Claude)
+- `LLM_MODEL=gpt-4o` (或 deepseek-chat 等)
+- `FEISHU_WEBHOOK_URL=` (选填，支持控制台动态配置)
+- `WECOM_WEBHOOK_URL=` (选填，支持控制台动态配置)
+- `BINANCE_API_KEY=` / `BINANCE_API_SECRET=` (用于自动同步持仓)
+
