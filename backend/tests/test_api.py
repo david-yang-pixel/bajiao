@@ -222,4 +222,87 @@ async def test_daily_picks_lifecycle_and_clear(tmp_path, monkeypatch):
         picks_res3 = await ac.get("/api/analysis/picks")
         assert len(picks_res3.json()) == 0
 
+@pytest.mark.asyncio
+async def test_position_with_include_ai_analysis_alert(tmp_path, monkeypatch):
+    db_file = str(tmp_path / "test_ai_pos.db")
+    monkeypatch.setattr("backend.app.config.settings.DB_PATH", db_file)
+    await init_db(db_file)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        # Create position with include_ai_analysis=True
+        create_res = await ac.post("/api/positions", json={
+            "symbol": "NVDAUSDT",
+            "buy_price": 120.0,
+            "quantity": 10.0,
+            "check_interval_hours": 0.5,
+            "include_ai_analysis": True
+        })
+        assert create_res.status_code == 200
+        pos_id = create_res.json()["id"]
+
+        mock_analysis = {
+            "symbol": "NVDAUSDT",
+            "reason": "突破均线，短线量价配合良好",
+            "target_price": 128.0,
+            "stop_loss_price": 116.0
+        }
+
+        with patch("backend.app.main.binance_client.get_ticker_price", new_callable=AsyncMock) as mock_p, \
+             patch("backend.app.main.position_monitor.get_symbol_trend_analysis", new_callable=AsyncMock) as mock_trend, \
+             patch("backend.app.main.notification_service.send_position_alert", new_callable=AsyncMock) as mock_alert:
+            mock_p.return_value = 122.50
+            mock_trend.return_value = mock_analysis
+            mock_alert.return_value = True
+
+            test_res = await ac.post(f"/api/positions/{pos_id}/test-alert")
+            assert test_res.status_code == 200
+            assert test_res.json()["success"] is True
+
+            # Verify get_symbol_trend_analysis was called
+            mock_trend.assert_called_once_with("NVDAUSDT")
+            # Verify notification_service was called with trend_analysis
+            mock_alert.assert_called_once()
+            call_kwargs = mock_alert.call_args[1]
+            assert call_kwargs["trend_analysis"] == mock_analysis
+
+        # Test updating include_ai_analysis to False
+        up_res = await ac.put(f"/api/positions/{pos_id}", json={
+            "include_ai_analysis": False
+        })
+        assert up_res.status_code == 200
+
+        # Verify it is now False
+        get_res = await ac.get("/api/positions")
+        assert get_res.status_code == 200
+        assert get_res.json()[0]["include_ai_analysis"] in (0, False)
+
+@pytest.mark.asyncio
+async def test_system_config_ai_picks_push_schedule(tmp_path, monkeypatch):
+    db_file = str(tmp_path / "test_cfg_sched.db")
+    monkeypatch.setattr("backend.app.config.settings.DB_PATH", db_file)
+    await init_db(db_file)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        # Default config
+        cfg_res = await ac.get("/api/config")
+        assert cfg_res.status_code == 200
+        assert cfg_res.json()["ai_picks_push_enabled"] is False
+        assert cfg_res.json()["ai_picks_push_time"] == "21:30"
+
+        # Update schedule config
+        save_res = await ac.post("/api/config", json={
+            "ai_picks_push_enabled": True,
+            "ai_picks_push_time": "21:20"
+        })
+        assert save_res.status_code == 200
+
+        # Re-fetch
+        cfg_res2 = await ac.get("/api/config")
+        assert cfg_res2.status_code == 200
+        assert cfg_res2.json()["ai_picks_push_enabled"] is True
+        assert cfg_res2.json()["ai_picks_push_time"] == "21:20"
+
+
 

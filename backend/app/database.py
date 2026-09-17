@@ -12,11 +12,18 @@ async def init_db(db_path: str = None):
                 quantity REAL NOT NULL,
                 take_profit_price REAL,
                 stop_loss_price REAL,
-                check_interval_hours INTEGER DEFAULT 1,
+                check_interval_hours REAL DEFAULT 0.5,
                 ladder_alerts TEXT DEFAULT '[]',
+                include_ai_analysis BOOLEAN DEFAULT 0,
                 is_active BOOLEAN DEFAULT 1
             )
         """)
+
+        # Migration: add include_ai_analysis to existing tables if missing
+        try:
+            await db.execute("ALTER TABLE positions ADD COLUMN include_ai_analysis BOOLEAN DEFAULT 0")
+        except Exception:
+            pass
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS daily_picks (

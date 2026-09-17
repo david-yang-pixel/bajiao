@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
 import json
 import logging
 import os
@@ -36,7 +37,9 @@ analysis_agent = AnalysisAgent()
 notification_service = NotificationService()
 position_monitor = PositionMonitor(
     binance_client=binance_client,
-    notification_service=notification_service
+    notification_service=notification_service,
+    quant_screener=quant_screener,
+    analysis_agent=analysis_agent
 )
 
 async def apply_runtime_config():
@@ -79,10 +82,13 @@ async def apply_runtime_config():
 
 # Background worker loop
 _monitor_task = None
+_last_ai_picks_push_date = ""
 
 async def background_monitoring_loop():
+    global _last_ai_picks_push_date
     logger.info("Background position monitoring loop started.")
     tick_count = 0
+    tz_bj = timezone(timedelta(hours=8))
     while True:
         try:
             await asyncio.sleep(60)
@@ -96,6 +102,29 @@ async def background_monitoring_loop():
                     await perform_binance_sync(min_notional=1.0)
                 except Exception as sync_err:
                     logger.warning(f"Periodic binance sync warning: {sync_err}")
+
+            # Check daily scheduled AI stock picks push (Beijing Time UTC+8)
+            try:
+                now_bj = datetime.now(tz_bj)
+                current_hm = now_bj.strftime("%H:%M")
+                today_date = now_bj.strftime("%Y-%m-%d")
+
+                async with aiosqlite.connect(settings.DB_PATH) as db:
+                    db.row_factory = aiosqlite.Row
+                    cursor = await db.execute(
+                        "SELECT key, value FROM system_configs WHERE key IN ('ai_picks_push_enabled', 'ai_picks_push_time')"
+                    )
+                    rows = await cursor.fetchall()
+                    sched_cfg = {r["key"]: r["value"] for r in rows}
+                    is_sched_enabled = sched_cfg.get("ai_picks_push_enabled") in ("1", "true", "True", True)
+                    sched_time = sched_cfg.get("ai_picks_push_time") or "21:30"
+
+                    if is_sched_enabled and current_hm == sched_time and _last_ai_picks_push_date != today_date:
+                        _last_ai_picks_push_date = today_date
+                        logger.info(f"Triggering scheduled daily AI stock picks push for {today_date} at {current_hm} (Beijing Time)...")
+                        await run_daily_analysis()
+            except Exception as sched_err:
+                logger.error(f"Error checking scheduled AI picks push: {sched_err}")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -245,8 +274,8 @@ async def create_position(pos: PositionCreate):
         ladder_json = json.dumps(pos.ladder_alerts)
         cursor = await db.execute(
             """
-            INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 pos.symbol.upper(),
@@ -255,7 +284,8 @@ async def create_position(pos: PositionCreate):
                 pos.take_profit_price,
                 pos.stop_loss_price,
                 pos.check_interval_hours,
-                ladder_json
+                ladder_json,
+                1 if pos.include_ai_analysis else 0
             )
         )
         await db.commit()
@@ -290,6 +320,9 @@ async def update_position(position_id: int, pos: PositionUpdate):
         if pos.ladder_alerts is not None:
             updates.append("ladder_alerts = ?")
             params.append(json.dumps(pos.ladder_alerts))
+        if pos.include_ai_analysis is not None:
+            updates.append("include_ai_analysis = ?")
+            params.append(1 if pos.include_ai_analysis else 0)
 
         if updates:
             params.append(position_id)
@@ -343,13 +376,18 @@ async def test_position_alert(position_id: int):
 
     note = f"手动点击测试（当前设定周期: {interval_str}）"
 
+    trend_analysis = None
+    if bool(pos.get("include_ai_analysis")):
+        trend_analysis = await position_monitor.get_symbol_trend_analysis(pos["symbol"])
+
     sent = await notification_service.send_position_alert(
         symbol=pos["symbol"],
         buy_price=buy_price,
         curr_price=curr_price,
         pnl_pct=pnl_pct,
         alert_type="periodic",
-        extra_note=note
+        extra_note=note,
+        trend_analysis=trend_analysis
     )
 
     if not sent:
@@ -584,7 +622,9 @@ async def get_system_config():
         "openai_model": cfg.get("openai_model") or "gpt-4o-mini",
         "has_openai_key": bool(raw_openai_key),
         "feishu_webhook_url": cfg.get("feishu_webhook_url") or settings.FEISHU_WEBHOOK_URL or "",
-        "wecom_webhook_url": cfg.get("wecom_webhook_url") or settings.WECOM_WEBHOOK_URL or ""
+        "wecom_webhook_url": cfg.get("wecom_webhook_url") or settings.WECOM_WEBHOOK_URL or "",
+        "ai_picks_push_enabled": cfg.get("ai_picks_push_enabled") in ("1", "true", "True", True),
+        "ai_picks_push_time": cfg.get("ai_picks_push_time") or "21:30"
     }
 
 @app.post("/api/config")
@@ -595,7 +635,9 @@ async def save_system_config(payload: SystemConfigSchema):
         "openai_base_url": payload.openai_base_url,
         "openai_model": payload.openai_model,
         "feishu_webhook_url": payload.feishu_webhook_url,
-        "wecom_webhook_url": payload.wecom_webhook_url
+        "wecom_webhook_url": payload.wecom_webhook_url,
+        "ai_picks_push_enabled": "1" if payload.ai_picks_push_enabled else "0",
+        "ai_picks_push_time": payload.ai_picks_push_time or "21:30"
     }
 
     # Only overwrite keys if provided and not masked

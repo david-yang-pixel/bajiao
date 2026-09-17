@@ -8,6 +8,8 @@ import aiosqlite
 from backend.app.config import settings
 from backend.app.services.binance_client import BinanceClient
 from backend.app.services.notification import NotificationService
+from backend.app.services.quant_screener import QuantScreener
+from backend.app.services.analysis_agent import AnalysisAgent
 
 logger = logging.getLogger(__name__)
 
@@ -17,16 +19,21 @@ class PositionMonitor:
     1. Periodic inspection (check_interval_hours)
     2. Real-time threshold alerts (Take-profit, Stop-loss, Ladder percentages)
     3. Anti-spam / alert cooldown mechanisms
+    4. Optional AI future trend analysis for position alerts
     """
 
     def __init__(
         self,
         binance_client: Optional[BinanceClient] = None,
         notification_service: Optional[NotificationService] = None,
+        quant_screener: Optional[QuantScreener] = None,
+        analysis_agent: Optional[AnalysisAgent] = None,
         db_path: Optional[str] = None
     ):
         self.binance_client = binance_client or BinanceClient()
         self.notification_service = notification_service or NotificationService()
+        self.quant_screener = quant_screener
+        self.analysis_agent = analysis_agent
         self._db_path = db_path
         self._last_alert_times: Dict[str, float] = {}  # {f"{pos_id}:{alert_type}:{step}": timestamp}
         self._last_periodic_times: Dict[int, float] = {}  # {pos_id: timestamp}
@@ -161,13 +168,40 @@ class PositionMonitor:
                 interval_str = f"每 {interval_hours:.1f} 小时"
 
             note = f"定时巡检汇报（周期: {interval_str}）"
+            trend_analysis = None
+            if bool(pos.get("include_ai_analysis")):
+                trend_analysis = await self.get_symbol_trend_analysis(symbol)
+
             await self.notification_service.send_position_alert(
-                symbol, buy_price, curr_price, pnl_pct, "periodic", note
+                symbol, buy_price, curr_price, pnl_pct, "periodic", note, trend_analysis=trend_analysis
             )
             await self.log_alert(pos_id, symbol, note, "periodic")
             triggered.append("periodic")
 
         return triggered
+
+    async def get_symbol_trend_analysis(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch klines and generate short-term AI trend analysis for position alert."""
+        if not self.quant_screener or not self.analysis_agent:
+            return None
+        try:
+            klines = await self.binance_client.get_klines(symbol, interval="1d", limit=40)
+            if not klines or len(klines) < 5:
+                klines = await self.binance_client.get_klines(symbol, interval="1h", limit=40)
+            if not klines:
+                return None
+            df = self.quant_screener.calculate_indicators(klines)
+            scored = self.quant_screener.score_stock(df)
+            analysis = await self.analysis_agent.analyze_candidate(
+                symbol=symbol,
+                score=scored.get("score", 0),
+                signals=scored.get("signals", []),
+                metrics=scored.get("metrics", {})
+            )
+            return analysis
+        except Exception as e:
+            logger.warning(f"Error generating AI trend analysis for {symbol}: {e}")
+            return None
 
     async def scan_all_positions(self, force_periodic: bool = False):
         """Scan all active positions."""

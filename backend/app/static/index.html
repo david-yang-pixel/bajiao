@@ -449,6 +449,11 @@
                         :class="pos.pnl_pct >= step ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-slate-100 text-slate-500'">
                     +{{ step }}%
                   </span>
+                  <span v-if="pos.include_ai_analysis"
+                        class="px-2 py-0.5 rounded-md font-medium text-[10px] bg-purple-50 text-purple-700 border border-purple-200 flex items-center gap-1"
+                        title="每次推送附带 AI 短线未来趋势研判">
+                    <i class="fa-solid fa-wand-magic-sparkles text-[9px]"></i> 附带AI研判
+                  </span>
                   <span class="ml-auto text-slate-500 text-[10px] font-mono flex items-center gap-1 bg-slate-50 px-2 py-0.5 rounded-md border border-slate-200/60">
                     <i class="fa-solid fa-bell text-[9px] text-indigo-500"></i>
                     {{ pos.check_interval_hours <= 0 ? '已关播报' : (pos.check_interval_hours < 1 ? Math.round(pos.check_interval_hours * 60) + 'm 飞书播报' : pos.check_interval_hours + 'h 飞书播报') }}
@@ -522,6 +527,15 @@
                 <span>{{ analyzing ? '大模型深度研判中...' : '即刻启动 AI 选股 (刷新)' }}</span>
               </button>
             </div>
+          </div>
+
+          <!-- Scheduled Push Status Banner -->
+          <div v-if="config.ai_picks_push_enabled" class="px-4 py-2.5 rounded-xl bg-indigo-50/70 border border-indigo-100 flex items-center justify-between text-xs text-indigo-900">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-clock text-indigo-600"></i>
+              <span>已开启每日定时自动研判推送：北京时间 <strong class="font-mono text-indigo-700 font-bold">{{ config.ai_picks_push_time || '21:30' }}</strong>，届时自动初筛并发卡片至飞书/企微群</span>
+            </div>
+            <button @click="currentTab = 'settings'" class="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 underline">修改定时</button>
           </div>
 
           <!-- Empty State -->
@@ -838,6 +852,44 @@
               </div>
             </div>
 
+            <!-- Group 5: AI Stock Picks Scheduled Push -->
+            <div class="p-5 rounded-2xl border border-slate-200/80 bg-slate-50/40 space-y-4 lg:col-span-2">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-3">
+                  <div class="w-9 h-9 rounded-xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600">
+                    <i class="fa-solid fa-clock-rotate-left text-sm"></i>
+                  </div>
+                  <div>
+                    <h3 class="font-bold text-slate-900 text-xs">
+                      AI 选股每日定时自动推送 (北京时间)
+                    </h3>
+                    <p class="text-[11px] text-slate-400 mt-0.5">
+                      到达设定时间后，后台自动执行全市场量化初筛 + AI 深度短线研判，并将潜力精选卡片自动推送到飞书与企业微信群
+                    </p>
+                  </div>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" v-model="config.ai_picks_push_enabled" class="sr-only peer">
+                  <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600"></div>
+                </label>
+              </div>
+
+              <div v-if="config.ai_picks_push_enabled" class="pt-3 border-t border-slate-200/60 flex flex-wrap items-center gap-3 text-xs">
+                <span class="text-slate-700 font-semibold">每日推送时间:</span>
+                <input v-model="config.ai_picks_push_time" type="time"
+                       class="bg-white border border-slate-200 rounded-xl px-3 py-1.5 text-slate-900 font-mono font-bold focus:outline-none focus:border-indigo-500 shadow-xs">
+                <div class="flex items-center gap-1.5">
+                  <span class="text-[11px] text-slate-400 font-medium">快捷推荐:</span>
+                  <button v-for="t in ['21:20', '21:30', '22:00', '09:30']" :key="t" type="button"
+                          @click="config.ai_picks_push_time = t"
+                          :class="config.ai_picks_push_time === t ? 'bg-indigo-600 text-white font-bold' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-100'"
+                          class="px-2.5 py-1 rounded-lg text-[10px] font-mono transition">
+                    {{ t }} ({{ t.startsWith('21') || t.startsWith('22') ? '美股盘前/开盘' : '早盘关注' }})
+                  </button>
+                </div>
+              </div>
+            </div>
+
           </div>
 
           <!-- Bottom Test Result Banner -->
@@ -991,6 +1043,23 @@
                 {{ item.label }}
               </button>
             </div>
+          </div>
+
+          <!-- Section 4: AI 短线未来趋势研判 -->
+          <div class="bg-purple-50/40 rounded-xl p-3 border border-purple-100/80 space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-purple-950 font-bold flex items-center gap-1.5 text-xs">
+                <i class="fa-solid fa-wand-magic-sparkles text-purple-600"></i>
+                飞书推送附带 AI 短线趋势研判
+              </label>
+              <label class="relative inline-flex items-center cursor-pointer">
+                <input type="checkbox" v-model="newPos.include_ai_analysis" class="sr-only peer">
+                <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-purple-600"></div>
+              </label>
+            </div>
+            <p class="text-[11px] text-slate-500 leading-relaxed">
+              开启后，每次向飞书群播报该持仓（定时或告警）时，将动态附带大模型对该标的 <span class="font-semibold text-purple-900">未来 1~3 天短线动量、支撑防守位与目标价</span> 研判分析。
+            </p>
           </div>
 
           <div class="flex justify-end gap-2.5 pt-2">
@@ -1167,6 +1236,23 @@
             </div>
           </div>
 
+          <!-- Section 4: AI 短线未来趋势研判 -->
+          <div class="bg-purple-50/40 rounded-xl p-3.5 border border-purple-100/80 space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-purple-950 font-bold flex items-center gap-1.5 text-xs">
+                <i class="fa-solid fa-wand-magic-sparkles text-purple-600"></i>
+                飞书推送附带 AI 趋势研判
+              </label>
+              <label class="relative inline-flex items-center cursor-pointer">
+                <input type="checkbox" v-model="editingPos.include_ai_analysis" class="sr-only peer">
+                <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-purple-600"></div>
+              </label>
+            </div>
+            <p class="text-[11px] text-slate-500 leading-relaxed">
+              开启后，每次向飞书/企微推送该标的播报（定时巡检或点击测试）时，系统将动态调用 AI 大模型研判该股票 <span class="font-semibold text-purple-900">未来 1~3 天短线动量、目标止盈与防守支撑位</span> 并附在飞书卡片中。
+            </p>
+          </div>
+
           <!-- Bottom buttons -->
           <div class="flex justify-end gap-2.5 pt-2 border-t border-slate-100">
             <button type="button" @click="editingPos = null"
@@ -1213,7 +1299,9 @@
           openai_model: 'gpt-4o-mini',
           has_openai_key: false,
           feishu_webhook_url: '',
-          wecom_webhook_url: ''
+          wecom_webhook_url: '',
+          ai_picks_push_enabled: false,
+          ai_picks_push_time: '21:30'
         });
 
         const intervalOptions = [
@@ -1238,7 +1326,8 @@
           tp_pct: 5.0,
           sl_pct: 3.0,
           check_interval_hours: 0.5,
-          ladder_alerts: [2.0, 3.0, 5.0, 8.0]
+          ladder_alerts: [2.0, 3.0, 5.0, 8.0],
+          include_ai_analysis: false
         });
 
         const showToast = (message, type = 'info') => {
@@ -1464,7 +1553,8 @@
               take_profit_price: newPos.value.take_profit_price ? parseFloat(newPos.value.take_profit_price) : null,
               stop_loss_price: newPos.value.stop_loss_price ? parseFloat(newPos.value.stop_loss_price) : null,
               check_interval_hours: parseFloat(newPos.value.check_interval_hours !== undefined ? newPos.value.check_interval_hours : 0.5),
-              ladder_alerts: newPos.value.ladder_alerts || [2.0, 3.0, 5.0, 8.0]
+              ladder_alerts: newPos.value.ladder_alerts || [2.0, 3.0, 5.0, 8.0],
+              include_ai_analysis: Boolean(newPos.value.include_ai_analysis)
             };
             const res = await fetch('/api/positions', {
               method: 'POST',
@@ -1482,7 +1572,8 @@
                 tp_pct: 5.0,
                 sl_pct: 3.0,
                 check_interval_hours: 0.5,
-                ladder_alerts: [2.0, 3.0, 5.0, 8.0]
+                ladder_alerts: [2.0, 3.0, 5.0, 8.0],
+                include_ai_analysis: false
               };
               await fetchPositions();
               currentTab.value = 'positions';
@@ -1604,6 +1695,7 @@
           }
           editingPos.value = {
             ...pos,
+            include_ai_analysis: Boolean(pos.include_ai_analysis),
             tp_pct: tp_pct !== null ? tp_pct : 5.0,
             sl_pct: sl_pct !== null ? sl_pct : 3.0,
             check_interval_hours: pos.check_interval_hours !== undefined ? parseFloat(pos.check_interval_hours) : 0.5
@@ -1627,7 +1719,8 @@
                 quantity: parseFloat(editingPos.value.quantity),
                 take_profit_price: parseFloat(editingPos.value.take_profit_price),
                 stop_loss_price: parseFloat(editingPos.value.stop_loss_price),
-                check_interval_hours: parseFloat(editingPos.value.check_interval_hours !== undefined ? editingPos.value.check_interval_hours : 0.5)
+                check_interval_hours: parseFloat(editingPos.value.check_interval_hours !== undefined ? editingPos.value.check_interval_hours : 0.5),
+                include_ai_analysis: Boolean(editingPos.value.include_ai_analysis)
               })
             });
             if (res.ok) {

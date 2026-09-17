@@ -107,10 +107,12 @@ class NotificationService:
         curr_price: float,
         pnl_pct: float,
         alert_type: str,
-        extra_note: str = ""
+        extra_note: str = "",
+        trend_analysis: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
-        Send position price alert card (Periodic check / Take Profit / Stop Loss / Ladder alert).
+        Send position price alert card (Periodic check / Take Profit / Stop Loss / Ladder alert),
+        with optional AI future trend analysis block if requested by user.
         """
         emoji_map = {
             "take_profit": "🚀 【阶段冲高 / 止盈提醒】",
@@ -123,6 +125,62 @@ class NotificationService:
         color = "green" if pnl_pct >= 0 else "red"
         success = False
 
+        # Build Feishu card elements
+        elements = [
+            {
+                "tag": "div",
+                "fields": [
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**买入成本:**\n${buy_price:.2f}"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**当前最新价:**\n${curr_price:.2f}"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**实时盈亏:**\n{pnl_str}"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**巡检状态:**\n{extra_note or '短线实时监控'}"}}
+                ]
+            }
+        ]
+
+        trend_plain_block = ""
+        if trend_analysis:
+            reason = trend_analysis.get("reason", "形态蓄势突破中")
+            tp = trend_analysis.get("target_price")
+            sl = trend_analysis.get("stop_loss_price")
+            tp_str = f"${float(tp):.2f}" if tp else "--"
+            sl_str = f"${float(sl):.2f}" if sl else "--"
+            elements.extend([
+                {"tag": "hr"},
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"🔮 **AI 短线未来趋势研判:**\n{reason}\n🎯 **研判止盈目标:** {tp_str}  |  🛡️ **防守止损位:** {sl_str}"
+                    }
+                }
+            ])
+            trend_plain_block = (
+                f"🔮 【AI 短线未来趋势研判】\n"
+                f"💡 逻辑: {reason}\n"
+                f"🎯 研判目标: {tp_str} | 🛡️ 防守支撑: {sl_str}\n"
+            )
+
+        elements.extend([
+            {"tag": "hr"},
+            {
+                "tag": "note",
+                "elements": [{"tag": "plain_text", "content": "⚡ Binance bStocks 短线高频量化盯盘助手"}]
+            }
+        ])
+
+        plain_text = (
+            f"{title}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔹 标的代号: {symbol}\n"
+            f"💵 买入成本: ${buy_price:.2f}\n"
+            f"📈 当前最新价: ${curr_price:.2f}\n"
+            f"📊 当前浮动盈亏: {pnl_str}\n"
+            + (f"💬 说明: {extra_note}\n" if extra_note else "")
+            + (f"━━━━━━━━━━━━━━━━━━━━\n{trend_plain_block}" if trend_plain_block else "")
+            + f"━━━━━━━━━━━━━━━━━━━━"
+        )
+
         # Feishu Interactive Card
         if self.feishu_webhook:
             card_payload = {
@@ -133,52 +191,17 @@ class NotificationService:
                         "title": {"tag": "plain_text", "content": f"{title} · {symbol}"},
                         "template": color
                     },
-                    "elements": [
-                        {
-                            "tag": "div",
-                            "fields": [
-                                {"is_short": True, "text": {"tag": "lark_md", "content": f"**买入成本:**\n${buy_price:.2f}"}},
-                                {"is_short": True, "text": {"tag": "lark_md", "content": f"**当前最新价:**\n${curr_price:.2f}"}},
-                                {"is_short": True, "text": {"tag": "lark_md", "content": f"**实时盈亏:**\n{pnl_str}"}},
-                                {"is_short": True, "text": {"tag": "lark_md", "content": f"**巡检状态:**\n{extra_note or '短线实时监控'}"}}
-                            ]
-                        },
-                        {"tag": "hr"},
-                        {
-                            "tag": "note",
-                            "elements": [{"tag": "plain_text", "content": "⚡ Binance bStocks 短线高频量化盯盘助手"}]
-                        }
-                    ]
+                    "elements": elements
                 }
             }
             res = await self._post(self.feishu_webhook, card_payload)
             if not res:
                 # Fallback to plain text
-                fallback_content = (
-                    f"{title}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔹 标的代号: {symbol}\n"
-                    f"💵 买入成本: ${buy_price:.2f}\n"
-                    f"📈 当前最新价: ${curr_price:.2f}\n"
-                    f"📊 当前浮动盈亏: {pnl_str}\n"
-                    + (f"💬 说明: {extra_note}\n" if extra_note else "")
-                    + f"━━━━━━━━━━━━━━━━━━━━"
-                )
-                res = await self._post(self.feishu_webhook, {"msg_type": "text", "content": {"text": fallback_content}})
+                res = await self._post(self.feishu_webhook, {"msg_type": "text", "content": {"text": plain_text}})
             success = success or res
 
         # WeCom webhook
         if self.wecom_webhook:
-            plain_text = (
-                f"{title}\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔹 标的代号: {symbol}\n"
-                f"💵 买入成本: ${buy_price:.2f}\n"
-                f"📈 当前最新价: ${curr_price:.2f}\n"
-                f"📊 当前浮动盈亏: {pnl_str}\n"
-                + (f"💬 说明: {extra_note}\n" if extra_note else "")
-                + f"━━━━━━━━━━━━━━━━━━━━"
-            )
             res = await self._post(self.wecom_webhook, {"msg_type": "text", "text": {"content": plain_text}})
             success = success or res
 

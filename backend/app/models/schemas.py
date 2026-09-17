@@ -7,8 +7,9 @@ class PositionCreate(BaseModel):
     quantity: float
     take_profit_price: Optional[float] = None
     stop_loss_price: Optional[float] = None
-    check_interval_hours: float = 1.0
+    check_interval_hours: float = 0.5
     ladder_alerts: List[float] = []
+    include_ai_analysis: bool = False
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -23,6 +24,7 @@ class PositionUpdate(BaseModel):
     stop_loss_price: Optional[float] = None
     ladder_alerts: Optional[List[float]] = None
     check_interval_hours: Optional[float] = None
+    include_ai_analysis: Optional[bool] = None
 
 class AskAIRequest(BaseModel):
     question: str
@@ -56,6 +58,8 @@ class SystemConfigSchema(BaseModel):
     openai_model: Optional[str] = "gpt-4o-mini"
     feishu_webhook_url: Optional[str] = ""
     wecom_webhook_url: Optional[str] = ""
+    ai_picks_push_enabled: Optional[bool] = False
+    ai_picks_push_time: Optional[str] = "21:30"
 
 class TestConnectionRequest(BaseModel):
     service: str # binance | llm | feishu | wecom
