@@ -380,10 +380,10 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
             avg_buy = await binance_client.get_average_buy_price(matched_symbol)
             buy_price = avg_buy if (avg_buy and avg_buy > 0) else curr_price
 
-            # Default take profit +10%, stop loss -5%
-            tp_price = round(buy_price * 1.10, 4)
-            sl_price = round(buy_price * 0.95, 4)
-            default_ladder = [5.0, 10.0, 15.0, 20.0]
+            # Default short-term take profit +5%, tight stop loss -3%, high-frequency 30m check
+            tp_price = round(buy_price * 1.05, 4)
+            sl_price = round(buy_price * 0.97, 4)
+            default_ladder = [2.0, 3.0, 5.0, 8.0]
 
             cursor = await db.execute(
                 "SELECT id, buy_price FROM positions WHERE symbol = ? AND is_active = 1",
@@ -423,7 +423,7 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
                         total_qty,
                         tp_price,
                         sl_price,
-                        1,
+                        0.5,
                         json.dumps(default_ladder)
                     )
                 )

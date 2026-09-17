@@ -300,9 +300,12 @@
               <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
                 <i class="fa-solid fa-layer-group text-indigo-600"></i>
                 当前持仓跟踪列表
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                  <i class="fa-solid fa-bolt text-amber-500"></i> 短线高频交易纪律
+                </span>
               </h2>
               <p class="text-xs text-slate-500 mt-1">
-                每 60 秒自动比对最新撮合价，追踪阶梯收益（+5%/+10%）、跌破止损线及常规周期播报。
+                每 60 秒高频撮合比对，追踪短线阶梯止盈（+2%/+3%/+5%/+8%）、紧凑防守止损与定时巡检播报。点击卡片可随时调整参数。
               </p>
             </div>
 
@@ -441,7 +444,7 @@
                 <!-- Ladder Alerts Tags -->
                 <div class="flex items-center gap-1.5 flex-wrap text-[11px] text-slate-500 mb-4">
                   <span class="text-slate-400">阶梯目标:</span>
-                  <span v-for="step in (pos.ladder_alerts || [5, 10, 20])" :key="step"
+                  <span v-for="step in (pos.ladder_alerts || [2, 3, 5, 8])" :key="step"
                         class="px-2 py-0.5 rounded-md font-mono text-[10px] font-bold"
                         :class="pos.pnl_pct >= step ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-slate-100 text-slate-500'">
                     +{{ step }}%
@@ -902,7 +905,7 @@
 
             <div class="flex items-center gap-1.5 pt-0.5 flex-wrap">
               <span class="text-[10px] text-slate-400 font-medium">快捷预设:</span>
-              <button v-for="p in [5, 10, 15, 20, 30]" :key="p" type="button" @click="setNewTpPct(p)"
+              <button v-for="p in [2, 3, 5, 8, 10]" :key="p" type="button" @click="setNewTpPct(p)"
                       :class="newPos.tp_pct === p ? 'bg-emerald-600 text-white font-bold shadow-xs' : 'bg-white text-emerald-800 border border-emerald-200 hover:bg-emerald-100/50'"
                       class="px-2 py-0.5 rounded-lg text-[10px] font-mono transition">
                 +{{ p }}%
@@ -945,7 +948,7 @@
 
             <div class="flex items-center gap-1.5 pt-0.5 flex-wrap">
               <span class="text-[10px] text-slate-400 font-medium">快捷预设:</span>
-              <button v-for="p in [3, 5, 8, 10, 15]" :key="p" type="button" @click="setNewSlPct(p)"
+              <button v-for="p in [1.5, 2, 3, 4, 5]" :key="p" type="button" @click="setNewSlPct(p)"
                       :class="newPos.sl_pct === p ? 'bg-rose-600 text-white font-bold shadow-xs' : 'bg-white text-rose-800 border border-rose-200 hover:bg-rose-100/50'"
                       class="px-2 py-0.5 rounded-lg text-[10px] font-mono transition">
                 -{{ p }}%
@@ -1060,7 +1063,7 @@
             <!-- Quick TP preset buttons -->
             <div class="flex items-center gap-1.5 pt-0.5 flex-wrap">
               <span class="text-[10px] text-slate-400 font-medium">快捷预设:</span>
-              <button v-for="p in [5, 10, 15, 20, 30]" :key="p" type="button" @click="setEditTpPct(p)"
+              <button v-for="p in [2, 3, 5, 8, 10]" :key="p" type="button" @click="setEditTpPct(p)"
                       :class="editingPos.tp_pct === p ? 'bg-emerald-600 text-white font-bold shadow-xs' : 'bg-white text-emerald-800 border border-emerald-200 hover:bg-emerald-100/50'"
                       class="px-2 py-0.5 rounded-lg text-[10px] font-mono transition">
                 +{{ p }}%
@@ -1104,7 +1107,7 @@
             <!-- Quick SL preset buttons -->
             <div class="flex items-center gap-1.5 pt-0.5 flex-wrap">
               <span class="text-[10px] text-slate-400 font-medium">快捷预设:</span>
-              <button v-for="p in [3, 5, 8, 10, 15]" :key="p" type="button" @click="setEditSlPct(p)"
+              <button v-for="p in [1.5, 2, 3, 4, 5]" :key="p" type="button" @click="setEditSlPct(p)"
                       :class="editingPos.sl_pct === p ? 'bg-rose-600 text-white font-bold shadow-xs' : 'bg-white text-rose-800 border border-rose-200 hover:bg-rose-100/50'"
                       class="px-2 py-0.5 rounded-lg text-[10px] font-mono transition">
                 -{{ p }}%
@@ -1216,10 +1219,10 @@
           quantity: 1,
           take_profit_price: null,
           stop_loss_price: null,
-          tp_pct: 10.0,
-          sl_pct: 5.0,
-          check_interval_hours: 1.0,
-          ladder_alerts: [5.0, 10.0, 20.0]
+          tp_pct: 5.0,
+          sl_pct: 3.0,
+          check_interval_hours: 0.5,
+          ladder_alerts: [2.0, 3.0, 5.0, 8.0]
         });
 
         const showToast = (message, type = 'info') => {
@@ -1423,8 +1426,8 @@
               quantity: parseFloat(newPos.value.quantity),
               take_profit_price: newPos.value.take_profit_price ? parseFloat(newPos.value.take_profit_price) : null,
               stop_loss_price: newPos.value.stop_loss_price ? parseFloat(newPos.value.stop_loss_price) : null,
-              check_interval_hours: parseFloat(newPos.value.check_interval_hours !== undefined ? newPos.value.check_interval_hours : 1.0),
-              ladder_alerts: newPos.value.ladder_alerts || [5.0, 10.0, 20.0]
+              check_interval_hours: parseFloat(newPos.value.check_interval_hours !== undefined ? newPos.value.check_interval_hours : 0.5),
+              ladder_alerts: newPos.value.ladder_alerts || [2.0, 3.0, 5.0, 8.0]
             };
             const res = await fetch('/api/positions', {
               method: 'POST',
@@ -1439,10 +1442,10 @@
                 quantity: 1,
                 take_profit_price: null,
                 stop_loss_price: null,
-                tp_pct: 10.0,
-                sl_pct: 5.0,
-                check_interval_hours: 1.0,
-                ladder_alerts: [5.0, 10.0, 20.0]
+                tp_pct: 5.0,
+                sl_pct: 3.0,
+                check_interval_hours: 0.5,
+                ladder_alerts: [2.0, 3.0, 5.0, 8.0]
               };
               await fetchPositions();
               currentTab.value = 'positions';
@@ -1564,15 +1567,15 @@
           }
           editingPos.value = {
             ...pos,
-            tp_pct: tp_pct !== null ? tp_pct : 10.0,
-            sl_pct: sl_pct !== null ? sl_pct : 5.0,
-            check_interval_hours: pos.check_interval_hours !== undefined ? parseFloat(pos.check_interval_hours) : 1.0
+            tp_pct: tp_pct !== null ? tp_pct : 5.0,
+            sl_pct: sl_pct !== null ? sl_pct : 3.0,
+            check_interval_hours: pos.check_interval_hours !== undefined ? parseFloat(pos.check_interval_hours) : 0.5
           };
           if (buy > 0 && !pos.take_profit_price) {
-            editingPos.value.take_profit_price = parseFloat((buy * 1.10).toFixed(4));
+            editingPos.value.take_profit_price = parseFloat((buy * 1.05).toFixed(4));
           }
           if (buy > 0 && !pos.stop_loss_price) {
-            editingPos.value.stop_loss_price = parseFloat((buy * 0.95).toFixed(4));
+            editingPos.value.stop_loss_price = parseFloat((buy * 0.97).toFixed(4));
           }
         };
 
@@ -1587,7 +1590,7 @@
                 quantity: parseFloat(editingPos.value.quantity),
                 take_profit_price: parseFloat(editingPos.value.take_profit_price),
                 stop_loss_price: parseFloat(editingPos.value.stop_loss_price),
-                check_interval_hours: parseFloat(editingPos.value.check_interval_hours !== undefined ? editingPos.value.check_interval_hours : 1.0)
+                check_interval_hours: parseFloat(editingPos.value.check_interval_hours !== undefined ? editingPos.value.check_interval_hours : 0.5)
               })
             });
             if (res.ok) {
