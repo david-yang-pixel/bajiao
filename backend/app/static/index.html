@@ -505,13 +505,23 @@
               </p>
             </div>
 
-            <button
-              @click="triggerAnalysis"
-              :disabled="analyzing"
-              class="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shadow-sm flex items-center gap-2 transition disabled:opacity-50">
-              <i class="fa-solid text-[11px]" :class="analyzing ? 'fa-spinner fa-spin' : 'fa-play'"></i>
-              <span>{{ analyzing ? '大模型深度研判中...' : '即刻启动 AI 选股' }}</span>
-            </button>
+            <div class="flex items-center gap-2">
+              <button
+                v-if="dailyPicks.length > 0"
+                @click="clearAllPicks"
+                class="px-3 py-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-600 text-xs font-semibold transition flex items-center gap-1.5">
+                <i class="fa-regular fa-trash-can text-slate-400 text-[11px]"></i>
+                <span>清空当前推荐</span>
+              </button>
+
+              <button
+                @click="triggerAnalysis"
+                :disabled="analyzing"
+                class="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shadow-sm flex items-center gap-2 transition disabled:opacity-50">
+                <i class="fa-solid text-[11px]" :class="analyzing ? 'fa-spinner fa-spin' : 'fa-play'"></i>
+                <span>{{ analyzing ? '大模型深度研判中...' : '即刻启动 AI 选股 (刷新)' }}</span>
+              </button>
+            </div>
           </div>
 
           <!-- Empty State -->
@@ -546,7 +556,13 @@
                       技术评分: {{ pick.score }}/100
                     </span>
                   </div>
-                  <span class="text-[11px] text-slate-400 font-mono">{{ pick.created_at }}</span>
+                  <div class="flex items-center gap-2">
+                    <span class="text-[11px] text-slate-400 font-mono">{{ pick.created_at }}</span>
+                    <button @click.stop="deletePick(pick.id)" title="移除此条建议"
+                            class="text-slate-300 hover:text-rose-500 p-1 rounded-lg hover:bg-slate-100 transition text-xs">
+                      <i class="fa-regular fa-trash-can"></i>
+                    </button>
+                  </div>
                 </div>
 
                 <!-- Suggested Targets -->
@@ -1346,16 +1362,37 @@
         const triggerAnalysis = async () => {
           analyzing.value = true;
           try {
-            showToast('AI Agent 正在分析全市场代币化美股形态...', 'info');
+            showToast('AI Agent 正在分析全市场代币化美股短线动能形态...', 'info');
             const res = await fetch('/api/analysis/run', { method: 'POST' });
             const data = await res.json();
             await fetchPicks();
             currentTab.value = 'picks';
-            showToast(`研判完成，已生成 ${data.count || 0} 只潜力标的建议`, 'success');
+            showToast(`短线研判完成！已刷新并生成 ${data.count || 0} 只最新精选标的建议`, 'success');
           } catch (e) {
             showToast('选股分析执行失败: ' + e, 'error');
           } finally {
             analyzing.value = false;
+          }
+        };
+
+        const clearAllPicks = async () => {
+          if (!confirm('确定清空当前所有 AI 推荐标的吗？')) return;
+          try {
+            await fetch('/api/analysis/picks', { method: 'DELETE' });
+            await fetchPicks();
+            showToast('已清空当前所有推荐标的', 'info');
+          } catch (e) {
+            showToast('清空异常: ' + e, 'error');
+          }
+        };
+
+        const deletePick = async (id) => {
+          try {
+            await fetch(`/api/analysis/picks/${id}`, { method: 'DELETE' });
+            await fetchPicks();
+            showToast('已移除该条标的推荐', 'info');
+          } catch (e) {
+            showToast('删除异常: ' + e, 'error');
           }
         };
 
@@ -1612,11 +1649,11 @@
           try {
             const res = await fetch(`/api/positions/${posId}/test-alert`, { method: 'POST' });
             const data = await res.json();
-            if (res.ok) {
-              showToast('已向飞书/企微发送实时持仓播报卡片，请在群内查看！', 'success');
+            if (res.ok && data.success) {
+              showToast(data.message || '已成功向飞书发送实时持仓播报卡片，请前往群内查收！', 'success');
               await fetchLogs();
             } else {
-              showToast('测试发送失败: ' + (data.detail || JSON.stringify(data)), 'error');
+              showToast(data.detail || data.message || '测试发送失败，请检查飞书 Webhook 设置', 'error');
             }
           } catch (e) {
             showToast('测试请求异常: ' + e, 'error');
@@ -1681,6 +1718,8 @@
           saveConfig,
           testConn,
           triggerAnalysis,
+          clearAllPicks,
+          deletePick,
           submitAddPosition,
           deletePosition,
           syncFromBinance,

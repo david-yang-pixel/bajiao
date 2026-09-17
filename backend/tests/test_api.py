@@ -1,3 +1,4 @@
+import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
 from unittest.mock import AsyncMock, patch
@@ -189,4 +190,36 @@ async def test_position_test_alert(tmp_path, monkeypatch):
             assert test_res.json()["success"] is True
             assert "periodic" in test_res.json()["triggered"]
             mock_alert.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_daily_picks_lifecycle_and_clear(tmp_path, monkeypatch):
+    db_file = str(tmp_path / "test_picks.db")
+    monkeypatch.setattr("backend.app.config.settings.DB_PATH", db_file)
+    await init_db(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
+        await db.execute("INSERT INTO daily_picks (symbol, reason, target_price) VALUES (?, ?, ?)", ("AAPLBUSDT", "突破", 250.0))
+        await db.execute("INSERT INTO daily_picks (symbol, reason, target_price) VALUES (?, ?, ?)", ("TSLABUSDT", "放量", 300.0))
+        await db.commit()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        picks_res = await ac.get("/api/analysis/picks")
+        assert len(picks_res.json()) == 2
+        pick_id = picks_res.json()[0]["id"]
+
+        # Delete single pick
+        del_one = await ac.delete(f"/api/analysis/picks/{pick_id}")
+        assert del_one.status_code == 200
+
+        picks_res2 = await ac.get("/api/analysis/picks")
+        assert len(picks_res2.json()) == 1
+
+        # Clear all picks
+        del_all = await ac.delete("/api/analysis/picks")
+        assert del_all.status_code == 200
+
+        picks_res3 = await ac.get("/api/analysis/picks")
+        assert len(picks_res3.json()) == 0
+
 

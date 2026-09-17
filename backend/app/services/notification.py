@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Any, Dict, Optional
 import httpx
@@ -17,9 +18,41 @@ class NotificationService:
         wecom_webhook: Optional[str] = None,
         timeout: float = 8.0
     ):
-        self.feishu_webhook = feishu_webhook or settings.FEISHU_WEBHOOK_URL
-        self.wecom_webhook = wecom_webhook or getattr(settings, "WECOM_WEBHOOK_URL", "")
+        self._feishu_webhook = feishu_webhook or settings.FEISHU_WEBHOOK_URL or ""
+        self._wecom_webhook = wecom_webhook or getattr(settings, "WECOM_WEBHOOK_URL", "") or ""
         self.timeout = timeout
+
+    @property
+    def feishu_webhook(self) -> str:
+        return self._feishu_webhook or ""
+
+    @feishu_webhook.setter
+    def feishu_webhook(self, val: Optional[str]):
+        self._feishu_webhook = val or ""
+
+    @property
+    def feishu_webhook_url(self) -> str:
+        return self._feishu_webhook or ""
+
+    @feishu_webhook_url.setter
+    def feishu_webhook_url(self, val: Optional[str]):
+        self._feishu_webhook = val or ""
+
+    @property
+    def wecom_webhook(self) -> str:
+        return self._wecom_webhook or ""
+
+    @wecom_webhook.setter
+    def wecom_webhook(self, val: Optional[str]):
+        self._wecom_webhook = val or ""
+
+    @property
+    def wecom_webhook_url(self) -> str:
+        return self._wecom_webhook or ""
+
+    @wecom_webhook_url.setter
+    def wecom_webhook_url(self, val: Optional[str]):
+        self._wecom_webhook = val or ""
 
     async def send_text(self, content: str) -> bool:
         """
@@ -87,24 +120,93 @@ class NotificationService:
         }
         title = emoji_map.get(alert_type, "📢 【持仓变动提醒】")
         pnl_str = f"+{pnl_pct:.2f}%" if pnl_pct >= 0 else f"{pnl_pct:.2f}%"
+        color = "green" if pnl_pct >= 0 else "red"
+        success = False
 
-        content = (
-            f"{title}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔹 标的代号: {symbol}\n"
-            f"💵 买入成本: ${buy_price:.2f}\n"
-            f"📈 当前最新价: ${curr_price:.2f}\n"
-            f"📊 当前浮动盈亏: {pnl_str}\n"
-            + (f"💬 说明: {extra_note}\n" if extra_note else "")
-            + f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        return await self.send_text(content)
+        # Feishu Interactive Card
+        if self.feishu_webhook:
+            card_payload = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {"tag": "plain_text", "content": f"{title} · {symbol}"},
+                        "template": color
+                    },
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "fields": [
+                                {"is_short": True, "text": {"tag": "lark_md", "content": f"**买入成本:**\n${buy_price:.2f}"}},
+                                {"is_short": True, "text": {"tag": "lark_md", "content": f"**当前最新价:**\n${curr_price:.2f}"}},
+                                {"is_short": True, "text": {"tag": "lark_md", "content": f"**实时盈亏:**\n{pnl_str}"}},
+                                {"is_short": True, "text": {"tag": "lark_md", "content": f"**巡检状态:**\n{extra_note or '短线实时监控'}"}}
+                            ]
+                        },
+                        {"tag": "hr"},
+                        {
+                            "tag": "note",
+                            "elements": [{"tag": "plain_text", "content": "⚡ Binance bStocks 短线高频量化盯盘助手"}]
+                        }
+                    ]
+                }
+            }
+            res = await self._post(self.feishu_webhook, card_payload)
+            if not res:
+                # Fallback to plain text
+                fallback_content = (
+                    f"{title}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔹 标的代号: {symbol}\n"
+                    f"💵 买入成本: ${buy_price:.2f}\n"
+                    f"📈 当前最新价: ${curr_price:.2f}\n"
+                    f"📊 当前浮动盈亏: {pnl_str}\n"
+                    + (f"💬 说明: {extra_note}\n" if extra_note else "")
+                    + f"━━━━━━━━━━━━━━━━━━━━"
+                )
+                res = await self._post(self.feishu_webhook, {"msg_type": "text", "content": {"text": fallback_content}})
+            success = success or res
+
+        # WeCom webhook
+        if self.wecom_webhook:
+            plain_text = (
+                f"{title}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 标的代号: {symbol}\n"
+                f"💵 买入成本: ${buy_price:.2f}\n"
+                f"📈 当前最新价: ${curr_price:.2f}\n"
+                f"📊 当前浮动盈亏: {pnl_str}\n"
+                + (f"💬 说明: {extra_note}\n" if extra_note else "")
+                + f"━━━━━━━━━━━━━━━━━━━━"
+            )
+            res = await self._post(self.wecom_webhook, {"msg_type": "text", "text": {"content": plain_text}})
+            success = success or res
+
+        return success
 
     async def _post(self, url: str, payload: Dict[str, Any]) -> bool:
+        if not url:
+            return False
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.post(url, json=payload)
                 if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        if inspect.isawaitable(data):
+                            data = await data
+                        if isinstance(data, dict):
+                            if "code" in data and data["code"] != 0:
+                                logger.warning(f"Webhook {url} returned error code: {data}")
+                                return False
+                            if "StatusCode" in data and data["StatusCode"] != 0:
+                                logger.warning(f"Webhook {url} returned error code: {data}")
+                                return False
+                            if "errcode" in data and data["errcode"] != 0:
+                                logger.warning(f"Webhook {url} returned error code: {data}")
+                                return False
+                    except Exception:
+                        pass
                     return True
                 logger.warning(f"Webhook post failed [{resp.status_code}]: {resp.text}")
                 return False

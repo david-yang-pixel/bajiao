@@ -68,8 +68,10 @@ async def apply_runtime_config():
         analysis_agent.model = oa_model
 
         # Update notification service
-        notification_service.feishu_webhook_url = feishu_url
-        notification_service.wecom_webhook_url = wecom_url
+        notification_service.feishu_webhook = feishu_url or ""
+        notification_service.feishu_webhook_url = feishu_url or ""
+        notification_service.wecom_webhook = wecom_url or ""
+        notification_service.wecom_webhook_url = wecom_url or ""
 
         logger.info("Runtime configuration successfully reloaded.")
     except Exception as e:
@@ -161,6 +163,10 @@ async def run_daily_analysis():
 
     results = []
     async with aiosqlite.connect(settings.DB_PATH) as db:
+        # Clear previous picks so the newly generated run completely refreshes the recommendations
+        await db.execute("DELETE FROM daily_picks")
+        await db.commit()
+
         for cand in top_candidates:
             symbol = cand["symbol"]
             analysis = await analysis_agent.analyze_candidate(
@@ -195,9 +201,23 @@ async def run_daily_analysis():
 async def get_latest_picks():
     async with aiosqlite.connect(settings.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM daily_picks ORDER BY id DESC LIMIT 10")
+        cursor = await db.execute("SELECT * FROM daily_picks ORDER BY id DESC")
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+@app.delete("/api/analysis/picks")
+async def clear_all_picks():
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        await db.execute("DELETE FROM daily_picks")
+        await db.commit()
+    return {"message": "All picks cleared successfully"}
+
+@app.delete("/api/analysis/picks/{pick_id}")
+async def delete_single_pick(pick_id: int):
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        await db.execute("DELETE FROM daily_picks WHERE id = ?", (pick_id,))
+        await db.commit()
+    return {"message": "Pick deleted successfully"}
 
 @app.get("/api/positions", response_model=List[Dict[str, Any]])
 async def list_positions():
@@ -287,25 +307,67 @@ async def remove_position(position_id: int):
 
 @app.post("/api/positions/{position_id}/test-alert")
 async def test_position_alert(position_id: int):
+    # 1. Verify webhook configuration
+    if not notification_service.feishu_webhook and not notification_service.wecom_webhook:
+        raise HTTPException(
+            status_code=400,
+            detail="尚未配置飞书或企业微信 Webhook 机器人地址，请前往【系统配置】页面填写并保存后再试。"
+        )
+
     async with aiosqlite.connect(settings.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM positions WHERE id = ?", (position_id,))
         row = await cursor.fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Position not found")
+            raise HTTPException(status_code=404, detail="持仓标的不存在")
         pos = dict(row)
-        if isinstance(pos.get("ladder_alerts"), str):
-            try:
-                pos["ladder_alerts"] = json.loads(pos["ladder_alerts"])
-            except Exception:
-                pos["ladder_alerts"] = []
 
-        triggered = await position_monitor.check_single_position(pos, force_periodic=True)
-        return {
-            "success": True,
-            "message": f"已向配置的飞书/企微机器人发送 {pos['symbol']} 实时持仓巡检测试卡片",
-            "triggered": triggered
-        }
+    # 2. Get latest ticker price
+    buy_price = float(pos.get("buy_price") or 0.0)
+    try:
+        curr_price = await binance_client.get_ticker_price(pos["symbol"])
+    except Exception:
+        curr_price = buy_price
+
+    pnl_pct = ((curr_price - buy_price) / buy_price) * 100.0 if buy_price > 0 else 0.0
+
+    interval_hours = float(pos.get("check_interval_hours") if pos.get("check_interval_hours") is not None else 0.5)
+    if interval_hours <= 0:
+        interval_str = "已关闭定时播报"
+    elif interval_hours < 1:
+        interval_str = f"每 {int(round(interval_hours * 60))} 分钟"
+    elif interval_hours == int(interval_hours):
+        interval_str = f"每 {int(interval_hours)} 小时"
+    else:
+        interval_str = f"每 {interval_hours:.1f} 小时"
+
+    note = f"手动点击测试（当前设定周期: {interval_str}）"
+
+    sent = await notification_service.send_position_alert(
+        symbol=pos["symbol"],
+        buy_price=buy_price,
+        curr_price=curr_price,
+        pnl_pct=pnl_pct,
+        alert_type="periodic",
+        extra_note=note
+    )
+
+    if not sent:
+        raise HTTPException(
+            status_code=502,
+            detail="飞书/企微机器人发送失败，请检查系统配置中的 Webhook 地址是否有效或机器人是否已被群移除。"
+        )
+
+    # Record to alert logs
+    await position_monitor.log_alert(pos["id"], pos["symbol"], note, "periodic")
+
+    return {
+        "success": True,
+        "message": f"已成功向飞书推送 {pos['symbol']} 实时持仓卡片！最新价: ${curr_price:.2f}, 盈亏: {pnl_pct:+.2f}%",
+        "triggered": ["periodic"],
+        "curr_price": round(curr_price, 2),
+        "pnl_pct": round(pnl_pct, 2)
+    }
 
 async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
     """
