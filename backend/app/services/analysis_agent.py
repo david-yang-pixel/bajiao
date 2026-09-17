@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 import httpx
 
@@ -83,7 +84,11 @@ class AnalysisAgent:
                     if resp.status_code == 200:
                         data = resp.json()
                         raw_result = data["choices"][0]["message"]["content"]
-                        parsed = json.loads(raw_result)
+                        clean_text = raw_result.strip()
+                        match = re.search(r"\{.*\}", clean_text, re.DOTALL)
+                        if match:
+                            clean_text = match.group(0)
+                        parsed = json.loads(clean_text)
                         return {
                             "symbol": symbol,
                             "reason": parsed.get("reason", signals_str),
