@@ -21,5 +21,6 @@ async def test_init_db(tmp_path):
     assert "positions" in tables
     assert "daily_picks" in tables
     assert "alert_logs" in tables
+    assert "system_configs" in tables
     
     conn.close()

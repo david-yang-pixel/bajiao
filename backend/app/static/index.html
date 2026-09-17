@@ -1,0 +1,1283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>bStocks AI Console - 币安美股交易分析与盯盘控制台</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Vue 3 CDN -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <!-- Inter & JetBrains Mono Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
+            mono: ['JetBrains Mono', 'ui-monospace', 'monospace']
+          },
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              100: '#e0e7ff',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+              900: '#312e81'
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    .num-font {
+      font-family: 'JetBrains Mono', monospace;
+      font-feature-settings: "tnum";
+      font-variant-numeric: tabular-nums;
+    }
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #f1f5f9;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 9999px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+  </style>
+</head>
+
+<body class="bg-[#f8fafc] text-slate-800 min-h-screen flex flex-col selection:bg-indigo-100 selection:text-indigo-900">
+  <div id="app" class="flex-1 flex flex-col">
+
+    <!-- Floating Toast Notifications -->
+    <div class="fixed top-5 right-5 z-50 flex flex-col gap-2.5 max-w-sm w-full pointer-events-none">
+      <transition-group enter-active-class="transform ease-out duration-300 transition"
+                        enter-from-class="translate-y-2 opacity-0 sm:translate-y-0 sm:translate-x-2"
+                        enter-to-class="translate-y-0 opacity-100 sm:translate-x-0"
+                        leave-active-class="transition ease-in duration-200"
+                        leave-from-class="opacity-100"
+                        leave-to-class="opacity-0">
+        <div v-for="t in toasts" :key="t.id"
+             class="pointer-events-auto p-3.5 rounded-xl border shadow-lg bg-white flex items-start gap-3 text-xs"
+             :class="{
+               'border-emerald-200 text-slate-800 shadow-emerald-500/5': t.type === 'success',
+               'border-rose-200 text-slate-800 shadow-rose-500/5': t.type === 'error',
+               'border-indigo-200 text-slate-800 shadow-indigo-500/5': t.type === 'info',
+               'border-amber-200 text-slate-800 shadow-amber-500/5': t.type === 'warning'
+             }">
+          <div class="mt-0.5 text-sm" :class="{
+            'text-emerald-600': t.type === 'success',
+            'text-rose-600': t.type === 'error',
+            'text-indigo-600': t.type === 'info',
+            'text-amber-600': t.type === 'warning'
+          }">
+            <i class="fa-solid" :class="{
+              'fa-circle-check': t.type === 'success',
+              'fa-circle-xmark': t.type === 'error',
+              'fa-circle-info': t.type === 'info',
+              'fa-triangle-exclamation': t.type === 'warning'
+            }"></i>
+          </div>
+          <div class="flex-1 leading-relaxed font-medium">{{ t.message }}</div>
+          <button @click="removeToast(t.id)" class="text-slate-400 hover:text-slate-600">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+      </transition-group>
+    </div>
+
+    <!-- Top Navigation Bar -->
+    <header class="bg-white/90 backdrop-blur-md border-b border-slate-200/90 sticky top-0 z-30 transition-all">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+        
+        <!-- Left: Brand Logo & Engine Indicator -->
+        <div class="flex items-center gap-6">
+          <div class="flex items-center gap-3">
+            <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center text-white shadow-sm shadow-indigo-200">
+              <i class="fa-solid fa-arrow-trend-up text-sm"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="font-extrabold text-base tracking-tight text-slate-900">bStocks Console</span>
+                <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200/80">v1.3</span>
+              </div>
+              <p class="text-[11px] text-slate-400 font-normal hidden sm:block">币安代币化美股智能交易与监控</p>
+            </div>
+          </div>
+
+          <!-- Engine Live Heartbeat -->
+          <div class="hidden lg:flex items-center gap-2 px-3 py-1 rounded-full bg-slate-50 border border-slate-200 text-xs font-medium text-slate-600">
+            <span class="relative flex h-2 w-2">
+              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+            </span>
+            <span>巡检引擎运行中</span>
+            <span class="text-slate-300">|</span>
+            <span class="text-slate-400 num-font text-[11px]">{{ countdown }}s</span>
+          </div>
+        </div>
+
+        <!-- Center: Navigation Tabs (Desktop) -->
+        <nav class="hidden md:flex items-center p-1 bg-slate-100/90 rounded-xl border border-slate-200/70">
+          <button
+            @click="currentTab = 'positions'"
+            :class="currentTab === 'positions' ? 'bg-white text-slate-900 font-semibold shadow-sm' : 'text-slate-600 hover:text-slate-900 font-medium'"
+            class="px-3.5 py-1.5 rounded-lg text-xs flex items-center gap-2 transition duration-150">
+            <i class="fa-solid fa-layer-group text-slate-500" :class="{'text-indigo-600': currentTab === 'positions'}"></i>
+            持仓监控
+            <span v-if="positions.length" class="ml-1 px-1.5 py-0.2 rounded-full text-[10px] font-bold"
+                  :class="currentTab === 'positions' ? 'bg-indigo-50 text-indigo-600' : 'bg-slate-200/80 text-slate-600'">
+              {{ positions.length }}
+            </span>
+          </button>
+          <button
+            @click="currentTab = 'picks'"
+            :class="currentTab === 'picks' ? 'bg-white text-slate-900 font-semibold shadow-sm' : 'text-slate-600 hover:text-slate-900 font-medium'"
+            class="px-3.5 py-1.5 rounded-lg text-xs flex items-center gap-2 transition duration-150">
+            <i class="fa-solid fa-wand-magic-sparkles text-slate-500" :class="{'text-indigo-600': currentTab === 'picks'}"></i>
+            AI 选股研判
+          </button>
+          <button
+            @click="currentTab = 'alerts'"
+            :class="currentTab === 'alerts' ? 'bg-white text-slate-900 font-semibold shadow-sm' : 'text-slate-600 hover:text-slate-900 font-medium'"
+            class="px-3.5 py-1.5 rounded-lg text-xs flex items-center gap-2 transition duration-150">
+            <i class="fa-solid fa-bell text-slate-500" :class="{'text-indigo-600': currentTab === 'alerts'}"></i>
+            预警日志
+          </button>
+          <button
+            @click="currentTab = 'settings'"
+            :class="currentTab === 'settings' ? 'bg-white text-slate-900 font-semibold shadow-sm' : 'text-slate-600 hover:text-slate-900 font-medium'"
+            class="px-3.5 py-1.5 rounded-lg text-xs flex items-center gap-2 transition duration-150">
+            <i class="fa-solid fa-sliders text-slate-500" :class="{'text-indigo-600': currentTab === 'settings'}"></i>
+            系统设置
+          </button>
+        </nav>
+
+        <!-- Right Quick Actions -->
+        <div class="flex items-center gap-2 sm:gap-3">
+          <button
+            @click="syncFromBinance"
+            :disabled="syncingBinance"
+            class="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-sm flex items-center gap-1.5 transition disabled:opacity-50">
+            <i class="fa-solid fa-arrows-rotate text-slate-500 text-[11px]" :class="{'animate-spin text-indigo-600': syncingBinance}"></i>
+            <span class="hidden sm:inline">{{ syncingBinance ? '同步中...' : '同步币安持仓' }}</span>
+          </button>
+
+          <button
+            @click="openAddModal = true"
+            class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold px-3.5 py-1.5 rounded-lg shadow-sm shadow-indigo-200 flex items-center gap-1.5 transition">
+            <i class="fa-solid fa-plus text-[11px]"></i>
+            <span>手动录入</span>
+          </button>
+
+          <button
+            @click="triggerAnalysis"
+            :disabled="analyzing"
+            class="hidden sm:flex bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold px-3.5 py-1.5 rounded-lg shadow-sm flex items-center gap-1.5 transition disabled:opacity-50">
+            <i class="fa-solid text-[11px]" :class="analyzing ? 'fa-spinner fa-spin' : 'fa-brain'"></i>
+            <span>{{ analyzing ? '研判中...' : 'AI 选股' }}</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Mobile Tab Bar -->
+      <div class="md:hidden flex items-center justify-around border-t border-slate-100 py-2 bg-white text-xs">
+        <button @click="currentTab = 'positions'" :class="currentTab === 'positions' ? 'text-indigo-600 font-bold' : 'text-slate-500'">持仓跟踪</button>
+        <button @click="currentTab = 'picks'" :class="currentTab === 'picks' ? 'text-indigo-600 font-bold' : 'text-slate-500'">AI 选股</button>
+        <button @click="currentTab = 'alerts'" :class="currentTab === 'alerts' ? 'text-indigo-600 font-bold' : 'text-slate-500'">预警日志</button>
+        <button @click="currentTab = 'settings'" :class="currentTab === 'settings' ? 'text-indigo-600 font-bold' : 'text-slate-500'">系统配置</button>
+      </div>
+    </header>
+
+    <!-- Main Content Container -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-1 w-full space-y-6">
+
+      <!-- Global Summary Cards -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <!-- Card 1 -->
+        <div class="bg-white rounded-2xl p-5 border border-slate-200/90 shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] hover:shadow-md transition-shadow">
+          <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-2">
+            <span>活跃监控标的</span>
+            <div class="w-7 h-7 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center text-xs">
+              <i class="fa-solid fa-cubes"></i>
+            </div>
+          </div>
+          <div class="flex items-baseline gap-2">
+            <span class="text-2xl font-black text-slate-900 num-font">{{ positions.length }}</span>
+            <span class="text-xs text-slate-500">只活跃股票</span>
+          </div>
+          <p class="text-[11px] text-slate-400 mt-2 flex items-center gap-1">
+            <i class="fa-solid fa-filter text-[9px] text-slate-400"></i>
+            自动过滤 &lt; $1 USDT 粉尘
+          </p>
+        </div>
+
+        <!-- Card 2 -->
+        <div class="bg-white rounded-2xl p-5 border border-slate-200/90 shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] hover:shadow-md transition-shadow">
+          <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-2">
+            <span>浮动总盈亏</span>
+            <div class="w-7 h-7 rounded-lg flex items-center justify-center text-xs"
+                 :class="totalPnL >= 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'">
+              <i class="fa-solid" :class="totalPnL >= 0 ? 'fa-arrow-trend-up' : 'fa-arrow-trend-down'"></i>
+            </div>
+          </div>
+          <div class="flex items-baseline gap-1.5">
+            <span class="text-2xl font-black num-font" :class="totalPnL >= 0 ? 'text-emerald-600' : 'text-rose-600'">
+              {{ totalPnL >= 0 ? '+' : '' }}{{ totalPnL.toFixed(2) }}
+            </span>
+            <span class="text-xs text-slate-500 font-medium">USDT</span>
+          </div>
+          <p class="text-[11px] text-slate-400 mt-2">
+            根据持仓现价与买入成本加权
+          </p>
+        </div>
+
+        <!-- Card 3 -->
+        <div class="bg-white rounded-2xl p-5 border border-slate-200/90 shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] hover:shadow-md transition-shadow cursor-pointer"
+             @click="currentTab = 'picks'">
+          <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-2">
+            <span>AI 潜力推荐库</span>
+            <div class="w-7 h-7 rounded-lg bg-violet-50 text-violet-600 flex items-center justify-center text-xs">
+              <i class="fa-solid fa-wand-magic-sparkles"></i>
+            </div>
+          </div>
+          <div class="flex items-baseline gap-2">
+            <span class="text-2xl font-black text-slate-900 num-font">{{ dailyPicks.length }}</span>
+            <span class="text-xs text-slate-500">条研判报告</span>
+          </div>
+          <p class="text-[11px] text-indigo-600 font-medium mt-2 flex items-center gap-1">
+            查看最新研判建议 <i class="fa-solid fa-chevron-right text-[9px]"></i>
+          </p>
+        </div>
+
+        <!-- Card 4 -->
+        <div class="bg-white rounded-2xl p-5 border border-slate-200/90 shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] hover:shadow-md transition-shadow">
+          <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-2">
+            <span>盯盘预警引擎</span>
+            <div class="w-7 h-7 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center text-xs">
+              <i class="fa-solid fa-shield-halved"></i>
+            </div>
+          </div>
+          <div class="flex items-baseline gap-2">
+            <span class="text-lg font-bold text-slate-900">60s 高频轮询</span>
+          </div>
+          <p class="text-[11px] text-emerald-600 font-medium mt-2 flex items-center gap-1.5">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+            止盈/止损/阶梯防疲劳就绪
+          </p>
+        </div>
+      </div>
+
+      <!-- ============================================== -->
+      <!-- TAB 1: POSITIONS MONITORING & MANAGEMENT       -->
+      <!-- ============================================== -->
+      <div v-if="currentTab === 'positions'" class="space-y-5">
+        
+        <!-- Header Controls & Dust Filtering Banner -->
+        <div class="bg-white rounded-2xl p-5 sm:p-6 border border-slate-200/90 shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] space-y-4">
+          
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-layer-group text-indigo-600"></i>
+                当前持仓跟踪列表
+              </h2>
+              <p class="text-xs text-slate-500 mt-1">
+                每 60 秒自动比对最新撮合价，追踪阶梯收益（+5%/+10%）、跌破止损线及常规周期播报。
+              </p>
+            </div>
+
+            <div class="flex items-center gap-2">
+              <button
+                @click="syncFromBinance"
+                :disabled="syncingBinance"
+                class="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shadow-sm flex items-center gap-1.5 transition disabled:opacity-50">
+                <i class="fa-solid fa-arrows-rotate text-[11px]" :class="{'animate-spin': syncingBinance}"></i>
+                <span>{{ syncingBinance ? '正在对齐...' : '一键同步币安账户' }}</span>
+              </button>
+
+              <button
+                @click="fetchPositions"
+                class="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-semibold transition flex items-center gap-1.5">
+                <i class="fa-solid fa-rotate text-slate-400 text-[11px]"></i>
+                <span>刷新</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Smart Sync Notice -->
+          <div class="bg-indigo-50/60 border border-indigo-100 rounded-xl p-3.5 flex items-start gap-3 text-xs text-indigo-900">
+            <i class="fa-solid fa-circle-info text-indigo-500 mt-0.5 text-sm"></i>
+            <div class="leading-relaxed">
+              <span class="font-semibold text-indigo-950">资产自动对齐与粉尘过滤：</span>
+              系统每 10 分钟在后台静默同步币安现货持仓。为免受交易精度碎屑干扰，持仓市值低于 <code class="font-mono bg-indigo-100/70 px-1 py-0.5 rounded text-indigo-800">$1.0 USDT</code> 的零头资产（如全额卖出后的残留粉尘）会自动忽略；在币安平仓卖出后，旧持仓将自动从当前看板中移出。
+            </div>
+          </div>
+
+          <!-- Empty State (When No Positions) -->
+          <div v-if="positions.length === 0" class="py-16 px-4 text-center border-2 border-dashed border-slate-200 rounded-2xl">
+            <div class="w-16 h-16 rounded-full bg-slate-50 border border-slate-200 flex items-center justify-center text-slate-400 text-2xl mx-auto mb-3">
+              <i class="fa-solid fa-box-open"></i>
+            </div>
+            <h3 class="text-sm font-bold text-slate-800 mb-1">当前币安账户无活跃监控持仓</h3>
+            <p class="text-xs text-slate-400 max-w-md mx-auto mb-5 leading-relaxed">
+              您的币安账户现货资产已全部平仓卖出，或当前资产名义价值低于 $1.0 USDT（已自动忽略粉尘残渣）。
+            </p>
+            <div class="flex items-center justify-center gap-3">
+              <button
+                @click="syncFromBinance"
+                :disabled="syncingBinance"
+                class="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shadow-sm flex items-center gap-2 transition disabled:opacity-50">
+                <i class="fa-solid fa-arrows-rotate text-[11px]" :class="{'animate-spin': syncingBinance}"></i>
+                从币安重新同步
+              </button>
+              <button
+                @click="openAddModal = true"
+                class="px-4 py-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-semibold transition flex items-center gap-2">
+                <i class="fa-solid fa-plus text-[11px]"></i>
+                手动录入持仓
+              </button>
+            </div>
+          </div>
+
+          <!-- Position Cards Grid -->
+          <div v-else class="grid grid-cols-1 lg:grid-cols-2 gap-4 pt-2">
+            <div v-for="pos in positions" :key="pos.id"
+                 class="bg-white rounded-2xl border border-slate-200/90 p-5 shadow-sm hover:shadow-md transition-all relative overflow-hidden flex flex-col justify-between">
+              
+              <!-- Top Row: Symbol & PnL Pill -->
+              <div>
+                <div class="flex items-start justify-between mb-3">
+                  <div class="flex items-center gap-2.5">
+                    <div class="w-10 h-10 rounded-xl bg-indigo-50 border border-indigo-100 flex items-center justify-center font-black text-indigo-700 text-sm">
+                      {{ pos.symbol.substring(0, 3) }}
+                    </div>
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <span class="font-extrabold text-base text-slate-900 num-font tracking-tight">{{ pos.symbol }}</span>
+                        <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-600">bStocks 现货</span>
+                      </div>
+                      <div class="text-[11px] text-slate-400 font-medium mt-0.5">
+                        持仓数量: <span class="num-font text-slate-600 font-semibold">{{ pos.quantity }}</span> 股
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- Floating PnL Badge -->
+                  <div class="px-3 py-1.5 rounded-xl border flex items-center gap-1.5"
+                       :class="pos.pnl_pct >= 0 ? 'bg-emerald-50 border-emerald-200/80 text-emerald-700' : 'bg-rose-50 border-rose-200/80 text-rose-700'">
+                    <i class="fa-solid text-xs" :class="pos.pnl_pct >= 0 ? 'fa-arrow-up' : 'fa-arrow-down'"></i>
+                    <span class="font-black text-sm num-font">{{ pos.pnl_pct >= 0 ? '+' : '' }}{{ pos.pnl_pct ? pos.pnl_pct.toFixed(2) : '0.00' }}%</span>
+                  </div>
+                </div>
+
+                <!-- Price Metric Grid -->
+                <div class="grid grid-cols-3 gap-2 bg-slate-50/80 p-3 rounded-xl border border-slate-100 text-xs mb-4">
+                  <div>
+                    <div class="text-[11px] text-slate-400">买入成本</div>
+                    <div class="font-bold text-slate-800 num-font mt-0.5">${{ pos.buy_price ? pos.buy_price.toFixed(2) : '--' }}</div>
+                  </div>
+                  <div>
+                    <div class="text-[11px] text-slate-400">最新现价</div>
+                    <div class="font-black text-slate-900 num-font mt-0.5">
+                      ${{ pos.current_price ? pos.current_price.toFixed(2) : '--' }}
+                    </div>
+                  </div>
+                  <div>
+                    <div class="text-[11px] text-slate-400">当前持仓市值</div>
+                    <div class="font-bold text-slate-800 num-font mt-0.5">
+                      ${{ (pos.current_price && pos.quantity) ? (pos.current_price * pos.quantity).toFixed(2) : '--' }}
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Progress Bar: Stop-Loss to Take-Profit Distance -->
+                <div class="space-y-1.5 mb-4 text-xs">
+                  <div class="flex items-center justify-between text-[11px]">
+                    <span class="text-rose-600 font-medium">
+                      <i class="fa-solid fa-shield-halved text-[9px] mr-0.5"></i>
+                      止损: ${{ pos.stop_loss_price || '未设' }}
+                    </span>
+                    <span class="text-slate-400">区间位置</span>
+                    <span class="text-emerald-600 font-medium">
+                      止盈: ${{ pos.take_profit_price || '未设' }}
+                      <i class="fa-solid fa-flag-checkered text-[9px] ml-0.5"></i>
+                    </span>
+                  </div>
+                  
+                  <!-- Range bar -->
+                  <div class="w-full bg-slate-100 h-2 rounded-full overflow-hidden relative">
+                    <div class="h-full bg-gradient-to-r from-rose-400 via-amber-400 to-emerald-400 rounded-full"
+                         :style="{ width: calcRangeProgress(pos) + '%' }"></div>
+                  </div>
+                </div>
+
+                <!-- Ladder Alerts Tags -->
+                <div class="flex items-center gap-1.5 flex-wrap text-[11px] text-slate-500 mb-4">
+                  <span class="text-slate-400">阶梯目标:</span>
+                  <span v-for="step in (pos.ladder_alerts || [5, 10, 20])" :key="step"
+                        class="px-2 py-0.5 rounded-md font-mono text-[10px] font-bold"
+                        :class="pos.pnl_pct >= step ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-slate-100 text-slate-500'">
+                    +{{ step }}%
+                  </span>
+                  <span class="ml-auto text-slate-400 text-[10px]">
+                    <i class="fa-solid fa-clock text-[9px] mr-0.5"></i>
+                    {{ pos.check_interval_hours || 1 }}h 巡检
+                  </span>
+                </div>
+              </div>
+
+              <!-- Bottom Actions -->
+              <div class="pt-3 border-t border-slate-100 flex items-center justify-between">
+                <button
+                  @click="quickAnalyze(pos.symbol)"
+                  class="text-xs text-indigo-600 hover:text-indigo-700 font-semibold flex items-center gap-1">
+                  <i class="fa-solid fa-brain text-[11px]"></i>
+                  AI 研判该标的
+                </button>
+
+                <div class="flex items-center gap-2">
+                  <button
+                    @click="openEditModal(pos)"
+                    class="px-2.5 py-1 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-600 text-xs font-medium transition">
+                    设置止盈止损
+                  </button>
+                  <button
+                    @click="deletePosition(pos.id)"
+                    class="px-2 py-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition"
+                    title="移除此监控">
+                    <i class="fa-solid fa-trash-can text-xs"></i>
+                  </button>
+                </div>
+              </div>
+
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+
+      <!-- ============================================== -->
+      <!-- TAB 2: AI STOCK RECOMMENDATIONS & DEEP DIVE    -->
+      <!-- ============================================== -->
+      <div v-if="currentTab === 'picks'" class="space-y-5">
+        <div class="bg-white rounded-2xl p-5 sm:p-6 border border-slate-200/90 shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] space-y-4">
+          
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-wand-magic-sparkles text-indigo-600"></i>
+                AI 潜力推荐标的
+              </h2>
+              <p class="text-xs text-slate-500 mt-1">
+                多周期量化初筛（MA5/10/20 排列、RSI 突破、布林带突破、成交量放量）+ 大模型综合研判
+              </p>
+            </div>
+
+            <button
+              @click="triggerAnalysis"
+              :disabled="analyzing"
+              class="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shadow-sm flex items-center gap-2 transition disabled:opacity-50">
+              <i class="fa-solid text-[11px]" :class="analyzing ? 'fa-spinner fa-spin' : 'fa-play'"></i>
+              <span>{{ analyzing ? '大模型深度研判中...' : '即刻启动 AI 选股' }}</span>
+            </button>
+          </div>
+
+          <!-- Empty State -->
+          <div v-if="dailyPicks.length === 0" class="py-16 text-center border-2 border-dashed border-slate-200 rounded-2xl">
+            <div class="w-14 h-14 rounded-full bg-slate-50 border border-slate-200 flex items-center justify-center text-slate-400 text-xl mx-auto mb-3">
+              <i class="fa-solid fa-robot"></i>
+            </div>
+            <h3 class="text-sm font-bold text-slate-800 mb-1">暂无 AI 选股推荐记录</h3>
+            <p class="text-xs text-slate-400 max-w-sm mx-auto mb-4">
+              点击上方“即刻启动 AI 选股”按钮，AI Agent 将自动拉取币安所有代币化美股日线进行形态评分与逻辑推理。
+            </p>
+            <button
+              @click="triggerAnalysis"
+              class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-sm transition">
+              开始今日量化研判
+            </button>
+          </div>
+
+          <!-- Recommendations Grid -->
+          <div v-else class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+            <div v-for="pick in dailyPicks" :key="pick.id"
+                 class="bg-white rounded-2xl border border-slate-200/90 p-5 shadow-sm hover:shadow-md transition-all flex flex-col justify-between">
+              
+              <div>
+                <!-- Card Header -->
+                <div class="flex items-start justify-between mb-3">
+                  <div class="flex items-center gap-2.5">
+                    <span class="text-lg font-black text-slate-900 num-font tracking-tight">{{ pick.symbol }}</span>
+                    <span v-if="pick.score"
+                          class="px-2 py-0.5 rounded-full text-xs font-bold border"
+                          :class="pick.score >= 70 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-indigo-50 text-indigo-700 border-indigo-200'">
+                      技术评分: {{ pick.score }}/100
+                    </span>
+                  </div>
+                  <span class="text-[11px] text-slate-400 font-mono">{{ pick.created_at }}</span>
+                </div>
+
+                <!-- Suggested Targets -->
+                <div class="grid grid-cols-2 gap-2 bg-slate-50 p-3 rounded-xl border border-slate-100 text-xs mb-3">
+                  <div>
+                    <span class="text-slate-400 text-[11px]">建议目标止盈价</span>
+                    <div class="font-bold text-emerald-600 num-font text-sm mt-0.5">
+                      ${{ pick.target_price ? pick.target_price.toFixed(2) : '--' }}
+                    </div>
+                  </div>
+                  <div>
+                    <span class="text-slate-400 text-[11px]">上涨概率研判</span>
+                    <div class="font-bold text-indigo-600 text-sm mt-0.5 flex items-center gap-1">
+                      <i class="fa-solid fa-chart-line text-xs"></i>
+                      高确定性 (High)
+                    </div>
+                  </div>
+                </div>
+
+                <!-- AI Reasoning Quote Box -->
+                <div class="bg-slate-50/60 p-3.5 rounded-xl border border-slate-100 text-xs text-slate-600 leading-relaxed mb-4">
+                  <div class="text-[11px] font-semibold text-slate-800 mb-1 flex items-center gap-1.5">
+                    <i class="fa-solid fa-quote-left text-slate-400"></i>
+                    核心逻辑研判：
+                  </div>
+                  {{ pick.reason }}
+                </div>
+              </div>
+
+              <!-- Action button -->
+              <div class="pt-3 border-t border-slate-100 flex items-center justify-between">
+                <span class="text-[11px] text-slate-400">已自动向推送群发送精选卡片</span>
+                <button
+                  @click="quickTrack(pick)"
+                  class="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 text-slate-700 text-xs font-semibold transition flex items-center gap-1.5">
+                  <i class="fa-solid fa-plus text-[10px]"></i>
+                  以此策略加入盯盘
+                </button>
+              </div>
+
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- ============================================== -->
+      <!-- TAB 3: ALERT LOGS STREAM                       -->
+      <!-- ============================================== -->
+      <div v-if="currentTab === 'alerts'" class="space-y-5">
+        <div class="bg-white rounded-2xl p-5 sm:p-6 border border-slate-200/90 shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] space-y-4">
+          
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-bell text-indigo-600"></i>
+                预警与推送流水记录
+              </h2>
+              <p class="text-xs text-slate-500 mt-1">记录系统巡检触发的阶梯冲高、止损防线预警及常规播报</p>
+            </div>
+
+            <button
+              @click="fetchLogs"
+              class="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-semibold transition flex items-center gap-1.5">
+              <i class="fa-solid fa-rotate text-slate-400 text-[11px]"></i>
+              <span>刷新日志</span>
+            </button>
+          </div>
+
+          <!-- Empty State -->
+          <div v-if="alertLogs.length === 0" class="py-16 text-center border-2 border-dashed border-slate-200 rounded-2xl">
+            <div class="w-12 h-12 rounded-full bg-slate-50 border border-slate-200 flex items-center justify-center text-slate-400 text-lg mx-auto mb-2">
+              <i class="fa-solid fa-inbox"></i>
+            </div>
+            <p class="text-xs text-slate-400">暂无预警日志，当持仓触碰设定条件时将自动在此记录</p>
+          </div>
+
+          <!-- Log Timeline -->
+          <div v-else class="divide-y divide-slate-100">
+            <div v-for="log in alertLogs" :key="log.id"
+                 class="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs hover:bg-slate-50/60 px-2 rounded-xl transition">
+              
+              <div class="flex items-center gap-3">
+                <div class="w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold"
+                     :class="{
+                       'bg-emerald-50 text-emerald-600 border border-emerald-200': log.alert_type === 'take_profit' || log.alert_type === 'ladder',
+                       'bg-rose-50 text-rose-600 border border-rose-200': log.alert_type === 'stop_loss',
+                       'bg-indigo-50 text-indigo-600 border border-indigo-200': log.alert_type === 'periodic'
+                     }">
+                  <i class="fa-solid" :class="{
+                    'fa-arrow-trend-up': log.alert_type === 'take_profit' || log.alert_type === 'ladder',
+                    'fa-triangle-exclamation': log.alert_type === 'stop_loss',
+                    'fa-clock': log.alert_type === 'periodic'
+                  }"></i>
+                </div>
+
+                <div>
+                  <div class="flex items-center gap-2">
+                    <span class="font-extrabold text-slate-900 num-font">{{ log.symbol }}</span>
+                    <span class="px-2 py-0.2 rounded-full text-[10px] font-semibold"
+                          :class="{
+                            'bg-emerald-50 text-emerald-700': log.alert_type === 'take_profit' || log.alert_type === 'ladder',
+                            'bg-rose-50 text-rose-700': log.alert_type === 'stop_loss',
+                            'bg-slate-100 text-slate-600': log.alert_type === 'periodic'
+                          }">
+                      {{ formatAlertType(log.alert_type) }}
+                    </span>
+                  </div>
+                  <div class="text-slate-600 mt-0.5 font-medium">{{ log.message }}</div>
+                </div>
+              </div>
+
+              <div class="text-slate-400 text-[11px] num-font sm:text-right">
+                {{ log.created_at }}
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- ============================================== -->
+      <!-- TAB 4: SYSTEM & API CONFIGURATION              -->
+      <!-- ============================================== -->
+      <div v-if="currentTab === 'settings'" class="space-y-5">
+        <div class="bg-white rounded-2xl p-5 sm:p-6 border border-slate-200/90 shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] space-y-6">
+          
+          <div class="flex items-center justify-between pb-4 border-b border-slate-100">
+            <div>
+              <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
+                <i class="fa-solid fa-sliders text-indigo-600"></i>
+                系统与 API 接入设置
+              </h2>
+              <p class="text-xs text-slate-500 mt-1">
+                在线更新币安 API 密钥、大模型端点及飞书/企微 Webhook，保存后服务热重载实时生效
+              </p>
+            </div>
+
+            <button
+              @click="saveConfig"
+              :disabled="savingConfig"
+              class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-sm shadow-indigo-200 flex items-center gap-1.5 transition disabled:opacity-50">
+              <i class="fa-solid" :class="savingConfig ? 'fa-spinner fa-spin' : 'fa-check'"></i>
+              <span>{{ savingConfig ? '正在保存...' : '保存并实时生效' }}</span>
+            </button>
+          </div>
+
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+            
+            <!-- Group 1: Binance Gateway -->
+            <div class="p-5 rounded-2xl border border-slate-200/80 bg-slate-50/40 space-y-4">
+              <div class="flex items-center justify-between">
+                <h3 class="font-bold text-slate-900 text-xs flex items-center gap-2">
+                  <i class="fa-brands fa-bitcoin text-amber-500 text-sm"></i>
+                  币安行情网关与持仓鉴权
+                </h3>
+                <button @click="testConn('binance')" class="text-xs text-indigo-600 hover:text-indigo-700 font-semibold px-2 py-1 rounded bg-indigo-50 border border-indigo-100 transition">
+                  测试连通性
+                </button>
+              </div>
+
+              <div>
+                <div class="flex items-center justify-between mb-1">
+                  <label class="block text-slate-600 text-xs font-medium">Binance API Key (公钥)</label>
+                  <span v-if="config.has_binance_key" class="text-[11px] font-semibold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100">
+                    <i class="fa-solid fa-circle-check text-[10px]"></i> 已配置生效
+                  </span>
+                </div>
+                <input v-model="config.binance_api_key" type="text"
+                       :placeholder="config.has_binance_key ? (config.binance_api_key || '••••••••') : '填入币安 API Key'"
+                       class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+              </div>
+
+              <div>
+                <div class="flex items-center justify-between mb-1">
+                  <label class="block text-slate-600 text-xs font-medium">Binance API Secret (私钥，仅用于读取现货持仓)</label>
+                  <span v-if="config.has_binance_secret" class="text-[11px] font-semibold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100">
+                    <i class="fa-solid fa-circle-check text-[10px]"></i> 已配置生效
+                  </span>
+                </div>
+                <input v-model="config.binance_api_secret" type="password"
+                       :placeholder="config.has_binance_secret ? '••••••••••••••••' : '填入币安 API Secret（只需只读权限）'"
+                       class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+              </div>
+
+              <div>
+                <label class="block text-slate-600 text-xs mb-1 font-medium">币安远程 MCP 端点</label>
+                <input v-model="config.binance_mcp_url" type="text"
+                       placeholder="https://agent.binance.com/mcp/agentic"
+                       class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+              </div>
+            </div>
+
+            <!-- Group 2: AI Model Settings -->
+            <div class="p-5 rounded-2xl border border-slate-200/80 bg-slate-50/40 space-y-4">
+              <div class="flex items-center justify-between">
+                <h3 class="font-bold text-slate-900 text-xs flex items-center gap-2">
+                  <i class="fa-solid fa-brain text-violet-500 text-sm"></i>
+                  大模型推理引擎 (OpenAI / Gemini 兼容)
+                </h3>
+                <button @click="testConn('llm')" class="text-xs text-indigo-600 hover:text-indigo-700 font-semibold px-2 py-1 rounded bg-indigo-50 border border-indigo-100 transition">
+                  测试调用
+                </button>
+              </div>
+
+              <div>
+                <div class="flex items-center justify-between mb-1">
+                  <label class="block text-slate-600 text-xs font-medium">API Key</label>
+                  <span v-if="config.has_openai_key" class="text-[11px] font-semibold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100">
+                    <i class="fa-solid fa-circle-check text-[10px]"></i> 已配置生效
+                  </span>
+                </div>
+                <input v-model="config.openai_api_key" type="password"
+                       :placeholder="config.has_openai_key ? (config.openai_api_key || 'sk-••••••••') : 'sk-...'"
+                       class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+              </div>
+
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="block text-slate-600 text-xs mb-1 font-medium">API Base URL</label>
+                  <input v-model="config.openai_base_url" type="text"
+                         placeholder="https://api.openai.com/v1"
+                         class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+                </div>
+                <div>
+                  <label class="block text-slate-600 text-xs mb-1 font-medium">模型名称 (Model)</label>
+                  <input v-model="config.openai_model" type="text"
+                         placeholder="gpt-4o-mini 或 gemini-3.8-flash-high"
+                         class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+                </div>
+              </div>
+            </div>
+
+            <!-- Group 3: Feishu Webhook -->
+            <div class="p-5 rounded-2xl border border-slate-200/80 bg-slate-50/40 space-y-4">
+              <div class="flex items-center justify-between">
+                <h3 class="font-bold text-slate-900 text-xs flex items-center gap-2">
+                  <i class="fa-solid fa-paper-plane text-sky-500 text-sm"></i>
+                  飞书自定义机器人 Webhook
+                </h3>
+                <button @click="testConn('feishu')" class="text-xs text-indigo-600 hover:text-indigo-700 font-semibold px-2 py-1 rounded bg-indigo-50 border border-indigo-100 transition">
+                  发送测试卡片
+                </button>
+              </div>
+
+              <div>
+                <label class="block text-slate-600 text-xs mb-1 font-medium">Webhook URL</label>
+                <input v-model="config.feishu_webhook_url" type="text"
+                       placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
+                       class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+                <p class="text-[11px] text-slate-400 mt-1">飞书群添加「自定义机器人」获取 Webhook，推送富文本卡片。</p>
+              </div>
+            </div>
+
+            <!-- Group 4: WeCom Webhook -->
+            <div class="p-5 rounded-2xl border border-slate-200/80 bg-slate-50/40 space-y-4">
+              <div class="flex items-center justify-between">
+                <h3 class="font-bold text-slate-900 text-xs flex items-center gap-2">
+                  <i class="fa-solid fa-comments text-emerald-500 text-sm"></i>
+                  企业微信机器人 Webhook
+                </h3>
+                <button @click="testConn('wecom')" class="text-xs text-indigo-600 hover:text-indigo-700 font-semibold px-2 py-1 rounded bg-indigo-50 border border-indigo-100 transition">
+                  发送测试消息
+                </button>
+              </div>
+
+              <div>
+                <label class="block text-slate-600 text-xs mb-1 font-medium">Webhook URL</label>
+                <input v-model="config.wecom_webhook_url" type="text"
+                       placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxx"
+                       class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+                <p class="text-[11px] text-slate-400 mt-1">企业微信群添加群机器人获取 Webhook，推送 Markdown 告警通知。</p>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Bottom Test Result Banner -->
+          <div v-if="testResult"
+               class="p-4 rounded-xl text-xs flex items-center gap-2.5 border"
+               :class="testResult.success ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-rose-50 border-rose-200 text-rose-800'">
+            <i class="fa-solid text-sm" :class="testResult.success ? 'fa-circle-check text-emerald-600' : 'fa-circle-exclamation text-rose-600'"></i>
+            <span>{{ testResult.message }}</span>
+          </div>
+
+        </div>
+      </div>
+
+    </main>
+
+    <!-- Modal: Add Position Manually -->
+    <div v-if="openAddModal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+      <div class="bg-white rounded-2xl border border-slate-200/90 max-w-md w-full p-6 shadow-2xl animate-in fade-in zoom-in duration-200">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="text-base font-bold text-slate-900 flex items-center gap-2">
+            <i class="fa-solid fa-plus-circle text-indigo-600"></i>
+            手动添加 bStocks 监控标的
+          </h3>
+          <button @click="openAddModal = false" class="text-slate-400 hover:text-slate-600">
+            <i class="fa-solid fa-xmark text-lg"></i>
+          </button>
+        </div>
+
+        <form @submit.prevent="submitAddPosition" class="space-y-4 text-xs">
+          <div>
+            <label class="block text-slate-700 mb-1 font-semibold">标的代码 (bStocks)</label>
+            <input v-model="newPos.symbol" type="text" placeholder="例如: NVDABUSDT 或 TSLAB" required
+                   class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+          </div>
+
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-slate-700 mb-1 font-semibold">买入成本价 (USDT)</label>
+              <input v-model.number="newPos.buy_price" type="number" step="any" placeholder="135.5" required
+                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+              <label class="block text-slate-700 mb-1 font-semibold">持仓数量</label>
+              <input v-model.number="newPos.quantity" type="number" step="any" placeholder="10" required
+                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-slate-700 mb-1 font-semibold">目标止盈价 (选填)</label>
+              <input v-model.number="newPos.take_profit_price" type="number" step="any" placeholder="150.0"
+                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+              <label class="block text-slate-700 mb-1 font-semibold">防守止损价 (选填)</label>
+              <input v-model.number="newPos.stop_loss_price" type="number" step="any" placeholder="125.0"
+                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-slate-700 mb-1 font-semibold">常规汇报周期 (小时)</label>
+            <input v-model.number="newPos.check_interval_hours" type="number" min="1" max="24"
+                   class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+          </div>
+
+          <div class="flex justify-end gap-2.5 pt-3">
+            <button type="button" @click="openAddModal = false"
+                    class="px-4 py-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 font-medium transition">
+              取消
+            </button>
+            <button type="submit"
+                    class="px-5 py-2 rounded-xl bg-indigo-600 text-white font-semibold hover:bg-indigo-700 shadow-sm shadow-indigo-200 transition">
+              确认添加
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Modal: Edit Position TP/SL -->
+    <div v-if="editingPos" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+      <div class="bg-white rounded-2xl border border-slate-200/90 max-w-md w-full p-6 shadow-2xl">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="text-base font-bold text-slate-900 flex items-center gap-2">
+            <i class="fa-solid fa-sliders text-indigo-600"></i>
+            调整止盈与止损线: {{ editingPos.symbol }}
+          </h3>
+          <button @click="editingPos = null" class="text-slate-400 hover:text-slate-600">
+            <i class="fa-solid fa-xmark text-lg"></i>
+          </button>
+        </div>
+
+        <div class="space-y-4 text-xs">
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-slate-700 mb-1 font-semibold">买入成本价 (USDT)</label>
+              <input v-model.number="editingPos.buy_price" type="number" step="any"
+                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+              <label class="block text-slate-700 mb-1 font-semibold">持仓数量</label>
+              <input v-model.number="editingPos.quantity" type="number" step="any"
+                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-slate-700 mb-1 font-semibold">目标止盈价 (USDT)</label>
+            <input v-model.number="editingPos.take_profit_price" type="number" step="any"
+                   class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+          </div>
+
+          <div>
+            <label class="block text-slate-700 mb-1 font-semibold">安全止损价 (USDT)</label>
+            <input v-model.number="editingPos.stop_loss_price" type="number" step="any"
+                   class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+          </div>
+
+          <div class="flex justify-end gap-2.5 pt-3">
+            <button type="button" @click="editingPos = null"
+                    class="px-4 py-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 font-medium transition">
+              取消
+            </button>
+            <button type="button" @click="saveEditPosition"
+                    class="px-5 py-2 rounded-xl bg-indigo-600 text-white font-semibold hover:bg-indigo-700 shadow-sm shadow-indigo-200 transition">
+              保存更改
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const { createApp, ref, onMounted, computed } = Vue;
+
+    createApp({
+      setup() {
+        const currentTab = ref('positions'); // positions | picks | alerts | settings
+        const positions = ref([]);
+        const dailyPicks = ref([]);
+        const alertLogs = ref([]);
+        const analyzing = ref(false);
+        const openAddModal = ref(false);
+        const editingPos = ref(null);
+        const savingConfig = ref(false);
+        const syncingBinance = ref(false);
+        const testResult = ref(null);
+        const toasts = ref([]);
+        const countdown = ref(60);
+
+        const config = ref({
+          binance_api_key: '',
+          binance_api_secret: '',
+          binance_mcp_url: 'https://agent.binance.com/mcp/agentic',
+          has_binance_key: false,
+          has_binance_secret: false,
+          openai_api_key: '',
+          openai_base_url: 'https://api.openai.com/v1',
+          openai_model: 'gpt-4o-mini',
+          has_openai_key: false,
+          feishu_webhook_url: '',
+          wecom_webhook_url: ''
+        });
+
+        const newPos = ref({
+          symbol: '',
+          buy_price: null,
+          quantity: 1,
+          take_profit_price: null,
+          stop_loss_price: null,
+          check_interval_hours: 1,
+          ladder_alerts: [5.0, 10.0, 20.0]
+        });
+
+        const showToast = (message, type = 'info') => {
+          const id = Date.now() + Math.random();
+          toasts.value.push({ id, message, type });
+          setTimeout(() => removeToast(id), 4500);
+        };
+
+        const removeToast = (id) => {
+          toasts.value = toasts.value.filter(t => t.id !== id);
+        };
+
+        const totalPnL = computed(() => {
+          return positions.value.reduce((acc, pos) => {
+            if (pos.current_price && pos.buy_price) {
+              return acc + (pos.current_price - pos.buy_price) * pos.quantity;
+            }
+            return acc;
+          }, 0);
+        });
+
+        const calcRangeProgress = (pos) => {
+          if (!pos.current_price || !pos.stop_loss_price || !pos.take_profit_price) return 50;
+          const low = pos.stop_loss_price;
+          const high = pos.take_profit_price;
+          if (high <= low) return 50;
+          const pct = ((pos.current_price - low) / (high - low)) * 100;
+          return Math.max(5, Math.min(95, pct));
+        };
+
+        const formatAlertType = (type) => {
+          const map = {
+            'take_profit': '止盈冲高',
+            'stop_loss': '跌破止损',
+            'ladder': '阶梯达成',
+            'periodic': '常规巡检'
+          };
+          return map[type] || type;
+        };
+
+        const fetchPositions = async () => {
+          try {
+            const res = await fetch('/api/positions');
+            positions.value = await res.json();
+          } catch (e) {
+            console.error(e);
+          }
+        };
+
+        const fetchPicks = async () => {
+          try {
+            const res = await fetch('/api/analysis/picks');
+            dailyPicks.value = await res.json();
+          } catch (e) {
+            console.error(e);
+          }
+        };
+
+        const fetchLogs = async () => {
+          try {
+            const res = await fetch('/api/alerts/logs');
+            alertLogs.value = await res.json();
+          } catch (e) {
+            console.error(e);
+          }
+        };
+
+        const fetchConfig = async () => {
+          try {
+            const res = await fetch('/api/config');
+            const data = await res.json();
+            config.value = { ...config.value, ...data };
+          } catch (e) {
+            console.error(e);
+          }
+        };
+
+        const saveConfig = async () => {
+          savingConfig.value = true;
+          testResult.value = null;
+          try {
+            const res = await fetch('/api/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(config.value)
+            });
+            const data = await res.json();
+            showToast(data.message || '配置已成功保存并实时生效', 'success');
+            await fetchConfig();
+          } catch (e) {
+            showToast('保存失败: ' + e, 'error');
+          } finally {
+            savingConfig.value = false;
+          }
+        };
+
+        const testConn = async (service) => {
+          testResult.value = { success: true, message: `正在测试 ${service} 连通性...` };
+          try {
+            const payload = {
+              service: service,
+              api_key: service === 'binance' ? config.value.binance_api_key : config.value.openai_api_key,
+              base_url: service === 'binance' ? config.value.binance_mcp_url : config.value.openai_base_url,
+              model: config.value.openai_model,
+              webhook_url: service === 'feishu' ? config.value.feishu_webhook_url : config.value.wecom_webhook_url
+            };
+            const res = await fetch('/api/config/test', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            testResult.value = data;
+            showToast(data.message, data.success ? 'success' : 'error');
+          } catch (e) {
+            testResult.value = { success: false, message: '测试请求异常: ' + e };
+            showToast('测试异常: ' + e, 'error');
+          }
+        };
+
+        const triggerAnalysis = async () => {
+          analyzing.value = true;
+          try {
+            showToast('AI Agent 正在分析全市场代币化美股形态...', 'info');
+            const res = await fetch('/api/analysis/run', { method: 'POST' });
+            const data = await res.json();
+            await fetchPicks();
+            currentTab.value = 'picks';
+            showToast(`研判完成，已生成 ${data.count || 0} 只潜力标的建议`, 'success');
+          } catch (e) {
+            showToast('选股分析执行失败: ' + e, 'error');
+          } finally {
+            analyzing.value = false;
+          }
+        };
+
+        const submitAddPosition = async () => {
+          try {
+            let sym = newPos.value.symbol.trim().toUpperCase();
+            if (!sym.endsWith('USDT') && !sym.endsWith('B')) {
+              sym = sym + 'BUSDT';
+            }
+            const payload = { ...newPos.value, symbol: sym };
+            const res = await fetch('/api/positions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            if (res.ok) {
+              openAddModal.value = false;
+              newPos.value = { symbol: '', buy_price: null, quantity: 1, take_profit_price: null, stop_loss_price: null, check_interval_hours: 1, ladder_alerts: [5.0, 10.0, 20.0] };
+              await fetchPositions();
+              currentTab.value = 'positions';
+              showToast(`已成功录入并开始监控 ${sym}`, 'success');
+            } else {
+              showToast('添加失败', 'error');
+            }
+          } catch (e) {
+            showToast('请求异常: ' + e, 'error');
+          }
+        };
+
+        const deletePosition = async (id) => {
+          try {
+            await fetch(`/api/positions/${id}`, { method: 'DELETE' });
+            await fetchPositions();
+            showToast('持仓监控已停止并移除', 'info');
+          } catch (e) {
+            showToast('移除异常: ' + e, 'error');
+          }
+        };
+
+        const syncFromBinance = async () => {
+          syncingBinance.value = true;
+          try {
+            const res = await fetch('/api/positions/sync-binance', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) {
+              showToast('同步失败: ' + (data.detail || JSON.stringify(data)), 'error');
+            } else {
+              if (data.count > 0 && data.synced && data.synced.length > 0) {
+                const names = data.synced.map(s => `${s.symbol} (${s.quantity})`).join(', ');
+                showToast(`成功同步 ${data.count} 个持仓: ${names}`, 'success');
+              } else {
+                showToast(data.message || '未检测到大于 $1.0 的有效持仓', 'info');
+              }
+              await fetchPositions();
+            }
+          } catch (e) {
+            showToast('网络异常: ' + e, 'error');
+          } finally {
+            syncingBinance.value = false;
+          }
+        };
+
+        const openEditModal = (pos) => {
+          editingPos.value = { ...pos };
+        };
+
+        const saveEditPosition = async () => {
+          if (!editingPos.value || !editingPos.value.id) return;
+          try {
+            const res = await fetch(`/api/positions/${editingPos.value.id}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                buy_price: parseFloat(editingPos.value.buy_price),
+                quantity: parseFloat(editingPos.value.quantity),
+                take_profit_price: parseFloat(editingPos.value.take_profit_price),
+                stop_loss_price: parseFloat(editingPos.value.stop_loss_price)
+              })
+            });
+            if (res.ok) {
+              showToast('持仓参数已成功更新', 'success');
+              editingPos.value = null;
+              await fetchPositions();
+            } else {
+              const d = await res.json();
+              showToast('更新失败: ' + (d.detail || JSON.stringify(d)), 'error');
+            }
+          } catch (e) {
+            showToast('更新异常: ' + e, 'error');
+          }
+        };
+
+        const quickAnalyze = (symbol) => {
+          currentTab.value = 'picks';
+          triggerAnalysis();
+        };
+
+        const quickTrack = (pick) => {
+          newPos.value.symbol = pick.symbol;
+          newPos.value.take_profit_price = pick.target_price;
+          newPos.value.stop_loss_price = pick.stop_loss_price;
+          openAddModal.value = true;
+        };
+
+        onMounted(() => {
+          fetchPositions();
+          fetchPicks();
+          fetchLogs();
+          fetchConfig();
+
+          setInterval(() => {
+            if (countdown.value <= 1) {
+              countdown.value = 60;
+              if (currentTab.value === 'positions') fetchPositions();
+              if (currentTab.value === 'alerts') fetchLogs();
+            } else {
+              countdown.value--;
+            }
+          }, 1000);
+        });
+
+        return {
+          currentTab,
+          positions,
+          dailyPicks,
+          alertLogs,
+          config,
+          analyzing,
+          openAddModal,
+          editingPos,
+          savingConfig,
+          syncingBinance,
+          testResult,
+          toasts,
+          countdown,
+          newPos,
+          totalPnL,
+          calcRangeProgress,
+          formatAlertType,
+          showToast,
+          removeToast,
+          fetchPositions,
+          fetchPicks,
+          fetchLogs,
+          fetchConfig,
+          saveConfig,
+          testConn,
+          triggerAnalysis,
+          submitAddPosition,
+          deletePosition,
+          syncFromBinance,
+          openEditModal,
+          saveEditPosition,
+          quickAnalyze,
+          quickTrack
+        };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>

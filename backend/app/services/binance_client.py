@@ -1,5 +1,9 @@
+import hashlib
+import hmac
 import logging
+import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 import httpx
 
 from backend.app.config import settings
@@ -28,11 +32,13 @@ class BinanceClient:
         self,
         mcp_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
         rest_base_url: str = "https://api.binance.com",
         timeout: float = 10.0
     ):
         self.mcp_url = mcp_url if mcp_url is not None else settings.BINANCE_MCP_URL
         self.api_key = api_key if api_key is not None else settings.BINANCE_API_KEY
+        self.api_secret = api_secret if api_secret is not None else settings.BINANCE_API_SECRET
         self.rest_base_url = rest_base_url.rstrip("/")
         self.timeout = timeout
 
@@ -153,3 +159,197 @@ class BinanceClient:
                 })
 
         return klines
+
+    def _generate_signature(self, params: Dict[str, Any]) -> str:
+        """
+        Generate HMAC-SHA256 signature for Binance Private Signed Endpoints.
+        """
+        if not self.api_secret:
+            raise ValueError("BINANCE_API_SECRET 未配置，无法调用币安私有鉴权接口")
+        query_str = urlencode(params)
+        return hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_str.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
+    async def get_account_balances(self) -> List[Dict[str, Any]]:
+        """
+        Fetch combined account balances from Binance:
+        1. Spot account (GET /api/v3/account)
+        2. Funding account (POST /sapi/v1/asset/get-funding-asset) - holds bStocks/Pay/Convert assets
+        Returns all non-zero asset balances merged by asset.
+        """
+        if not self.api_key or not self.api_secret:
+            raise ValueError("需要同时配置币安 API Key 和 API Secret 才能读取账户持仓")
+
+        balances_map: Dict[str, Dict[str, Any]] = {}
+
+        # 1. Fetch Spot Account Balances
+        try:
+            params: Dict[str, Any] = {
+                "timestamp": int(time.time() * 1000),
+                "recvWindow": 5000
+            }
+            params["signature"] = self._generate_signature(params)
+            headers = {"X-MBX-APIKEY": self.api_key}
+            url = f"{self.rest_base_url}/api/v3/account"
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for b in data.get("balances", []):
+                        asset = b.get("asset", "").upper()
+                        free = float(b.get("free", 0))
+                        locked = float(b.get("locked", 0))
+                        tot = free + locked
+                        if tot > 0:
+                            balances_map[asset] = {
+                                "asset": asset,
+                                "free": free,
+                                "locked": locked,
+                                "total": tot,
+                                "wallet": "现货账户"
+                            }
+                else:
+                    logger.warning(f"获取币安现货账户失败: {resp.status_code} {resp.text}")
+        except Exception as e:
+            logger.warning(f"获取币安现货账户异常: {e}")
+
+        # 2. Fetch Funding Account Balances (资金账户 - bStocks 常用账户)
+        try:
+            params = {
+                "needBtcValuation": "false",
+                "timestamp": int(time.time() * 1000),
+                "recvWindow": 5000
+            }
+            params["signature"] = self._generate_signature(params)
+            headers = {"X-MBX-APIKEY": self.api_key}
+            url = f"{self.rest_base_url}/sapi/v1/asset/get-funding-asset"
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(url, params=params, headers=headers)
+                if resp.status_code == 200:
+                    funding_data = resp.json()
+                    if isinstance(funding_data, list):
+                        for b in funding_data:
+                            asset = b.get("asset", "").upper()
+                            free = float(b.get("free", 0))
+                            locked = float(b.get("locked", 0)) + float(b.get("freeze", 0)) + float(b.get("withdrawing", 0))
+                            tot = free + locked
+                            if tot > 0:
+                                if asset in balances_map:
+                                    balances_map[asset]["free"] += free
+                                    balances_map[asset]["locked"] += locked
+                                    balances_map[asset]["total"] += tot
+                                    balances_map[asset]["wallet"] = "现货+资金账户"
+                                else:
+                                    balances_map[asset] = {
+                                        "asset": asset,
+                                        "free": free,
+                                        "locked": locked,
+                                        "total": tot,
+                                        "wallet": "资金账户"
+                                    }
+                else:
+                    logger.info(f"获取币安资金账户提示: {resp.status_code} {resp.text}")
+        except Exception as e:
+            logger.warning(f"获取币安资金账户异常: {e}")
+
+        return list(balances_map.values())
+
+    async def get_average_buy_price(self, symbol: str) -> Optional[float]:
+        """
+        Calculate weighted average buy price from:
+        1. Recent buy trades in Spot market (GET /api/v3/myTrades).
+        2. Recent Binance Convert orders (GET /sapi/v1/convert/tradeFlow).
+        """
+        if not self.api_key or not self.api_secret:
+            return None
+
+        clean_symbol = symbol.upper()
+
+        # 1. Check Spot Trades
+        try:
+            params: Dict[str, Any] = {
+                "symbol": clean_symbol,
+                "limit": 50,
+                "timestamp": int(time.time() * 1000),
+                "recvWindow": 5000
+            }
+            params["signature"] = self._generate_signature(params)
+            headers = {"X-MBX-APIKEY": self.api_key}
+            url = f"{self.rest_base_url}/api/v3/myTrades"
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                if resp.status_code == 200:
+                    trades = resp.json()
+                    if isinstance(trades, list) and len(trades) > 0:
+                        trades.sort(key=lambda x: x.get("time", 0))
+                        current_inventory = 0.0
+                        current_cost = 0.0
+                        last_buy_price = None
+
+                        for t in trades:
+                            qty = float(t.get("qty", 0))
+                            price = float(t.get("price", 0))
+                            is_buyer = t.get("isBuyer", True)
+
+                            if is_buyer:
+                                current_cost += qty * price
+                                current_inventory += qty
+                                last_buy_price = price
+                            else:
+                                if current_inventory > 0:
+                                    unit_cost = current_cost / current_inventory
+                                    sold_qty = min(qty, current_inventory)
+                                    current_inventory -= sold_qty
+                                    current_cost -= sold_qty * unit_cost
+                                    if current_inventory <= 1e-5:
+                                        current_inventory = 0.0
+                                        current_cost = 0.0
+
+                        if current_inventory > 1e-5:
+                            return round(current_cost / current_inventory, 4)
+                        if last_buy_price is not None:
+                            return last_buy_price
+        except Exception as e:
+            logger.warning(f"获取 {clean_symbol} 现货成交记录异常: {e}")
+
+        # 2. Check Convert Trade Flow (闪兑/换币记录)
+        try:
+            base_asset = clean_symbol.replace("USDT", "").replace("USDC", "")
+            now_ms = int(time.time() * 1000)
+            convert_params: Dict[str, Any] = {
+                "startTime": now_ms - (90 * 24 * 3600 * 1000),
+                "endTime": now_ms,
+                "timestamp": now_ms,
+                "recvWindow": 5000
+            }
+            convert_params["signature"] = self._generate_signature(convert_params)
+            headers = {"X-MBX-APIKEY": self.api_key}
+            url = f"{self.rest_base_url}/sapi/v1/convert/tradeFlow"
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(url, params=convert_params, headers=headers)
+                if resp.status_code == 200:
+                    flow_data = resp.json()
+                    trades = flow_data.get("list", [])
+                    # Find matching buy trades where toAsset matches our base_asset
+                    for item in reversed(trades):
+                        to_asset = item.get("toAsset", "").upper()
+                        from_asset = item.get("fromAsset", "").upper()
+                        if to_asset == base_asset and from_asset in ["USDT", "USDC", "BUSD", "FDUSD", "USD"]:
+                            to_amt = float(item.get("toAmount", 0))
+                            from_amt = float(item.get("fromAmount", 0))
+                            if to_amt > 0:
+                                unit_price = round(from_amt / to_amt, 4)
+                                logger.info(f"从闪兑订单获取到 {clean_symbol} 买入成本价: {unit_price}")
+                                return unit_price
+        except Exception as e:
+            logger.warning(f"获取 {clean_symbol} 闪兑记录异常: {e}")
+
+        return None
+

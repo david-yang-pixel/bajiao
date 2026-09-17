@@ -145,3 +145,63 @@ async def test_call_mcp_fallback_to_rest():
             result = await client._call_mcp_or_api("ticker/price", {"symbol": "TSLABUSDT"})
             assert result == {"symbol": "TSLABUSDT", "price": "220.10"}
             mock_rest.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_get_account_balances_spot_and_funding():
+    client = BinanceClient(api_key="key", api_secret="secret")
+    
+    async def mock_get(url, **kwargs):
+        resp = AsyncMock()
+        resp.status_code = 200
+        resp.json = lambda: {
+            "balances": [
+                {"asset": "MRVLB", "free": "0.000293", "locked": "0.0"}
+            ]
+        }
+        return resp
+
+    async def mock_post(url, **kwargs):
+        resp = AsyncMock()
+        resp.status_code = 200
+        resp.json = lambda: [
+            {"asset": "AMZNB", "free": "0.65787882", "locked": "0", "freeze": "0", "withdrawing": "0"}
+        ]
+        return resp
+
+    with patch("httpx.AsyncClient.get", side_effect=mock_get), \
+         patch("httpx.AsyncClient.post", side_effect=mock_post):
+        balances = await client.get_account_balances()
+        assets = {b["asset"]: b for b in balances}
+        assert "AMZNB" in assets
+        assert assets["AMZNB"]["total"] == pytest.approx(0.65787882)
+        assert assets["AMZNB"]["wallet"] == "资金账户"
+        assert "MRVLB" in assets
+        assert assets["MRVLB"]["wallet"] == "现货账户"
+
+@pytest.mark.asyncio
+async def test_get_average_buy_price_convert_flow():
+    client = BinanceClient(api_key="key", api_secret="secret")
+
+    # When spot myTrades returns empty, fall back to convert flow
+    async def mock_get(url, **kwargs):
+        resp = AsyncMock()
+        resp.status_code = 200
+        if "myTrades" in url:
+            resp.json = lambda: []
+        elif "convert/tradeFlow" in url:
+            resp.json = lambda: {
+                "list": [
+                    {
+                        "toAsset": "AMZNB",
+                        "fromAsset": "USDC",
+                        "toAmount": "0.65787882",
+                        "fromAmount": "163.37152558"
+                    }
+                ]
+            }
+        return resp
+
+    with patch("httpx.AsyncClient.get", side_effect=mock_get):
+        price = await client.get_average_buy_price("AMZNBUSDT")
+        assert price == pytest.approx(248.3311, rel=1e-3)
+
