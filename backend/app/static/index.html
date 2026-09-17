@@ -362,7 +362,8 @@
           <!-- Position Cards Grid -->
           <div v-else class="grid grid-cols-1 lg:grid-cols-2 gap-4 pt-2">
             <div v-for="pos in positions" :key="pos.id"
-                 class="bg-white rounded-2xl border border-slate-200/90 p-5 shadow-sm hover:shadow-md transition-all relative overflow-hidden flex flex-col justify-between">
+                 @click="openEditModal(pos)"
+                 class="bg-white rounded-2xl border border-slate-200/90 hover:border-indigo-300 p-5 shadow-sm hover:shadow-md cursor-pointer transition-all relative overflow-hidden flex flex-col justify-between">
               
               <!-- Top Row: Symbol & PnL Pill -->
               <div>
@@ -413,14 +414,20 @@
                 <!-- Progress Bar: Stop-Loss to Take-Profit Distance -->
                 <div class="space-y-1.5 mb-4 text-xs">
                   <div class="flex items-center justify-between text-[11px]">
-                    <span class="text-rose-600 font-medium">
-                      <i class="fa-solid fa-shield-halved text-[9px] mr-0.5"></i>
-                      止损: ${{ pos.stop_loss_price || '未设' }}
+                    <span class="text-rose-600 font-medium flex items-center gap-1">
+                      <i class="fa-solid fa-shield-halved text-[9px]"></i>
+                      <span>止损: ${{ pos.stop_loss_price || '未设' }}</span>
+                      <span v-if="pos.stop_loss_price && pos.buy_price" class="px-1.5 py-0.2 rounded bg-rose-50 border border-rose-200/60 font-mono text-[10px]">
+                        -{{ (((pos.buy_price - pos.stop_loss_price) / pos.buy_price) * 100).toFixed(1) }}%
+                      </span>
                     </span>
                     <span class="text-slate-400">区间位置</span>
-                    <span class="text-emerald-600 font-medium">
-                      止盈: ${{ pos.take_profit_price || '未设' }}
-                      <i class="fa-solid fa-flag-checkered text-[9px] ml-0.5"></i>
+                    <span class="text-emerald-600 font-medium flex items-center gap-1">
+                      <span v-if="pos.take_profit_price && pos.buy_price" class="px-1.5 py-0.2 rounded bg-emerald-50 border border-emerald-200/60 font-mono text-[10px]">
+                        +{{ (((pos.take_profit_price - pos.buy_price) / pos.buy_price) * 100).toFixed(1) }}%
+                      </span>
+                      <span>止盈: ${{ pos.take_profit_price || '未设' }}</span>
+                      <i class="fa-solid fa-flag-checkered text-[9px]"></i>
                     </span>
                   </div>
                   
@@ -439,9 +446,9 @@
                         :class="pos.pnl_pct >= step ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-slate-100 text-slate-500'">
                     +{{ step }}%
                   </span>
-                  <span class="ml-auto text-slate-400 text-[10px]">
-                    <i class="fa-solid fa-clock text-[9px] mr-0.5"></i>
-                    {{ pos.check_interval_hours || 1 }}h 巡检
+                  <span class="ml-auto text-slate-500 text-[10px] font-mono flex items-center gap-1 bg-slate-50 px-2 py-0.5 rounded-md border border-slate-200/60">
+                    <i class="fa-solid fa-bell text-[9px] text-indigo-500"></i>
+                    {{ pos.check_interval_hours <= 0 ? '已关播报' : (pos.check_interval_hours < 1 ? Math.round(pos.check_interval_hours * 60) + 'm 飞书播报' : pos.check_interval_hours + 'h 飞书播报') }}
                   </span>
                 </div>
               </div>
@@ -449,7 +456,7 @@
               <!-- Bottom Actions -->
               <div class="pt-3 border-t border-slate-100 flex items-center justify-between">
                 <button
-                  @click="quickAnalyze(pos.symbol)"
+                  @click.stop="quickAnalyze(pos.symbol)"
                   class="text-xs text-indigo-600 hover:text-indigo-700 font-semibold flex items-center gap-1">
                   <i class="fa-solid fa-brain text-[11px]"></i>
                   AI 研判该标的
@@ -457,12 +464,13 @@
 
                 <div class="flex items-center gap-2">
                   <button
-                    @click="openEditModal(pos)"
-                    class="px-2.5 py-1 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-600 text-xs font-medium transition">
-                    设置止盈止损
+                    @click.stop="openEditModal(pos)"
+                    class="px-2.5 py-1 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-medium transition flex items-center gap-1">
+                    <i class="fa-solid fa-sliders text-indigo-600 text-[10px]"></i>
+                    <span>止盈止损与频率</span>
                   </button>
                   <button
-                    @click="deletePosition(pos.id)"
+                    @click.stop="deletePosition(pos.id)"
                     class="px-2 py-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition"
                     title="移除此监控">
                     <i class="fa-solid fa-trash-can text-xs"></i>
@@ -849,36 +857,124 @@
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="block text-slate-700 mb-1 font-semibold">买入成本价 (USDT)</label>
-              <input v-model.number="newPos.buy_price" type="number" step="any" placeholder="135.5" required
+              <input v-model.number="newPos.buy_price" @input="onNewBuyPriceChange" type="number" step="any" placeholder="例如: 248.33" required
                      class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
             </div>
             <div>
               <label class="block text-slate-700 mb-1 font-semibold">持仓数量</label>
-              <input v-model.number="newPos.quantity" type="number" step="any" placeholder="10" required
+              <input v-model.number="newPos.quantity" type="number" step="any" placeholder="例如: 1.0" required
                      class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
             </div>
           </div>
 
-          <div class="grid grid-cols-2 gap-3">
-            <div>
-              <label class="block text-slate-700 mb-1 font-semibold">目标止盈价 (选填)</label>
-              <input v-model.number="newPos.take_profit_price" type="number" step="any" placeholder="150.0"
-                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+          <!-- Section 1: Take Profit (上涨百分比 & 目标价) -->
+          <div class="bg-emerald-50/40 rounded-xl p-3 border border-emerald-100/80 space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-emerald-950 font-bold flex items-center gap-1.5 text-xs">
+                <i class="fa-solid fa-arrow-trend-up text-emerald-600"></i>
+                目标止盈 (上涨百分比 / 目标价)
+              </label>
+              <span v-if="newPos.take_profit_price && newPos.buy_price" class="text-emerald-700 font-mono font-bold text-[11px]">
+                预计盈利 +${{ (((newPos.take_profit_price - newPos.buy_price) * (newPos.quantity || 1))).toFixed(2) }}
+              </span>
             </div>
-            <div>
-              <label class="block text-slate-700 mb-1 font-semibold">防守止损价 (选填)</label>
-              <input v-model.number="newPos.stop_loss_price" type="number" step="any" placeholder="125.0"
-                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+
+            <div class="grid grid-cols-2 gap-2.5">
+              <div>
+                <div class="text-[10px] text-slate-500 mb-1 font-medium">设定上涨比例 (%)</div>
+                <div class="relative">
+                  <span class="absolute left-3 top-2.5 text-emerald-600 font-black font-mono">+</span>
+                  <input v-model.number="newPos.tp_pct" @input="onNewTpPctChange" type="number" step="any" placeholder="10.0"
+                         class="w-full bg-white border border-emerald-200 rounded-xl pl-7 pr-7 py-2 text-slate-900 font-mono font-bold focus:outline-none focus:border-emerald-500 shadow-sm">
+                  <span class="absolute right-3 top-2 text-slate-400 font-mono text-[11px]">%</span>
+                </div>
+              </div>
+
+              <div>
+                <div class="text-[10px] text-slate-500 mb-1 font-medium">对应目标价格 (USDT)</div>
+                <div class="relative">
+                  <span class="absolute left-3 top-2.5 text-slate-400 font-mono text-[11px]">$</span>
+                  <input v-model.number="newPos.take_profit_price" @input="onNewTpPriceChange" type="number" step="any"
+                         class="w-full bg-white border border-emerald-200 rounded-xl pl-7 pr-3 py-2 text-slate-900 font-mono font-bold focus:outline-none focus:border-emerald-500 shadow-sm">
+                </div>
+              </div>
+            </div>
+
+            <div class="flex items-center gap-1.5 pt-0.5 flex-wrap">
+              <span class="text-[10px] text-slate-400 font-medium">快捷预设:</span>
+              <button v-for="p in [5, 10, 15, 20, 30]" :key="p" type="button" @click="setNewTpPct(p)"
+                      :class="newPos.tp_pct === p ? 'bg-emerald-600 text-white font-bold shadow-xs' : 'bg-white text-emerald-800 border border-emerald-200 hover:bg-emerald-100/50'"
+                      class="px-2 py-0.5 rounded-lg text-[10px] font-mono transition">
+                +{{ p }}%
+              </button>
             </div>
           </div>
 
-          <div>
-            <label class="block text-slate-700 mb-1 font-semibold">常规汇报周期 (小时)</label>
-            <input v-model.number="newPos.check_interval_hours" type="number" min="1" max="24"
-                   class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+          <!-- Section 2: Stop Loss (下跌百分比 & 防守价) -->
+          <div class="bg-rose-50/40 rounded-xl p-3 border border-rose-100/80 space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-rose-950 font-bold flex items-center gap-1.5 text-xs">
+                <i class="fa-solid fa-shield-halved text-rose-600"></i>
+                安全止损 (下跌百分比 / 防守价)
+              </label>
+              <span v-if="newPos.stop_loss_price && newPos.buy_price" class="text-rose-700 font-mono font-bold text-[11px]">
+                最大回撤 -${{ (((newPos.buy_price - newPos.stop_loss_price) * (newPos.quantity || 1))).toFixed(2) }}
+              </span>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2.5">
+              <div>
+                <div class="text-[10px] text-slate-500 mb-1 font-medium">设定下跌比例 (%)</div>
+                <div class="relative">
+                  <span class="absolute left-3 top-2.5 text-rose-600 font-black font-mono">-</span>
+                  <input v-model.number="newPos.sl_pct" @input="onNewSlPctChange" type="number" step="any" placeholder="5.0"
+                         class="w-full bg-white border border-rose-200 rounded-xl pl-7 pr-7 py-2 text-slate-900 font-mono font-bold focus:outline-none focus:border-rose-500 shadow-sm">
+                  <span class="absolute right-3 top-2 text-slate-400 font-mono text-[11px]">%</span>
+                </div>
+              </div>
+
+              <div>
+                <div class="text-[10px] text-slate-500 mb-1 font-medium">对应防守价格 (USDT)</div>
+                <div class="relative">
+                  <span class="absolute left-3 top-2.5 text-slate-400 font-mono text-[11px]">$</span>
+                  <input v-model.number="newPos.stop_loss_price" @input="onNewSlPriceChange" type="number" step="any"
+                         class="w-full bg-white border border-rose-200 rounded-xl pl-7 pr-3 py-2 text-slate-900 font-mono font-bold focus:outline-none focus:border-rose-500 shadow-sm">
+                </div>
+              </div>
+            </div>
+
+            <div class="flex items-center gap-1.5 pt-0.5 flex-wrap">
+              <span class="text-[10px] text-slate-400 font-medium">快捷预设:</span>
+              <button v-for="p in [3, 5, 8, 10, 15]" :key="p" type="button" @click="setNewSlPct(p)"
+                      :class="newPos.sl_pct === p ? 'bg-rose-600 text-white font-bold shadow-xs' : 'bg-white text-rose-800 border border-rose-200 hover:bg-rose-100/50'"
+                      class="px-2 py-0.5 rounded-lg text-[10px] font-mono transition">
+                -{{ p }}%
+              </button>
+            </div>
           </div>
 
-          <div class="flex justify-end gap-2.5 pt-3">
+          <!-- Section 3: Feishu / Webhook 定时汇报周期 -->
+          <div class="bg-indigo-50/40 rounded-xl p-3 border border-indigo-100/80 space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-indigo-950 font-bold flex items-center gap-1.5 text-xs">
+                <i class="fa-solid fa-clock text-indigo-600"></i>
+                飞书 / 企微定时巡检播报频率
+              </label>
+            </div>
+            <p class="text-[11px] text-slate-500">
+              系统将自动向群内播报：当前最新价、买入成本、实时涨跌幅及浮动盈亏。
+            </p>
+            <div class="grid grid-cols-4 gap-1.5">
+              <button v-for="item in intervalOptions" :key="item.value" type="button"
+                      @click="newPos.check_interval_hours = item.value"
+                      :class="newPos.check_interval_hours === item.value ? 'bg-indigo-600 text-white font-bold shadow-xs' : 'bg-white text-slate-700 border border-indigo-100 hover:bg-indigo-50/60'"
+                      class="py-1.5 px-2 rounded-lg text-[11px] text-center font-medium transition">
+                {{ item.label }}
+              </button>
+            </div>
+          </div>
+
+          <div class="flex justify-end gap-2.5 pt-2">
             <button type="button" @click="openAddModal = false"
                     class="px-4 py-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 font-medium transition">
               取消
@@ -892,53 +988,175 @@
       </div>
     </div>
 
-    <!-- Modal: Edit Position TP/SL -->
+    <!-- Modal: Edit Position TP/SL and Feishu Interval -->
     <div v-if="editingPos" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-      <div class="bg-white rounded-2xl border border-slate-200/90 max-w-md w-full p-6 shadow-2xl">
-        <div class="flex items-center justify-between mb-4">
-          <h3 class="text-base font-bold text-slate-900 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-indigo-600"></i>
-            调整止盈与止损线: {{ editingPos.symbol }}
-          </h3>
-          <button @click="editingPos = null" class="text-slate-400 hover:text-slate-600">
+      <div class="bg-white rounded-2xl border border-slate-200/90 max-w-lg w-full p-6 shadow-2xl max-h-[90vh] overflow-y-auto">
+        
+        <!-- Header -->
+        <div class="flex items-center justify-between mb-4 pb-3 border-b border-slate-100">
+          <div>
+            <h3 class="text-base font-bold text-slate-900 flex items-center gap-2">
+              <i class="fa-solid fa-sliders text-indigo-600"></i>
+              持仓与监控配置: {{ editingPos.symbol }}
+            </h3>
+            <p class="text-[11px] text-slate-400 mt-0.5">
+              现价: ${{ editingPos.current_price ? editingPos.current_price.toFixed(2) : '--' }} ·
+              当前盈亏: <span :class="editingPos.pnl_pct >= 0 ? 'text-emerald-600' : 'text-rose-600'" class="font-bold">{{ editingPos.pnl_pct >= 0 ? '+' : '' }}{{ editingPos.pnl_pct ? editingPos.pnl_pct.toFixed(2) : '0.00' }}%</span>
+            </p>
+          </div>
+          <button @click="editingPos = null" class="text-slate-400 hover:text-slate-600 p-1">
             <i class="fa-solid fa-xmark text-lg"></i>
           </button>
         </div>
 
         <div class="space-y-4 text-xs">
+          <!-- Buy Price & Quantity -->
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="block text-slate-700 mb-1 font-semibold">买入成本价 (USDT)</label>
-              <input v-model.number="editingPos.buy_price" type="number" step="any"
-                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+              <input v-model.number="editingPos.buy_price" @input="onEditBuyPriceChange" type="number" step="any"
+                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono font-semibold focus:bg-white focus:outline-none focus:border-indigo-500">
             </div>
             <div>
               <label class="block text-slate-700 mb-1 font-semibold">持仓数量</label>
               <input v-model.number="editingPos.quantity" type="number" step="any"
-                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+                     class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono font-semibold focus:bg-white focus:outline-none focus:border-indigo-500">
             </div>
           </div>
 
-          <div>
-            <label class="block text-slate-700 mb-1 font-semibold">目标止盈价 (USDT)</label>
-            <input v-model.number="editingPos.take_profit_price" type="number" step="any"
-                   class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+          <!-- Section 1: Take Profit (上涨百分比 & 目标价) -->
+          <div class="bg-emerald-50/40 rounded-xl p-3.5 border border-emerald-100/80 space-y-2.5">
+            <div class="flex items-center justify-between">
+              <label class="text-emerald-950 font-bold flex items-center gap-1.5 text-xs">
+                <i class="fa-solid fa-arrow-trend-up text-emerald-600"></i>
+                目标止盈 (上涨百分比 / 目标价)
+              </label>
+              <span v-if="editingPos.take_profit_price && editingPos.buy_price" class="text-emerald-700 font-mono font-bold text-[11px]">
+                预计盈利 +${{ (((editingPos.take_profit_price - editingPos.buy_price) * (editingPos.quantity || 1))).toFixed(2) }}
+              </span>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <div class="text-[10px] text-slate-500 mb-1 font-medium">设定上涨比例 (%)</div>
+                <div class="relative">
+                  <span class="absolute left-3 top-2.5 text-emerald-600 font-black font-mono">+</span>
+                  <input v-model.number="editingPos.tp_pct" @input="onEditTpPctChange" type="number" step="any" placeholder="10.0"
+                         class="w-full bg-white border border-emerald-200 rounded-xl pl-7 pr-7 py-2 text-slate-900 font-mono font-bold focus:outline-none focus:border-emerald-500 shadow-sm">
+                  <span class="absolute right-3 top-2 text-slate-400 font-mono text-[11px]">%</span>
+                </div>
+              </div>
+
+              <div>
+                <div class="text-[10px] text-slate-500 mb-1 font-medium">对应目标价格 (USDT)</div>
+                <div class="relative">
+                  <span class="absolute left-3 top-2.5 text-slate-400 font-mono text-[11px]">$</span>
+                  <input v-model.number="editingPos.take_profit_price" @input="onEditTpPriceChange" type="number" step="any"
+                         class="w-full bg-white border border-emerald-200 rounded-xl pl-7 pr-3 py-2 text-slate-900 font-mono font-bold focus:outline-none focus:border-emerald-500 shadow-sm">
+                </div>
+              </div>
+            </div>
+
+            <!-- Quick TP preset buttons -->
+            <div class="flex items-center gap-1.5 pt-0.5 flex-wrap">
+              <span class="text-[10px] text-slate-400 font-medium">快捷预设:</span>
+              <button v-for="p in [5, 10, 15, 20, 30]" :key="p" type="button" @click="setEditTpPct(p)"
+                      :class="editingPos.tp_pct === p ? 'bg-emerald-600 text-white font-bold shadow-xs' : 'bg-white text-emerald-800 border border-emerald-200 hover:bg-emerald-100/50'"
+                      class="px-2 py-0.5 rounded-lg text-[10px] font-mono transition">
+                +{{ p }}%
+              </button>
+            </div>
           </div>
 
-          <div>
-            <label class="block text-slate-700 mb-1 font-semibold">安全止损价 (USDT)</label>
-            <input v-model.number="editingPos.stop_loss_price" type="number" step="any"
-                   class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-indigo-500">
+          <!-- Section 2: Stop Loss (下跌百分比 & 防守价) -->
+          <div class="bg-rose-50/40 rounded-xl p-3.5 border border-rose-100/80 space-y-2.5">
+            <div class="flex items-center justify-between">
+              <label class="text-rose-950 font-bold flex items-center gap-1.5 text-xs">
+                <i class="fa-solid fa-shield-halved text-rose-600"></i>
+                安全止损 (下跌百分比 / 防守价)
+              </label>
+              <span v-if="editingPos.stop_loss_price && editingPos.buy_price" class="text-rose-700 font-mono font-bold text-[11px]">
+                最大回撤 -${{ (((editingPos.buy_price - editingPos.stop_loss_price) * (editingPos.quantity || 1))).toFixed(2) }}
+              </span>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <div class="text-[10px] text-slate-500 mb-1 font-medium">设定下跌比例 (%)</div>
+                <div class="relative">
+                  <span class="absolute left-3 top-2.5 text-rose-600 font-black font-mono">-</span>
+                  <input v-model.number="editingPos.sl_pct" @input="onEditSlPctChange" type="number" step="any" placeholder="5.0"
+                         class="w-full bg-white border border-rose-200 rounded-xl pl-7 pr-7 py-2 text-slate-900 font-mono font-bold focus:outline-none focus:border-rose-500 shadow-sm">
+                  <span class="absolute right-3 top-2 text-slate-400 font-mono text-[11px]">%</span>
+                </div>
+              </div>
+
+              <div>
+                <div class="text-[10px] text-slate-500 mb-1 font-medium">对应防守价格 (USDT)</div>
+                <div class="relative">
+                  <span class="absolute left-3 top-2.5 text-slate-400 font-mono text-[11px]">$</span>
+                  <input v-model.number="editingPos.stop_loss_price" @input="onEditSlPriceChange" type="number" step="any"
+                         class="w-full bg-white border border-rose-200 rounded-xl pl-7 pr-3 py-2 text-slate-900 font-mono font-bold focus:outline-none focus:border-rose-500 shadow-sm">
+                </div>
+              </div>
+            </div>
+
+            <!-- Quick SL preset buttons -->
+            <div class="flex items-center gap-1.5 pt-0.5 flex-wrap">
+              <span class="text-[10px] text-slate-400 font-medium">快捷预设:</span>
+              <button v-for="p in [3, 5, 8, 10, 15]" :key="p" type="button" @click="setEditSlPct(p)"
+                      :class="editingPos.sl_pct === p ? 'bg-rose-600 text-white font-bold shadow-xs' : 'bg-white text-rose-800 border border-rose-200 hover:bg-rose-100/50'"
+                      class="px-2 py-0.5 rounded-lg text-[10px] font-mono transition">
+                -{{ p }}%
+              </button>
+            </div>
           </div>
 
-          <div class="flex justify-end gap-2.5 pt-3">
+          <!-- Section 3: Feishu / Webhook 定时汇报周期 -->
+          <div class="bg-indigo-50/40 rounded-xl p-3.5 border border-indigo-100/80 space-y-2.5">
+            <div class="flex items-center justify-between">
+              <label class="text-indigo-950 font-bold flex items-center gap-1.5 text-xs">
+                <i class="fa-solid fa-clock text-indigo-600"></i>
+                飞书 / 企微定时巡检播报频率
+              </label>
+              <button type="button" @click="sendTestAlert(editingPos.id)" :disabled="testingAlert"
+                      class="px-2.5 py-1 rounded-lg bg-white border border-indigo-200 hover:bg-indigo-100/60 text-indigo-700 text-[10px] font-semibold flex items-center gap-1 transition disabled:opacity-50">
+                <i class="fa-solid" :class="testingAlert ? 'fa-spinner fa-spin' : 'fa-paper-plane'"></i>
+                <span>发送测试飞书卡片</span>
+              </button>
+            </div>
+
+            <p class="text-[11px] text-slate-500">
+              系统将自动向飞书/企微群推送：<span class="font-semibold text-slate-700">当前最新价、买入成本、实时涨跌幅及浮动盈亏</span>。
+            </p>
+
+            <!-- Preset Interval Chips -->
+            <div class="grid grid-cols-4 gap-1.5 pt-1">
+              <button v-for="item in intervalOptions" :key="item.value" type="button"
+                      @click="editingPos.check_interval_hours = item.value"
+                      :class="editingPos.check_interval_hours === item.value ? 'bg-indigo-600 text-white font-bold shadow-xs' : 'bg-white text-slate-700 border border-indigo-100 hover:bg-indigo-50/60'"
+                      class="py-1.5 px-2 rounded-lg text-[11px] text-center font-medium transition">
+                {{ item.label }}
+              </button>
+            </div>
+
+            <div class="flex items-center gap-2 pt-1">
+              <span class="text-[10px] text-slate-400">自定义周期 (小时):</span>
+              <input v-model.number="editingPos.check_interval_hours" type="number" step="0.1" min="0" max="168"
+                     class="w-20 bg-white border border-indigo-200 rounded-lg px-2 py-1 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500">
+              <span class="text-[10px] text-slate-400">（填 0 代表关闭常规定时，仅触发止盈止损时提醒）</span>
+            </div>
+          </div>
+
+          <!-- Bottom buttons -->
+          <div class="flex justify-end gap-2.5 pt-2 border-t border-slate-100">
             <button type="button" @click="editingPos = null"
                     class="px-4 py-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 font-medium transition">
               取消
             </button>
             <button type="button" @click="saveEditPosition"
-                    class="px-5 py-2 rounded-xl bg-indigo-600 text-white font-semibold hover:bg-indigo-700 shadow-sm shadow-indigo-200 transition">
-              保存更改
+                    class="px-6 py-2 rounded-xl bg-indigo-600 text-white font-semibold hover:bg-indigo-700 shadow-sm shadow-indigo-200 transition">
+              保存更改并生效
             </button>
           </div>
         </div>
@@ -979,13 +1197,28 @@
           wecom_webhook_url: ''
         });
 
+        const intervalOptions = [
+          { label: '每 15 分钟', value: 0.25 },
+          { label: '每 30 分钟', value: 0.5 },
+          { label: '每 1 小时', value: 1.0 },
+          { label: '每 2 小时', value: 2.0 },
+          { label: '每 4 小时', value: 4.0 },
+          { label: '每 8 小时', value: 8.0 },
+          { label: '每 24 小时', value: 24.0 },
+          { label: '关闭播报', value: 0 }
+        ];
+
+        const testingAlert = ref(false);
+
         const newPos = ref({
           symbol: '',
           buy_price: null,
           quantity: 1,
           take_profit_price: null,
           stop_loss_price: null,
-          check_interval_hours: 1,
+          tp_pct: 10.0,
+          sl_pct: 5.0,
+          check_interval_hours: 1.0,
           ladder_alerts: [5.0, 10.0, 20.0]
         });
 
@@ -1123,13 +1356,76 @@
           }
         };
 
+        // New Position percentage handlers
+        const onNewTpPctChange = () => {
+          const buy = parseFloat(newPos.value.buy_price) || 0;
+          const pct = parseFloat(newPos.value.tp_pct);
+          if (buy > 0 && !isNaN(pct)) {
+            newPos.value.take_profit_price = parseFloat((buy * (1 + pct / 100)).toFixed(4));
+          }
+        };
+
+        const onNewTpPriceChange = () => {
+          const buy = parseFloat(newPos.value.buy_price) || 0;
+          const price = parseFloat(newPos.value.take_profit_price);
+          if (buy > 0 && !isNaN(price)) {
+            newPos.value.tp_pct = parseFloat((((price - buy) / buy) * 100).toFixed(2));
+          }
+        };
+
+        const setNewTpPct = (pct) => {
+          newPos.value.tp_pct = pct;
+          onNewTpPctChange();
+        };
+
+        const onNewSlPctChange = () => {
+          const buy = parseFloat(newPos.value.buy_price) || 0;
+          const pct = parseFloat(newPos.value.sl_pct);
+          if (buy > 0 && !isNaN(pct)) {
+            newPos.value.stop_loss_price = parseFloat((buy * (1 - pct / 100)).toFixed(4));
+          }
+        };
+
+        const onNewSlPriceChange = () => {
+          const buy = parseFloat(newPos.value.buy_price) || 0;
+          const price = parseFloat(newPos.value.stop_loss_price);
+          if (buy > 0 && !isNaN(price)) {
+            newPos.value.sl_pct = parseFloat((((buy - price) / buy) * 100).toFixed(2));
+          }
+        };
+
+        const setNewSlPct = (pct) => {
+          newPos.value.sl_pct = pct;
+          onNewSlPctChange();
+        };
+
+        const onNewBuyPriceChange = () => {
+          const buy = parseFloat(newPos.value.buy_price) || 0;
+          if (buy > 0) {
+            if (newPos.value.tp_pct !== undefined && newPos.value.tp_pct !== null) {
+              onNewTpPctChange();
+            }
+            if (newPos.value.sl_pct !== undefined && newPos.value.sl_pct !== null) {
+              onNewSlPctChange();
+            }
+          }
+        };
+
         const submitAddPosition = async () => {
           try {
             let sym = newPos.value.symbol.trim().toUpperCase();
             if (!sym.endsWith('USDT') && !sym.endsWith('B')) {
               sym = sym + 'BUSDT';
             }
-            const payload = { ...newPos.value, symbol: sym };
+            const payload = {
+              symbol: sym,
+              buy_price: parseFloat(newPos.value.buy_price),
+              quantity: parseFloat(newPos.value.quantity),
+              take_profit_price: newPos.value.take_profit_price ? parseFloat(newPos.value.take_profit_price) : null,
+              stop_loss_price: newPos.value.stop_loss_price ? parseFloat(newPos.value.stop_loss_price) : null,
+              check_interval_hours: parseFloat(newPos.value.check_interval_hours !== undefined ? newPos.value.check_interval_hours : 1.0),
+              ladder_alerts: newPos.value.ladder_alerts || [5.0, 10.0, 20.0]
+            };
             const res = await fetch('/api/positions', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -1137,7 +1433,17 @@
             });
             if (res.ok) {
               openAddModal.value = false;
-              newPos.value = { symbol: '', buy_price: null, quantity: 1, take_profit_price: null, stop_loss_price: null, check_interval_hours: 1, ladder_alerts: [5.0, 10.0, 20.0] };
+              newPos.value = {
+                symbol: '',
+                buy_price: null,
+                quantity: 1,
+                take_profit_price: null,
+                stop_loss_price: null,
+                tp_pct: 10.0,
+                sl_pct: 5.0,
+                check_interval_hours: 1.0,
+                ladder_alerts: [5.0, 10.0, 20.0]
+              };
               await fetchPositions();
               currentTab.value = 'positions';
               showToast(`已成功录入并开始监控 ${sym}`, 'success');
@@ -1182,8 +1488,92 @@
           }
         };
 
+        // Edit Position percentage handlers
+        const onEditTpPctChange = () => {
+          if (!editingPos.value) return;
+          const buy = parseFloat(editingPos.value.buy_price) || 0;
+          const pct = parseFloat(editingPos.value.tp_pct);
+          if (buy > 0 && !isNaN(pct)) {
+            editingPos.value.take_profit_price = parseFloat((buy * (1 + pct / 100)).toFixed(4));
+          }
+        };
+
+        const onEditTpPriceChange = () => {
+          if (!editingPos.value) return;
+          const buy = parseFloat(editingPos.value.buy_price) || 0;
+          const price = parseFloat(editingPos.value.take_profit_price);
+          if (buy > 0 && !isNaN(price)) {
+            editingPos.value.tp_pct = parseFloat((((price - buy) / buy) * 100).toFixed(2));
+          }
+        };
+
+        const setEditTpPct = (pct) => {
+          if (!editingPos.value) return;
+          editingPos.value.tp_pct = pct;
+          onEditTpPctChange();
+        };
+
+        const onEditSlPctChange = () => {
+          if (!editingPos.value) return;
+          const buy = parseFloat(editingPos.value.buy_price) || 0;
+          const pct = parseFloat(editingPos.value.sl_pct);
+          if (buy > 0 && !isNaN(pct)) {
+            editingPos.value.stop_loss_price = parseFloat((buy * (1 - pct / 100)).toFixed(4));
+          }
+        };
+
+        const onEditSlPriceChange = () => {
+          if (!editingPos.value) return;
+          const buy = parseFloat(editingPos.value.buy_price) || 0;
+          const price = parseFloat(editingPos.value.stop_loss_price);
+          if (buy > 0 && !isNaN(price)) {
+            editingPos.value.sl_pct = parseFloat((((buy - price) / buy) * 100).toFixed(2));
+          }
+        };
+
+        const setEditSlPct = (pct) => {
+          if (!editingPos.value) return;
+          editingPos.value.sl_pct = pct;
+          onEditSlPctChange();
+        };
+
+        const onEditBuyPriceChange = () => {
+          if (!editingPos.value) return;
+          const buy = parseFloat(editingPos.value.buy_price) || 0;
+          if (buy > 0) {
+            if (editingPos.value.tp_pct !== undefined && editingPos.value.tp_pct !== null) {
+              onEditTpPctChange();
+            }
+            if (editingPos.value.sl_pct !== undefined && editingPos.value.sl_pct !== null) {
+              onEditSlPctChange();
+            }
+          }
+        };
+
         const openEditModal = (pos) => {
-          editingPos.value = { ...pos };
+          const buy = parseFloat(pos.buy_price) || 0;
+          let tp_pct = null;
+          let sl_pct = null;
+          if (buy > 0) {
+            if (pos.take_profit_price) {
+              tp_pct = parseFloat((((parseFloat(pos.take_profit_price) - buy) / buy) * 100).toFixed(2));
+            }
+            if (pos.stop_loss_price) {
+              sl_pct = parseFloat((((buy - parseFloat(pos.stop_loss_price)) / buy) * 100).toFixed(2));
+            }
+          }
+          editingPos.value = {
+            ...pos,
+            tp_pct: tp_pct !== null ? tp_pct : 10.0,
+            sl_pct: sl_pct !== null ? sl_pct : 5.0,
+            check_interval_hours: pos.check_interval_hours !== undefined ? parseFloat(pos.check_interval_hours) : 1.0
+          };
+          if (buy > 0 && !pos.take_profit_price) {
+            editingPos.value.take_profit_price = parseFloat((buy * 1.10).toFixed(4));
+          }
+          if (buy > 0 && !pos.stop_loss_price) {
+            editingPos.value.stop_loss_price = parseFloat((buy * 0.95).toFixed(4));
+          }
         };
 
         const saveEditPosition = async () => {
@@ -1196,11 +1586,12 @@
                 buy_price: parseFloat(editingPos.value.buy_price),
                 quantity: parseFloat(editingPos.value.quantity),
                 take_profit_price: parseFloat(editingPos.value.take_profit_price),
-                stop_loss_price: parseFloat(editingPos.value.stop_loss_price)
+                stop_loss_price: parseFloat(editingPos.value.stop_loss_price),
+                check_interval_hours: parseFloat(editingPos.value.check_interval_hours !== undefined ? editingPos.value.check_interval_hours : 1.0)
               })
             });
             if (res.ok) {
-              showToast('持仓参数已成功更新', 'success');
+              showToast('持仓与飞书监控设置已成功更新并生效', 'success');
               editingPos.value = null;
               await fetchPositions();
             } else {
@@ -1209,6 +1600,25 @@
             }
           } catch (e) {
             showToast('更新异常: ' + e, 'error');
+          }
+        };
+
+        const sendTestAlert = async (posId) => {
+          if (!posId) return;
+          testingAlert.value = true;
+          try {
+            const res = await fetch(`/api/positions/${posId}/test-alert`, { method: 'POST' });
+            const data = await res.json();
+            if (res.ok) {
+              showToast('已向飞书/企微发送实时持仓播报卡片，请在群内查看！', 'success');
+              await fetchLogs();
+            } else {
+              showToast('测试发送失败: ' + (data.detail || JSON.stringify(data)), 'error');
+            }
+          } catch (e) {
+            showToast('测试请求异常: ' + e, 'error');
+          } finally {
+            testingAlert.value = false;
           }
         };
 
@@ -1274,7 +1684,24 @@
           openEditModal,
           saveEditPosition,
           quickAnalyze,
-          quickTrack
+          quickTrack,
+          intervalOptions,
+          testingAlert,
+          sendTestAlert,
+          onNewTpPctChange,
+          onNewTpPriceChange,
+          setNewTpPct,
+          onNewSlPctChange,
+          onNewSlPriceChange,
+          setNewSlPct,
+          onNewBuyPriceChange,
+          onEditTpPctChange,
+          onEditTpPriceChange,
+          setEditTpPct,
+          onEditSlPctChange,
+          onEditSlPriceChange,
+          setEditSlPct,
+          onEditBuyPriceChange
         };
       }
     }).mount('#app');

@@ -162,3 +162,31 @@ async def test_position_update_and_sync(tmp_path, monkeypatch):
             assert sync_data["synced"][0]["symbol"] == "AMZNBUSDT"
             assert sync_data["synced"][0]["buy_price"] == 248.33  # Preserved!
             assert sync_data["synced"][0]["wallet"] == "资金账户"
+
+@pytest.mark.asyncio
+async def test_position_test_alert(tmp_path, monkeypatch):
+    db_file = str(tmp_path / "test_alert_endpoint.db")
+    monkeypatch.setattr("backend.app.config.settings.DB_PATH", db_file)
+    await init_db(db_file)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        create_res = await ac.post("/api/positions", json={
+            "symbol": "AMZNBUSDT",
+            "buy_price": 248.33,
+            "quantity": 0.6578,
+            "check_interval_hours": 0.5
+        })
+        pos_id = create_res.json()["id"]
+
+        with patch("backend.app.main.binance_client.get_ticker_price", new_callable=AsyncMock) as mock_p, \
+             patch("backend.app.main.notification_service.send_position_alert", new_callable=AsyncMock) as mock_alert:
+            mock_p.return_value = 249.50
+            mock_alert.return_value = True
+
+            test_res = await ac.post(f"/api/positions/{pos_id}/test-alert")
+            assert test_res.status_code == 200
+            assert test_res.json()["success"] is True
+            assert "periodic" in test_res.json()["triggered"]
+            mock_alert.assert_called_once()
+

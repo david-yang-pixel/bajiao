@@ -7,7 +7,7 @@ class PositionCreate(BaseModel):
     quantity: float
     take_profit_price: Optional[float] = None
     stop_loss_price: Optional[float] = None
-    check_interval_hours: int = 1
+    check_interval_hours: float = 1.0
     ladder_alerts: List[float] = []
     
     model_config = ConfigDict(from_attributes=True)
@@ -22,7 +22,7 @@ class PositionUpdate(BaseModel):
     take_profit_price: Optional[float] = None
     stop_loss_price: Optional[float] = None
     ladder_alerts: Optional[List[float]] = None
-    check_interval_hours: Optional[int] = None
+    check_interval_hours: Optional[float] = None
 
 class AskAIRequest(BaseModel):
     question: str

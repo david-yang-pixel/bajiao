@@ -285,6 +285,28 @@ async def remove_position(position_id: int):
         await db.commit()
     return {"message": "Position closed/deactivated"}
 
+@app.post("/api/positions/{position_id}/test-alert")
+async def test_position_alert(position_id: int):
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM positions WHERE id = ?", (position_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Position not found")
+        pos = dict(row)
+        if isinstance(pos.get("ladder_alerts"), str):
+            try:
+                pos["ladder_alerts"] = json.loads(pos["ladder_alerts"])
+            except Exception:
+                pos["ladder_alerts"] = []
+
+        triggered = await position_monitor.check_single_position(pos, force_periodic=True)
+        return {
+            "success": True,
+            "message": f"已向配置的飞书/企微机器人发送 {pos['symbol']} 实时持仓巡检测试卡片",
+            "triggered": triggered
+        }
+
 async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
     """
     Sync user's real Binance Spot & Funding holdings into active positions monitor:

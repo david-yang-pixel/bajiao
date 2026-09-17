@@ -29,6 +29,7 @@ class PositionMonitor:
         self.notification_service = notification_service or NotificationService()
         self._db_path = db_path
         self._last_alert_times: Dict[str, float] = {}  # {f"{pos_id}:{alert_type}:{step}": timestamp}
+        self._last_periodic_times: Dict[int, float] = {}  # {pos_id: timestamp}
         self.cooldown_seconds = 1800  # 30 mins anti-spam cooldown per step
 
     @property
@@ -135,9 +136,31 @@ class PositionMonitor:
                     self._mark_alerted(key)
                     triggered.append(f"ladder_{step_val}")
 
-        # 4. Force periodic inspection notification
-        if force_periodic:
-            note = f"定时常规巡检（周期: 每{pos.get('check_interval_hours', 1)}小时）"
+        # 4. Periodic inspection notification (configured frequency e.g. every 15m, 30m, 1h, 2h)
+        interval_hours = float(pos.get("check_interval_hours") if pos.get("check_interval_hours") is not None else 1.0)
+        is_periodic_due = False
+
+        if interval_hours > 0:
+            interval_sec = interval_hours * 3600
+            last_p = self._last_periodic_times.get(pos_id, 0)
+            now = time.time()
+            if last_p == 0:
+                self._last_periodic_times[pos_id] = now
+            elif (now - last_p) >= interval_sec:
+                is_periodic_due = True
+                self._last_periodic_times[pos_id] = now
+
+        if force_periodic or is_periodic_due:
+            if interval_hours <= 0:
+                interval_str = "手动触发"
+            elif interval_hours < 1:
+                interval_str = f"每 {int(round(interval_hours * 60))} 分钟"
+            elif interval_hours == int(interval_hours):
+                interval_str = f"每 {int(interval_hours)} 小时"
+            else:
+                interval_str = f"每 {interval_hours:.1f} 小时"
+
+            note = f"定时巡检汇报（周期: {interval_str}）"
             await self.notification_service.send_position_alert(
                 symbol, buy_price, curr_price, pnl_pct, "periodic", note
             )
