@@ -7,7 +7,7 @@ import os
 from typing import Any, Dict, List
 import aiosqlite
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -26,6 +26,7 @@ from backend.app.services.quant_screener import QuantScreener
 from backend.app.services.analysis_agent import AnalysisAgent
 from backend.app.services.notification import NotificationService
 from backend.app.services.position_monitor import PositionMonitor
+from backend.app.services.feishu_bot_service import FeishuBotService
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bstocks_app")
@@ -40,6 +41,12 @@ position_monitor = PositionMonitor(
     notification_service=notification_service,
     quant_screener=quant_screener,
     analysis_agent=analysis_agent
+)
+feishu_bot_service = FeishuBotService(
+    binance_client=binance_client,
+    quant_screener=quant_screener,
+    analysis_agent=analysis_agent,
+    position_monitor=position_monitor
 )
 
 async def apply_runtime_config():
@@ -58,6 +65,8 @@ async def apply_runtime_config():
         oa_base = cfg.get("openai_base_url") or settings.OPENAI_BASE_URL or "https://api.openai.com/v1"
         oa_model = cfg.get("openai_model") or "gpt-4o-mini"
         feishu_url = cfg.get("feishu_webhook_url") or settings.FEISHU_WEBHOOK_URL
+        feishu_app_id = cfg.get("feishu_app_id") or settings.FEISHU_APP_ID
+        feishu_app_secret = cfg.get("feishu_app_secret") or settings.FEISHU_APP_SECRET
         wecom_url = cfg.get("wecom_webhook_url") or settings.WECOM_WEBHOOK_URL
 
         # Update binance client
@@ -75,6 +84,11 @@ async def apply_runtime_config():
         notification_service.feishu_webhook_url = feishu_url or ""
         notification_service.wecom_webhook = wecom_url or ""
         notification_service.wecom_webhook_url = wecom_url or ""
+
+        # Update Feishu two-way conversational bot service
+        feishu_bot_service.set_credentials(feishu_app_id or "", feishu_app_secret or "")
+        if feishu_app_id and feishu_app_secret and not feishu_bot_service.is_connected:
+            feishu_bot_service.start()
 
         logger.info("Runtime configuration successfully reloaded.")
     except Exception as e:
@@ -144,6 +158,7 @@ async def lifespan(app: FastAPI):
             await _monitor_task
         except asyncio.CancelledError:
             pass
+    feishu_bot_service.stop()
     logger.info("App shutdown complete.")
 
 app = FastAPI(
@@ -610,6 +625,7 @@ async def get_system_config():
     raw_binance_key = cfg.get("binance_api_key") or settings.BINANCE_API_KEY
     raw_binance_secret = cfg.get("binance_api_secret") or settings.BINANCE_API_SECRET
     raw_openai_key = cfg.get("openai_api_key") or settings.OPENAI_API_KEY
+    raw_feishu_secret = cfg.get("feishu_app_secret") or settings.FEISHU_APP_SECRET
 
     return {
         "binance_api_key": mask(raw_binance_key),
@@ -622,6 +638,10 @@ async def get_system_config():
         "openai_model": cfg.get("openai_model") or "gpt-4o-mini",
         "has_openai_key": bool(raw_openai_key),
         "feishu_webhook_url": cfg.get("feishu_webhook_url") or settings.FEISHU_WEBHOOK_URL or "",
+        "feishu_app_id": cfg.get("feishu_app_id") or settings.FEISHU_APP_ID or "",
+        "feishu_app_secret": mask(raw_feishu_secret),
+        "has_feishu_app_secret": bool(raw_feishu_secret),
+        "feishu_bot_connected": feishu_bot_service.is_connected,
         "wecom_webhook_url": cfg.get("wecom_webhook_url") or settings.WECOM_WEBHOOK_URL or "",
         "ai_picks_push_enabled": cfg.get("ai_picks_push_enabled") in ("1", "true", "True", True),
         "ai_picks_push_time": cfg.get("ai_picks_push_time") or "21:30"
@@ -642,11 +662,15 @@ async def save_system_config(payload: SystemConfigSchema):
 
     # Only overwrite keys if provided and not masked
     if payload.binance_api_key and "******" not in payload.binance_api_key:
-        fields_to_update["binance_api_key"] = payload.binance_api_key
+        fields_to_update["binance_api_key"] = payload.binance_api_key.strip()
     if payload.binance_api_secret and "******" not in payload.binance_api_secret:
-        fields_to_update["binance_api_secret"] = payload.binance_api_secret
+        fields_to_update["binance_api_secret"] = payload.binance_api_secret.strip()
     if payload.openai_api_key and "******" not in payload.openai_api_key:
-        fields_to_update["openai_api_key"] = payload.openai_api_key
+        fields_to_update["openai_api_key"] = payload.openai_api_key.strip()
+    if payload.feishu_app_id is not None:
+        fields_to_update["feishu_app_id"] = payload.feishu_app_id.strip()
+    if payload.feishu_app_secret and "******" not in payload.feishu_app_secret:
+        fields_to_update["feishu_app_secret"] = payload.feishu_app_secret.strip()
 
     async with aiosqlite.connect(settings.DB_PATH) as db:
         for k, v in fields_to_update.items():
@@ -790,8 +814,76 @@ async def test_connection(req: TestConnectionRequest):
             except Exception as e:
                 return {"success": False, "message": f"企业微信连接异常: {str(e)}"}
 
+        elif svc in ["feishu_bot", "feishu_app"]:
+            async with aiosqlite.connect(settings.DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT key, value FROM system_configs WHERE key IN ('feishu_app_id', 'feishu_app_secret')")
+                rows = await cursor.fetchall()
+                cfg_dict = {r["key"]: r["value"] for r in rows}
+
+            app_id = req.app_id or cfg_dict.get("feishu_app_id") or settings.FEISHU_APP_ID
+            app_secret = req.app_secret or cfg_dict.get("feishu_app_secret") or settings.FEISHU_APP_SECRET
+            if not app_id or not app_secret or "******" in app_secret:
+                app_secret = cfg_dict.get("feishu_app_secret") or settings.FEISHU_APP_SECRET
+
+            if not app_id or not app_secret:
+                return {"success": False, "message": "未配置飞书 App ID 或 App Secret"}
+
+            try:
+                res = await client.post(
+                    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                    json={"app_id": app_id, "app_secret": app_secret}
+                )
+                data = res.json()
+                if data.get("code") == 0:
+                    status_text = "长连接正常运行" if feishu_bot_service.is_connected else "鉴权通过（长连接已就绪）"
+                    return {"success": True, "message": f"飞书自建应用机器人鉴权成功！当前状态: {status_text}"}
+                else:
+                    return {"success": False, "message": f"飞书应用鉴权失败: {data.get('msg')} (code: {data.get('code')})"}
+            except Exception as e:
+                return {"success": False, "message": f"飞书应用连接异常: {str(e)}"}
+
         else:
             raise HTTPException(status_code=400, detail="不支持的服务测试类型")
+
+@app.post("/api/feishu/events")
+async def feishu_events_callback(request: Request, background_tasks: BackgroundTasks):
+    """
+    HTTP Callback for Feishu Event Subscriptions (Supports URL Verification & Incoming Messages).
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return {"code": 0}
+
+    # 1. URL Challenge verification
+    if data.get("type") == "url_verification":
+        return {"challenge": data.get("challenge")}
+
+    # 2. Event handling
+    header = data.get("header", {})
+    event_type = header.get("event_type")
+
+    if event_type == "im.message.receive_v1":
+        event = data.get("event", {})
+        msg = event.get("message", {})
+        content_str = msg.get("content", "{}")
+        try:
+            content_dict = json.loads(content_str)
+            text = content_dict.get("text", "")
+        except Exception:
+            text = ""
+        msg_id = msg.get("message_id")
+        chat_id = msg.get("chat_id")
+        sender_id = event.get("sender", {}).get("sender_id", {}).get("open_id", "")
+
+        if text and msg_id:
+            background_tasks.add_task(
+                feishu_bot_service.handle_incoming_text,
+                text, msg_id, chat_id, sender_id
+            )
+
+    return {"code": 0}
 
 # Static Files mount for Web Dashboard
 static_dir = os.path.join(os.path.dirname(__file__), "static")

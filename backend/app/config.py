@@ -5,6 +5,8 @@ class Settings(BaseSettings):
     BINANCE_API_SECRET: str = ""
     BINANCE_MCP_URL: str = "https://agent.binance.com/mcp/agentic"
     FEISHU_WEBHOOK_URL: str = ""
+    FEISHU_APP_ID: str = ""
+    FEISHU_APP_SECRET: str = ""
     WECOM_WEBHOOK_URL: str = ""
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"

@@ -57,13 +57,17 @@ class SystemConfigSchema(BaseModel):
     openai_base_url: Optional[str] = "https://api.openai.com/v1"
     openai_model: Optional[str] = "gpt-4o-mini"
     feishu_webhook_url: Optional[str] = ""
+    feishu_app_id: Optional[str] = ""
+    feishu_app_secret: Optional[str] = ""
     wecom_webhook_url: Optional[str] = ""
     ai_picks_push_enabled: Optional[bool] = False
     ai_picks_push_time: Optional[str] = "21:30"
 
 class TestConnectionRequest(BaseModel):
-    service: str # binance | llm | feishu | wecom
+    service: str # binance | llm | feishu | wecom | feishu_bot
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     model: Optional[str] = None
     webhook_url: Optional[str] = None
+    app_id: Optional[str] = None
+    app_secret: Optional[str] = None

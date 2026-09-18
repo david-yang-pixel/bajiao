@@ -1,3 +1,4 @@
+import json
 import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -303,6 +304,46 @@ async def test_system_config_ai_picks_push_schedule(tmp_path, monkeypatch):
         assert cfg_res2.status_code == 200
         assert cfg_res2.json()["ai_picks_push_enabled"] is True
         assert cfg_res2.json()["ai_picks_push_time"] == "21:20"
+
+@pytest.mark.asyncio
+async def test_feishu_events_endpoint(tmp_path, monkeypatch):
+    db_file = str(tmp_path / "test_feishu_events.db")
+    monkeypatch.setattr("backend.app.config.settings.DB_PATH", db_file)
+    await init_db(db_file)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        # 1. URL Challenge verification
+        challenge_res = await ac.post("/api/feishu/events", json={
+            "type": "url_verification",
+            "token": "test_token",
+            "challenge": "challenge_12345"
+        })
+        assert challenge_res.status_code == 200
+        assert challenge_res.json() == {"challenge": "challenge_12345"}
+
+        # 2. Message event webhook
+        with patch("backend.app.main.feishu_bot_service.handle_incoming_text", new_callable=AsyncMock) as mock_handle:
+            event_payload = {
+                "schema": "2.0",
+                "header": {
+                    "event_id": "ev_123456",
+                    "event_type": "im.message.receive_v1"
+                },
+                "event": {
+                    "sender": {"sender_id": {"open_id": "ou_user1"}},
+                    "message": {
+                        "message_id": "om_msg123",
+                        "chat_id": "oc_chat123",
+                        "content": json.dumps({"text": "持仓"})
+                    }
+                }
+            }
+            msg_res = await ac.post("/api/feishu/events", json=event_payload)
+            assert msg_res.status_code == 200
+            assert msg_res.json() == {"code": 0}
+            mock_handle.assert_called_once_with("持仓", "om_msg123", "oc_chat123", "ou_user1")
+
 
 
 
