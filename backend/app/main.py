@@ -87,8 +87,11 @@ async def apply_runtime_config():
 
         # Update Feishu two-way conversational bot service
         feishu_bot_service.set_credentials(feishu_app_id or "", feishu_app_secret or "")
-        if feishu_app_id and feishu_app_secret and not feishu_bot_service.is_connected:
-            feishu_bot_service.start()
+        if feishu_app_id and feishu_app_secret:
+            if not feishu_bot_service.is_connected:
+                feishu_bot_service.start()
+        else:
+            feishu_bot_service.stop()
 
         logger.info("Runtime configuration successfully reloaded.")
     except Exception as e:
