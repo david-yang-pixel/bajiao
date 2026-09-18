@@ -744,14 +744,14 @@ async def test_connection(req: TestConnectionRequest):
                 }
 
         elif svc == "llm":
-            base_url = (req.base_url or "https://api.openai.com/v1").rstrip("/")
+            base_url = (req.base_url or analysis_agent.base_url or settings.OPENAI_BASE_URL or "https://api.openai.com/v1").rstrip("/")
             api_key = req.api_key
             if not api_key or "******" in api_key:
                 api_key = analysis_agent.api_key or settings.OPENAI_API_KEY
             if not api_key:
                 return {"success": False, "message": "未提供有效的大模型 API Key"}
 
-            model = req.model or "gpt-4o-mini"
+            model = req.model or analysis_agent.model or "gemini-2.5-flash"
             try:
                 res = await client.post(
                     f"{base_url}/chat/completions",
