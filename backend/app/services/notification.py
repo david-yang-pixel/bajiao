@@ -133,9 +133,6 @@ class NotificationService:
         elif alert_type == "periodic" and pnl_pct < 0:
             color = "orange"
 
-        base_asset = symbol.replace("USDT", "").replace("USDC", "")
-        binance_convert_url = f"https://www.binance.com/zh-CN/convert?fromAsset={base_asset}&toAsset=USDT"
-
         success = False
 
         # Build Feishu card elements
@@ -177,20 +174,6 @@ class NotificationService:
         elements.extend([
             {"tag": "hr"},
             {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": f"⚡ 前往币安闪兑 ({base_asset} ⇄ USDT)"
-                        },
-                        "type": "danger" if alert_type == "stop_loss" else "primary",
-                        "url": binance_convert_url
-                    }
-                ]
-            },
-            {
                 "tag": "note",
                 "elements": [{"tag": "plain_text", "content": "⚡ 短线交易纪律：快进快出，保护本金，严格执行止盈止损"}]
             }
@@ -205,7 +188,6 @@ class NotificationService:
             f"📊 实时盈亏: {pnl_display}\n"
             + (f"💬 状态说明: {extra_note}\n" if extra_note else "")
             + (f"━━━━━━━━━━━━━━━━━━━━\n{trend_plain_block}" if trend_plain_block else "")
-            + f"🔗 币安闪兑直达: {binance_convert_url}\n"
             + f"━━━━━━━━━━━━━━━━━━━━"
         )
 
