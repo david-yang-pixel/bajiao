@@ -78,9 +78,10 @@ class PositionMonitor:
             )
             await db.commit()
 
-    def _is_cooled_down(self, key: str) -> bool:
+    def _is_cooled_down(self, key: str, custom_cooldown: Optional[float] = None) -> bool:
         last_time = self._last_alert_times.get(key, 0)
-        return (time.time() - last_time) > self.cooldown_seconds
+        cd = custom_cooldown if custom_cooldown is not None else self.cooldown_seconds
+        return (time.time() - last_time) > cd
 
     def _mark_alerted(self, key: str):
         self._last_alert_times[key] = time.time()
@@ -93,6 +94,7 @@ class PositionMonitor:
         pos_id = pos["id"]
         symbol = pos["symbol"]
         buy_price = float(pos["buy_price"])
+        qty = float(pos.get("quantity") or 0.0)
 
         try:
             curr_price = await self.binance_client.get_ticker_price(symbol)
@@ -101,6 +103,7 @@ class PositionMonitor:
             return triggered
 
         pnl_pct = ((curr_price - buy_price) / buy_price) * 100.0
+        pnl_usd = (curr_price - buy_price) * qty if qty > 0 else None
 
         include_ai = bool(pos.get("include_ai_analysis"))
         trend_cache = None
@@ -117,11 +120,11 @@ class PositionMonitor:
         tp_price = pos.get("take_profit_price")
         if tp_price and curr_price >= float(tp_price):
             key = f"{pos_id}:take_profit"
-            if self._is_cooled_down(key):
+            if self._is_cooled_down(key, custom_cooldown=900):  # 15 mins cooldown
                 note = f"已突破设定止盈位 ${tp_price:.2f}"
                 trend_data = await get_trend()
                 await self.notification_service.send_position_alert(
-                    symbol, buy_price, curr_price, pnl_pct, "take_profit", note, trend_analysis=trend_data
+                    symbol, buy_price, curr_price, pnl_pct, "take_profit", note, trend_analysis=trend_data, pnl_usd=pnl_usd
                 )
                 await self.log_alert(pos_id, symbol, note, "take_profit")
                 self._mark_alerted(key)
@@ -131,11 +134,11 @@ class PositionMonitor:
         sl_price = pos.get("stop_loss_price")
         if sl_price and curr_price <= float(sl_price):
             key = f"{pos_id}:stop_loss"
-            if self._is_cooled_down(key):
+            if self._is_cooled_down(key, custom_cooldown=600):  # 10 mins cooldown for emergency defense
                 note = f"已跌破设定止损线 ${sl_price:.2f}"
                 trend_data = await get_trend()
                 await self.notification_service.send_position_alert(
-                    symbol, buy_price, curr_price, pnl_pct, "stop_loss", note, trend_analysis=trend_data
+                    symbol, buy_price, curr_price, pnl_pct, "stop_loss", note, trend_analysis=trend_data, pnl_usd=pnl_usd
                 )
                 await self.log_alert(pos_id, symbol, note, "stop_loss")
                 self._mark_alerted(key)
@@ -150,7 +153,7 @@ class PositionMonitor:
                 if self._is_cooled_down(key):
                     note = f"收益率达成阶梯目标 +{step_val:.1f}%"
                     await self.notification_service.send_position_alert(
-                        symbol, buy_price, curr_price, pnl_pct, "ladder", note
+                        symbol, buy_price, curr_price, pnl_pct, "ladder", note, pnl_usd=pnl_usd
                     )
                     await self.log_alert(pos_id, symbol, note, "ladder")
                     self._mark_alerted(key)
@@ -184,7 +187,7 @@ class PositionMonitor:
             trend_data = await get_trend()
 
             await self.notification_service.send_position_alert(
-                symbol, buy_price, curr_price, pnl_pct, "periodic", note, trend_analysis=trend_data
+                symbol, buy_price, curr_price, pnl_pct, "periodic", note, trend_analysis=trend_data, pnl_usd=pnl_usd
             )
             await self.log_alert(pos_id, symbol, note, "periodic")
             triggered.append("periodic")

@@ -103,18 +103,18 @@ _last_ai_picks_push_date = ""
 
 async def background_monitoring_loop():
     global _last_ai_picks_push_date
-    logger.info("Background position monitoring loop started.")
+    logger.info("Background position monitoring loop started (30s interval).")
     tick_count = 0
     tz_bj = timezone(timedelta(hours=8))
     while True:
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
             tick_count += 1
-            force_periodic = (tick_count % 60 == 0)
+            force_periodic = (tick_count % 120 == 0)
             await position_monitor.scan_all_positions(force_periodic=force_periodic)
 
-            # Every 10 mins, silently sync Binance positions if API keys are configured
-            if tick_count % 10 == 0 and binance_client.api_key and binance_client.api_secret:
+            # Every 10 mins (20 ticks), silently sync Binance positions if API keys are configured
+            if tick_count % 20 == 0 and binance_client.api_key and binance_client.api_secret:
                 try:
                     await perform_binance_sync(min_notional=1.0)
                 except Exception as sync_err:

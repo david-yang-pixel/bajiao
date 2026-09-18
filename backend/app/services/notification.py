@@ -108,21 +108,34 @@ class NotificationService:
         pnl_pct: float,
         alert_type: str,
         extra_note: str = "",
-        trend_analysis: Optional[Dict[str, Any]] = None
+        trend_analysis: Optional[Dict[str, Any]] = None,
+        pnl_usd: Optional[float] = None
     ) -> bool:
         """
         Send position price alert card (Periodic check / Take Profit / Stop Loss / Ladder alert),
-        with optional AI future trend analysis block if requested by user.
+        with direct Binance Convert action button and optional AI trend analysis block.
         """
         emoji_map = {
             "take_profit": "🚀 【阶段冲高 / 止盈提醒】",
-            "stop_loss": "⚠️ 【安全防线 / 止损预警】",
+            "stop_loss": "🚨 【破位警报 / 严格止损】",
             "periodic": "⏱️ 【持仓定时巡检汇报】",
             "ladder": "🔥 【阶梯涨幅达成提醒】"
         }
         title = emoji_map.get(alert_type, "📢 【持仓变动提醒】")
-        pnl_str = f"+{pnl_pct:.2f}%" if pnl_pct >= 0 else f"{pnl_pct:.2f}%"
-        color = "green" if pnl_pct >= 0 else "red"
+        pnl_sign = "+" if pnl_pct >= 0 else ""
+        usd_str = f" (${pnl_usd:+.2f})" if pnl_usd is not None and abs(pnl_usd) > 0.001 else ""
+        pnl_display = f"{pnl_sign}{pnl_pct:.2f}%{usd_str}"
+        pnl_color_tag = "🟢" if pnl_pct >= 0 else "🔴"
+
+        color = "red" if alert_type == "stop_loss" else ("green" if pnl_pct >= 0 else "red")
+        if alert_type == "periodic" and pnl_pct >= 0:
+            color = "green"
+        elif alert_type == "periodic" and pnl_pct < 0:
+            color = "orange"
+
+        base_asset = symbol.replace("USDT", "").replace("USDC", "")
+        binance_convert_url = f"https://www.binance.com/zh-CN/convert?fromAsset={base_asset}&toAsset=USDT"
+
         success = False
 
         # Build Feishu card elements
@@ -131,16 +144,16 @@ class NotificationService:
                 "tag": "div",
                 "fields": [
                     {"is_short": True, "text": {"tag": "lark_md", "content": f"**买入成本:**\n${buy_price:.2f}"}},
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**当前最新价:**\n${curr_price:.2f}"}},
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**实时盈亏:**\n{pnl_str}"}},
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**巡检状态:**\n{extra_note or '短线实时监控'}"}}
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**当前最新价:**\n**${curr_price:.2f}**"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**实时盈亏:**\n{pnl_color_tag} **{pnl_display}**"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**巡检状态:**\n{extra_note or '短线实时盯盘'}"}}
                 ]
             }
         ]
 
         trend_plain_block = ""
         if trend_analysis:
-            reason = trend_analysis.get("reason", "形态蓄势突破中")
+            reason = trend_analysis.get("reason", "短线蓄势中")
             tp = trend_analysis.get("target_price")
             sl = trend_analysis.get("stop_loss_price")
             tp_str = f"${float(tp):.2f}" if tp else "--"
@@ -164,8 +177,22 @@ class NotificationService:
         elements.extend([
             {"tag": "hr"},
             {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": f"⚡ 前往币安闪兑 ({base_asset} ⇄ USDT)"
+                        },
+                        "type": "danger" if alert_type == "stop_loss" else "primary",
+                        "url": binance_convert_url
+                    }
+                ]
+            },
+            {
                 "tag": "note",
-                "elements": [{"tag": "plain_text", "content": "⚡ Binance bStocks 短线高频量化盯盘助手"}]
+                "elements": [{"tag": "plain_text", "content": "⚡ 短线交易纪律：快进快出，保护本金，严格执行止盈止损"}]
             }
         ])
 
@@ -175,9 +202,10 @@ class NotificationService:
             f"🔹 标的代号: {symbol}\n"
             f"💵 买入成本: ${buy_price:.2f}\n"
             f"📈 当前最新价: ${curr_price:.2f}\n"
-            f"📊 当前浮动盈亏: {pnl_str}\n"
-            + (f"💬 说明: {extra_note}\n" if extra_note else "")
+            f"📊 实时盈亏: {pnl_display}\n"
+            + (f"💬 状态说明: {extra_note}\n" if extra_note else "")
             + (f"━━━━━━━━━━━━━━━━━━━━\n{trend_plain_block}" if trend_plain_block else "")
+            + f"🔗 币安闪兑直达: {binance_convert_url}\n"
             + f"━━━━━━━━━━━━━━━━━━━━"
         )
 
