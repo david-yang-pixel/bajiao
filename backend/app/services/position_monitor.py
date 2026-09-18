@@ -102,14 +102,26 @@ class PositionMonitor:
 
         pnl_pct = ((curr_price - buy_price) / buy_price) * 100.0
 
+        include_ai = bool(pos.get("include_ai_analysis"))
+        trend_cache = None
+
+        async def get_trend():
+            nonlocal trend_cache
+            if not include_ai:
+                return None
+            if trend_cache is None:
+                trend_cache = await self.get_symbol_trend_analysis(symbol)
+            return trend_cache
+
         # 1. Take Profit alert
         tp_price = pos.get("take_profit_price")
         if tp_price and curr_price >= float(tp_price):
             key = f"{pos_id}:take_profit"
             if self._is_cooled_down(key):
                 note = f"已突破设定止盈位 ${tp_price:.2f}"
+                trend_data = await get_trend()
                 await self.notification_service.send_position_alert(
-                    symbol, buy_price, curr_price, pnl_pct, "take_profit", note
+                    symbol, buy_price, curr_price, pnl_pct, "take_profit", note, trend_analysis=trend_data
                 )
                 await self.log_alert(pos_id, symbol, note, "take_profit")
                 self._mark_alerted(key)
@@ -121,8 +133,9 @@ class PositionMonitor:
             key = f"{pos_id}:stop_loss"
             if self._is_cooled_down(key):
                 note = f"已跌破设定止损线 ${sl_price:.2f}"
+                trend_data = await get_trend()
                 await self.notification_service.send_position_alert(
-                    symbol, buy_price, curr_price, pnl_pct, "stop_loss", note
+                    symbol, buy_price, curr_price, pnl_pct, "stop_loss", note, trend_analysis=trend_data
                 )
                 await self.log_alert(pos_id, symbol, note, "stop_loss")
                 self._mark_alerted(key)
@@ -168,12 +181,10 @@ class PositionMonitor:
                 interval_str = f"每 {interval_hours:.1f} 小时"
 
             note = f"定时巡检汇报（周期: {interval_str}）"
-            trend_analysis = None
-            if bool(pos.get("include_ai_analysis")):
-                trend_analysis = await self.get_symbol_trend_analysis(symbol)
+            trend_data = await get_trend()
 
             await self.notification_service.send_position_alert(
-                symbol, buy_price, curr_price, pnl_pct, "periodic", note, trend_analysis=trend_analysis
+                symbol, buy_price, curr_price, pnl_pct, "periodic", note, trend_analysis=trend_data
             )
             await self.log_alert(pos_id, symbol, note, "periodic")
             triggered.append("periodic")
