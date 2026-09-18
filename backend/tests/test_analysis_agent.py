@@ -48,3 +48,25 @@ async def test_analysis_agent_llm_success():
         assert result["target_price"] == 250.0
         assert result["stop_loss_price"] == 220.0
         assert "放量拉升" in result["reason"]
+
+@pytest.mark.asyncio
+async def test_analysis_agent_ask_llm():
+    agent = AnalysisAgent(api_key="sk-mock-key")
+
+    mock_llm_resp = {
+        "choices": [{
+            "message": {
+                "content": "建议严控仓位，短线锁定利润。"
+            }
+        }]
+    }
+
+    with patch("httpx.AsyncClient.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_llm_resp
+        mock_post.return_value = mock_resp
+
+        reply = await agent.ask_llm("短线如何止盈？")
+        assert "短线锁定利润" in reply
+

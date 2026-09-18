@@ -544,8 +544,25 @@ class FeishuBotService:
         try:
             ans = await self.analysis_agent.ask_llm(text, system_prompt=system_prompt)
             if not ans:
-                ans = "收到您的消息。如需查持仓请发送「持仓」，调参数可发送「止损 245」，分析标的可发送「分析 标的代码」。"
+                if any(greet in text.lower() for greet in ["你好", "hello", "hi", "在吗", "在不在", "早上好", "晚上好"]):
+                    ans = (
+                        f"👋 您好！我是您的短线量化盯盘助理 Hermes ⚡\n"
+                        f"📊 当前活跃持仓监控: {pos_summary}\n\n"
+                        "💬 您可以随时发送：\n"
+                        "• 「持仓」查看最新现价与实时盈亏\n"
+                        "• 「开启保本」自动将止损平推至成本价\n"
+                        "• 「止损 245」微调防守位\n"
+                        "• 「分析 TSLA」获取 1~3 天短线推演\n"
+                        "• 或直接与我交流短线盘面与交易纪律！"
+                    )
+                else:
+                    ans = "收到您的消息。如需查持仓请发送「持仓」，调参数可发送「止损 245」，分析标的可发送「分析 标的代码」，或回复「帮助」查看完整指令。"
             await self.reply_message(message_id, ans)
         except Exception as e:
             logger.error(f"Error in LLM conversation: {e}")
-            await self.reply_message(message_id, "暂时无法连接大模型，请稍后重试或回复「帮助」查看指令。")
+            fallback_msg = (
+                f"👋 您好！我是您的短线量化助理 Hermes。\n"
+                f"当前活跃持仓: {pos_summary}。\n"
+                "可直接回复「持仓」、「保本」或「帮助」执行量化风控指令。"
+            )
+            await self.reply_message(message_id, fallback_msg)

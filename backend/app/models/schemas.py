@@ -50,18 +50,18 @@ class AlertLogOut(AlertLogCreate):
     created_at: str
 
 class SystemConfigSchema(BaseModel):
-    binance_api_key: Optional[str] = ""
-    binance_api_secret: Optional[str] = ""
-    binance_mcp_url: Optional[str] = "https://agent.binance.com/mcp/agentic"
-    openai_api_key: Optional[str] = ""
-    openai_base_url: Optional[str] = "https://api.openai.com/v1"
-    openai_model: Optional[str] = "gpt-4o-mini"
-    feishu_webhook_url: Optional[str] = ""
-    feishu_app_id: Optional[str] = ""
-    feishu_app_secret: Optional[str] = ""
-    wecom_webhook_url: Optional[str] = ""
-    ai_picks_push_enabled: Optional[bool] = False
-    ai_picks_push_time: Optional[str] = "21:30"
+    binance_api_key: Optional[str] = None
+    binance_api_secret: Optional[str] = None
+    binance_mcp_url: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    openai_base_url: Optional[str] = None
+    openai_model: Optional[str] = None
+    feishu_webhook_url: Optional[str] = None
+    feishu_app_id: Optional[str] = None
+    feishu_app_secret: Optional[str] = None
+    wecom_webhook_url: Optional[str] = None
+    ai_picks_push_enabled: Optional[bool] = None
+    ai_picks_push_time: Optional[str] = None
 
 class TestConnectionRequest(BaseModel):
     service: str # binance | llm | feishu | wecom | feishu_bot

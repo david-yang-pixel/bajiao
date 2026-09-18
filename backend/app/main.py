@@ -650,27 +650,22 @@ async def get_system_config():
 @app.post("/api/config")
 async def save_system_config(payload: SystemConfigSchema):
     """Save updated system settings and reload runtime services."""
-    fields_to_update = {
-        "binance_mcp_url": payload.binance_mcp_url,
-        "openai_base_url": payload.openai_base_url,
-        "openai_model": payload.openai_model,
-        "feishu_webhook_url": payload.feishu_webhook_url,
-        "wecom_webhook_url": payload.wecom_webhook_url,
-        "ai_picks_push_enabled": "1" if payload.ai_picks_push_enabled else "0",
-        "ai_picks_push_time": payload.ai_picks_push_time or "21:30"
-    }
+    dumped = payload.model_dump(exclude_unset=True)
+    fields_to_update = {}
+
+    for k in ["binance_mcp_url", "openai_base_url", "openai_model", "feishu_webhook_url", "wecom_webhook_url", "ai_picks_push_time", "feishu_app_id"]:
+        if k in dumped and dumped[k] is not None:
+            val = str(dumped[k]).strip()
+            if val:
+                fields_to_update[k] = val
+
+    if "ai_picks_push_enabled" in dumped and dumped["ai_picks_push_enabled"] is not None:
+        fields_to_update["ai_picks_push_enabled"] = "1" if dumped["ai_picks_push_enabled"] else "0"
 
     # Only overwrite keys if provided and not masked
-    if payload.binance_api_key and "******" not in payload.binance_api_key:
-        fields_to_update["binance_api_key"] = payload.binance_api_key.strip()
-    if payload.binance_api_secret and "******" not in payload.binance_api_secret:
-        fields_to_update["binance_api_secret"] = payload.binance_api_secret.strip()
-    if payload.openai_api_key and "******" not in payload.openai_api_key:
-        fields_to_update["openai_api_key"] = payload.openai_api_key.strip()
-    if payload.feishu_app_id is not None:
-        fields_to_update["feishu_app_id"] = payload.feishu_app_id.strip()
-    if payload.feishu_app_secret and "******" not in payload.feishu_app_secret:
-        fields_to_update["feishu_app_secret"] = payload.feishu_app_secret.strip()
+    for secret_k in ["binance_api_key", "binance_api_secret", "openai_api_key", "feishu_app_secret"]:
+        if secret_k in dumped and dumped[secret_k] and "******" not in str(dumped[secret_k]):
+            fields_to_update[secret_k] = str(dumped[secret_k]).strip()
 
     async with aiosqlite.connect(settings.DB_PATH) as db:
         for k, v in fields_to_update.items():

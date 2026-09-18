@@ -37,6 +37,38 @@ class AnalysisAgent:
         self.base_url = base_url.rstrip("/")
         self.model = model or getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
 
+    async def ask_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """
+        Ask LLM for interactive conversational response.
+        """
+        if not self.api_key:
+            return ""
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        sys_msg = system_prompt or SYSTEM_PROMPT
+        payload = {
+            "model": self.model or "gemini-2.5-flash",
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.4
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(f"{self.base_url}/chat/completions", json=payload, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                else:
+                    logger.error(f"LLM API error status={resp.status_code}, body={resp.text}")
+        except Exception as e:
+            logger.error(f"Error calling ask_llm: {e}")
+        return ""
+
     async def analyze_candidate(
         self,
         symbol: str,
