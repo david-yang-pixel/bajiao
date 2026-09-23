@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List
 import aiosqlite
 import httpx
@@ -110,8 +111,7 @@ async def background_monitoring_loop():
         try:
             await asyncio.sleep(30)
             tick_count += 1
-            force_periodic = (tick_count % 120 == 0)
-            await position_monitor.scan_all_positions(force_periodic=force_periodic)
+            await position_monitor.scan_all_positions(force_periodic=False)
 
             # Every 10 mins (20 ticks), silently sync Binance positions if API keys are configured
             if tick_count % 20 == 0 and binance_client.api_key and binance_client.api_secret:
@@ -307,7 +307,9 @@ async def create_position(pos: PositionCreate):
             )
         )
         await db.commit()
-        return {"id": cursor.lastrowid, "message": "Position created successfully"}
+        new_id = cursor.lastrowid
+        position_monitor._last_periodic_times[new_id] = time.time()
+        return {"id": new_id, "message": "Position created successfully"}
 
 @app.put("/api/positions/{position_id}")
 async def update_position(position_id: int, pos: PositionUpdate):
@@ -347,6 +349,9 @@ async def update_position(position_id: int, pos: PositionUpdate):
             await db.execute(f"UPDATE positions SET {', '.join(updates)} WHERE id = ?", params)
             await db.commit()
 
+        if pos.buy_price is not None or pos.ladder_alerts is not None:
+            position_monitor.clear_position_milestones(position_id)
+
     return {"message": "Position updated successfully"}
 
 @app.delete("/api/positions/{position_id}")
@@ -354,6 +359,8 @@ async def remove_position(position_id: int):
     async with aiosqlite.connect(settings.DB_PATH) as db:
         await db.execute("UPDATE positions SET is_active = 0 WHERE id = ?", (position_id,))
         await db.commit()
+    position_monitor._last_periodic_times.pop(position_id, None)
+    position_monitor.clear_position_milestones(position_id)
     return {"message": "Position closed/deactivated"}
 
 @app.post("/api/positions/{position_id}/test-alert")
@@ -416,6 +423,7 @@ async def test_position_alert(position_id: int):
 
     # Record to alert logs
     await position_monitor.log_alert(pos["id"], pos["symbol"], note, "periodic")
+    position_monitor._last_periodic_times[pos["id"]] = time.time()
 
     return {
         "success": True,

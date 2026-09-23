@@ -1,8 +1,9 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 import aiosqlite
 
 from backend.app.config import settings
@@ -37,6 +38,7 @@ class PositionMonitor:
         self._db_path = db_path
         self._last_alert_times: Dict[str, float] = {}  # {f"{pos_id}:{alert_type}:{step}": timestamp}
         self._last_periodic_times: Dict[int, float] = {}  # {pos_id: timestamp}
+        self._achieved_milestones: Set[str] = set()  # {f"{pos_id}:{alert_type}:{step}"}
         self.cooldown_seconds = 1800  # 30 mins anti-spam cooldown per step
 
     @property
@@ -77,6 +79,62 @@ class PositionMonitor:
                 (position_id, symbol, message, alert_type)
             )
             await db.commit()
+
+    async def get_last_periodic_alert_time(self, pos_id: int) -> Optional[float]:
+        """Fetch the timestamp of the last periodic alert for a position from alert_logs."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    "SELECT created_at FROM alert_logs WHERE position_id = ? AND alert_type = 'periodic' ORDER BY id DESC LIMIT 1",
+                    (pos_id,)
+                )
+                row = await cursor.fetchone()
+                if row and row[0]:
+                    dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    return dt.timestamp()
+        except Exception as e:
+            logger.warning(f"Error querying last periodic alert time for pos {pos_id}: {e}")
+        return None
+
+    async def is_milestone_achieved(
+        self,
+        pos_id: int,
+        key: str,
+        alert_type: str,
+        message_pattern: Optional[str] = None
+    ) -> bool:
+        """Check if a threshold or ladder milestone has already been alerted for this position."""
+        if key in self._achieved_milestones:
+            return True
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                if message_pattern:
+                    cursor = await db.execute(
+                        "SELECT 1 FROM alert_logs WHERE position_id = ? AND alert_type = ? AND message LIKE ? LIMIT 1",
+                        (pos_id, alert_type, message_pattern)
+                    )
+                else:
+                    cursor = await db.execute(
+                        "SELECT 1 FROM alert_logs WHERE position_id = ? AND alert_type = ? LIMIT 1",
+                        (pos_id, alert_type)
+                    )
+                row = await cursor.fetchone()
+                if row:
+                    self._achieved_milestones.add(key)
+                    return True
+        except Exception as e:
+            logger.warning(f"Error checking milestone achievement for {key}: {e}")
+        return False
+
+    def mark_milestone_achieved(self, key: str):
+        self._achieved_milestones.add(key)
+
+    def reset_milestone(self, key: str):
+        self._achieved_milestones.discard(key)
+
+    def clear_position_milestones(self, pos_id: int):
+        prefix = f"{pos_id}:"
+        self._achieved_milestones = {k for k in self._achieved_milestones if not k.startswith(prefix)}
 
     def _is_cooled_down(self, key: str, custom_cooldown: Optional[float] = None) -> bool:
         last_time = self._last_alert_times.get(key, 0)
@@ -120,60 +178,72 @@ class PositionMonitor:
         tp_price = pos.get("take_profit_price")
         if tp_price and curr_price >= float(tp_price):
             key = f"{pos_id}:take_profit"
-            if self._is_cooled_down(key, custom_cooldown=900):  # 15 mins cooldown
-                note = f"已突破设定止盈位 ${tp_price:.2f}"
+            if not await self.is_milestone_achieved(pos_id, key, "take_profit"):
+                note = f"已突破设定止盈位 ${float(tp_price):.2f}"
                 trend_data = await get_trend()
                 await self.notification_service.send_position_alert(
                     symbol, buy_price, curr_price, pnl_pct, "take_profit", note, trend_analysis=trend_data, pnl_usd=pnl_usd
                 )
                 await self.log_alert(pos_id, symbol, note, "take_profit")
+                self.mark_milestone_achieved(key)
                 self._mark_alerted(key)
                 triggered.append("take_profit")
+        elif tp_price and curr_price < float(tp_price) * 0.98:
+            self.reset_milestone(f"{pos_id}:take_profit")
 
         # 2. Stop Loss alert
         sl_price = pos.get("stop_loss_price")
         if sl_price and curr_price <= float(sl_price):
             key = f"{pos_id}:stop_loss"
-            if self._is_cooled_down(key, custom_cooldown=600):  # 10 mins cooldown for emergency defense
-                note = f"已跌破设定止损线 ${sl_price:.2f}"
+            if not await self.is_milestone_achieved(pos_id, key, "stop_loss"):
+                note = f"已跌破设定止损线 ${float(sl_price):.2f}"
                 trend_data = await get_trend()
                 await self.notification_service.send_position_alert(
                     symbol, buy_price, curr_price, pnl_pct, "stop_loss", note, trend_analysis=trend_data, pnl_usd=pnl_usd
                 )
                 await self.log_alert(pos_id, symbol, note, "stop_loss")
+                self.mark_milestone_achieved(key)
                 self._mark_alerted(key)
                 triggered.append("stop_loss")
+        elif sl_price and curr_price > float(sl_price) * 1.02:
+            self.reset_milestone(f"{pos_id}:stop_loss")
 
-        # 3. Ladder profit percentage alerts (e.g. 5.0, 10.0, 20.0)
-        ladder_alerts = pos.get("ladder_alerts") or []
-        for step in ladder_alerts:
-            step_val = float(step)
+        # 3. Ladder profit percentage alerts (e.g. 2.0, 3.0, 5.0, 8.0)
+        ladder_alerts = sorted([float(s) for s in (pos.get("ladder_alerts") or [])])
+        for step_val in ladder_alerts:
             if pnl_pct >= step_val:
-                key = f"{pos_id}:ladder:{step_val}"
-                if self._is_cooled_down(key):
+                key = f"{pos_id}:ladder:{step_val:.1f}"
+                if not await self.is_milestone_achieved(pos_id, key, "ladder", f"%+{step_val:.1f}%"):
                     note = f"收益率达成阶梯目标 +{step_val:.1f}%"
                     await self.notification_service.send_position_alert(
                         symbol, buy_price, curr_price, pnl_pct, "ladder", note, pnl_usd=pnl_usd
                     )
                     await self.log_alert(pos_id, symbol, note, "ladder")
+                    self.mark_milestone_achieved(key)
                     self._mark_alerted(key)
                     triggered.append(f"ladder_{step_val}")
 
-        # 4. Periodic inspection notification (configured frequency e.g. every 15m, 30m, 1h, 2h)
+        # 4. Periodic inspection notification (configured frequency e.g. every 15m, 30m, 1h, 2h, 4h)
         interval_hours = float(pos.get("check_interval_hours") if pos.get("check_interval_hours") is not None else 1.0)
         is_periodic_due = False
 
         if interval_hours > 0:
             interval_sec = interval_hours * 3600
-            last_p = self._last_periodic_times.get(pos_id, 0)
             now = time.time()
-            if last_p == 0:
-                self._last_periodic_times[pos_id] = now
-            elif (now - last_p) >= interval_sec:
+            last_p = self._last_periodic_times.get(pos_id)
+            if last_p is None:
+                last_p = await self.get_last_periodic_alert_time(pos_id)
+                if last_p is None:
+                    last_p = now
+                self._last_periodic_times[pos_id] = last_p
+
+            if (now - last_p) >= interval_sec:
                 is_periodic_due = True
-                self._last_periodic_times[pos_id] = now
 
         if force_periodic or is_periodic_due:
+            # Update last periodic time immediately so duplicate alerts cannot occur
+            self._last_periodic_times[pos_id] = time.time()
+
             if interval_hours <= 0:
                 interval_str = "手动触发"
             elif interval_hours < 1:
