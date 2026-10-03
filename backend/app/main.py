@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 import json
+import hmac
 import logging
 import os
 import time
@@ -11,8 +12,11 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.responses import JSONResponse
 
-from backend.app.config import settings
+from backend.app.config import DEFAULT_CHECK_INTERVAL_HOURS, settings
 from backend.app.database import init_db
 from backend.app.models.schemas import (
     PositionCreate,
@@ -21,8 +25,9 @@ from backend.app.models.schemas import (
     AskAIRequest,
     SystemConfigSchema,
     TestConnectionRequest,
+    BinanceCredentialsUpdate,
 )
-from backend.app.services.binance_client import BinanceClient
+from backend.app.services.binance_client import BinanceAccountError, BinanceClient
 from backend.app.services.quant_screener import QuantScreener
 from backend.app.services.analysis_agent import AnalysisAgent
 from backend.app.services.notification import NotificationService
@@ -30,6 +35,8 @@ from backend.app.services.position_monitor import PositionMonitor
 from backend.app.services.feishu_bot_service import FeishuBotService
 
 logging.basicConfig(level=logging.INFO)
+# HTTPX logs signed request URLs at INFO, including short-lived signatures.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("bstocks_app")
 
 # Singletons
@@ -50,7 +57,16 @@ feishu_bot_service = FeishuBotService(
     position_monitor=position_monitor
 )
 
+_runtime_config_lock = asyncio.Lock()
+
+
 async def apply_runtime_config():
+    # Concurrent saves must not reload an older snapshot after a newer save.
+    async with _runtime_config_lock:
+        await _load_runtime_config()
+
+
+async def _load_runtime_config():
     """Load config from system_configs table and re-initialize service singletons."""
     try:
         async with aiosqlite.connect(settings.DB_PATH) as db:
@@ -139,7 +155,7 @@ async def background_monitoring_loop():
                     if is_sched_enabled and current_hm == sched_time and _last_ai_picks_push_date != today_date:
                         _last_ai_picks_push_date = today_date
                         logger.info(f"Triggering scheduled daily AI stock picks push for {today_date} at {current_hm} (Beijing Time)...")
-                        await run_daily_analysis()
+                        await run_daily_analysis(push_notifications=True)
             except Exception as sched_err:
                 logger.error(f"Error checking scheduled AI picks push: {sched_err}")
         except asyncio.CancelledError:
@@ -169,6 +185,14 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_config_validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/config"):
+        errors = [{k: e[k] for k in ("loc", "msg", "type") if k in e} for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": errors})
+    return await request_validation_exception_handler(request, exc)
 
 app.add_middleware(
     CORSMiddleware,
@@ -204,7 +228,7 @@ async def get_klines(symbol: str = Query(...), interval: str = "1d", limit: int 
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/analysis/run")
-async def run_daily_analysis():
+async def run_daily_analysis(push_notifications: bool = False):
     candidates = await quant_screener.screen_candidates(binance_client, min_score=40)
     top_candidates = candidates[:3] if candidates else []
 
@@ -234,13 +258,14 @@ async def run_daily_analysis():
             )
             await db.commit()
 
-            await notification_service.send_daily_pick_card(
-                symbol=symbol,
-                reason=analysis["reason"],
-                target_price=analysis["target_price"],
-                stop_loss=analysis["stop_loss_price"],
-                score=cand["score"]
-            )
+            if push_notifications:
+                await notification_service.send_daily_pick_card(
+                    symbol=symbol,
+                    reason=analysis["reason"],
+                    target_price=analysis["target_price"],
+                    stop_loss=analysis["stop_loss_price"],
+                    score=cand["score"]
+                )
 
     return {"count": len(results), "picks": results}
 
@@ -286,10 +311,21 @@ async def list_positions():
         enriched.append(pos_dict)
     return enriched
 
+async def get_default_check_interval_hours(db: aiosqlite.Connection) -> float:
+    cursor = await db.execute(
+        "SELECT value FROM system_configs WHERE key = 'default_check_interval_hours'"
+    )
+    row = await cursor.fetchone()
+    return float(row[0]) if row else DEFAULT_CHECK_INTERVAL_HOURS
+
+
 @app.post("/api/positions")
 async def create_position(pos: PositionCreate):
     async with aiosqlite.connect(settings.DB_PATH) as db:
         ladder_json = json.dumps(pos.ladder_alerts)
+        interval_hours = pos.check_interval_hours
+        if interval_hours is None:
+            interval_hours = await get_default_check_interval_hours(db)
         cursor = await db.execute(
             """
             INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, is_active)
@@ -301,7 +337,7 @@ async def create_position(pos: PositionCreate):
                 pos.quantity,
                 pos.take_profit_price,
                 pos.stop_loss_price,
-                pos.check_interval_hours,
+                interval_hours,
                 ladder_json,
                 1 if pos.include_ai_analysis else 0
             )
@@ -389,7 +425,7 @@ async def test_position_alert(position_id: int):
 
     pnl_pct = ((curr_price - buy_price) / buy_price) * 100.0 if buy_price > 0 else 0.0
 
-    interval_hours = float(pos.get("check_interval_hours") if pos.get("check_interval_hours") is not None else 0.5)
+    interval_hours = float(pos.get("check_interval_hours") if pos.get("check_interval_hours") is not None else DEFAULT_CHECK_INTERVAL_HOURS)
     if interval_hours <= 0:
         interval_str = "已关闭定时播报"
     elif interval_hours < 1:
@@ -457,6 +493,9 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
 
     async with aiosqlite.connect(settings.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        default_interval = await get_default_check_interval_hours(db)
+        cursor = await db.execute("SELECT symbol FROM positions WHERE is_active = 1")
+        active_symbols = {row["symbol"] for row in await cursor.fetchall()}
 
         for b in balances:
             asset = b["asset"].upper()
@@ -491,6 +530,8 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
                     continue
 
             if not matched_symbol:
+                if active_symbols.intersection(candidates):
+                    raise RuntimeError("币安行情读取失败，本次同步已取消，现有持仓保持不变")
                 continue
 
             notional = total_qty * curr_price
@@ -506,7 +547,7 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
             avg_buy = await binance_client.get_average_buy_price(matched_symbol)
             buy_price = avg_buy if (avg_buy and avg_buy > 0) else curr_price
 
-            # Default short-term take profit +5%, tight stop loss -3%, high-frequency 30m check
+            # New holdings use the saved reporting default; reimported symbols retain preferences.
             tp_price = round(buy_price * 1.05, 4)
             sl_price = round(buy_price * 0.97, 4)
             default_ladder = [2.0, 3.0, 5.0, 8.0]
@@ -538,10 +579,28 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
                     "wallet": b.get("wallet", "币安账户")
                 })
             else:
+                cursor = await db.execute(
+                    """
+                    SELECT check_interval_hours, ladder_alerts, include_ai_analysis
+                    FROM positions WHERE symbol = ? AND is_active = 0
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (matched_symbol,)
+                )
+                previous = await cursor.fetchone()
+                interval_hours = default_interval
+                ladder_json = json.dumps(default_ladder)
+                include_ai = 0
+                if previous:
+                    if previous["check_interval_hours"] is not None:
+                        interval_hours = previous["check_interval_hours"]
+                    if previous["ladder_alerts"] is not None:
+                        ladder_json = previous["ladder_alerts"]
+                    include_ai = int(bool(previous["include_ai_analysis"]))
                 await db.execute(
                     """
-                    INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                    INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                     """,
                     (
                         matched_symbol,
@@ -549,8 +608,9 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
                         total_qty,
                         tp_price,
                         sl_price,
-                        0.5,
-                        json.dumps(default_ladder)
+                        interval_hours,
+                        ladder_json,
+                        include_ai
                     )
                 )
                 synced_items.append({
@@ -640,7 +700,7 @@ async def get_system_config():
 
     return {
         "binance_api_key": mask(raw_binance_key),
-        "binance_api_secret": mask(raw_binance_secret),
+        "binance_api_secret": "",
         "binance_mcp_url": cfg.get("binance_mcp_url") or settings.BINANCE_MCP_URL or "https://agent.binance.com/mcp/agentic",
         "has_binance_key": bool(raw_binance_key),
         "has_binance_secret": bool(raw_binance_secret),
@@ -655,7 +715,8 @@ async def get_system_config():
         "feishu_bot_connected": feishu_bot_service.is_connected,
         "wecom_webhook_url": cfg.get("wecom_webhook_url") or settings.WECOM_WEBHOOK_URL or "",
         "ai_picks_push_enabled": cfg.get("ai_picks_push_enabled") in ("1", "true", "True", True),
-        "ai_picks_push_time": cfg.get("ai_picks_push_time") or "21:30"
+        "ai_picks_push_time": cfg.get("ai_picks_push_time") or "21:30",
+        "default_check_interval_hours": float(cfg.get("default_check_interval_hours", DEFAULT_CHECK_INTERVAL_HOURS))
     }
 
 @app.post("/api/config")
@@ -664,7 +725,13 @@ async def save_system_config(payload: SystemConfigSchema):
     dumped = payload.model_dump(exclude_unset=True)
     fields_to_update = {}
 
-    for k in ["binance_mcp_url", "openai_base_url", "openai_model", "feishu_webhook_url", "wecom_webhook_url", "ai_picks_push_time", "feishu_app_id"]:
+    # Old tabs may submit masks; real credentials must use the verified pair endpoint.
+    for key in ("binance_api_key", "binance_api_secret"):
+        value = str(dumped.get(key) or "").strip()
+        if value and "******" not in value:
+            raise HTTPException(status_code=400, detail="普通设置保存不会修改币安凭据，请使用“验证并更新币安凭据”操作")
+
+    for k in ["binance_mcp_url", "openai_base_url", "openai_model", "feishu_webhook_url", "wecom_webhook_url", "ai_picks_push_time", "feishu_app_id", "default_check_interval_hours"]:
         if k in dumped and dumped[k] is not None:
             val = str(dumped[k]).strip()
             if val:
@@ -674,7 +741,7 @@ async def save_system_config(payload: SystemConfigSchema):
         fields_to_update["ai_picks_push_enabled"] = "1" if dumped["ai_picks_push_enabled"] else "0"
 
     # Only overwrite keys if provided and not masked
-    for secret_k in ["binance_api_key", "binance_api_secret", "openai_api_key", "feishu_app_secret"]:
+    for secret_k in ["openai_api_key", "feishu_app_secret"]:
         if secret_k in dumped and dumped[secret_k] and "******" not in str(dumped[secret_k]):
             fields_to_update[secret_k] = str(dumped[secret_k]).strip()
 
@@ -690,71 +757,69 @@ async def save_system_config(payload: SystemConfigSchema):
     await apply_runtime_config()
     return {"message": "配置已成功保存并实时生效"}
 
+
+@app.post("/api/config/binance-credentials")
+async def update_binance_credentials(payload: BinanceCredentialsUpdate, request: Request):
+    """Replace a complete pair only after both signed account reads succeed."""
+    api_key = payload.api_key.get_secret_value()
+    api_secret = payload.api_secret.get_secret_value()
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        stored_pair = dict(await (await db.execute(
+            "SELECT key,value FROM system_configs WHERE key IN ('binance_api_key','binance_api_secret')"
+        )).fetchall())
+    current_secret = stored_pair.get("binance_api_secret") or settings.BINANCE_API_SECRET
+    proof = payload.current_api_secret.get_secret_value() if payload.current_api_secret else ""
+    local_setup = request.client and request.client.host in ("127.0.0.1", "::1") and not any(
+        header in request.headers for header in ("forwarded", "x-forwarded-for", "x-real-ip")
+    )
+    if not local_setup and (not current_secret or not hmac.compare_digest(proof.encode("utf-8"), current_secret.encode("utf-8"))):
+        raise HTTPException(status_code=403, detail="更换币安凭据需验证当前 API Secret，原有凭据保持不变")
+    candidate = BinanceClient(api_key=api_key, api_secret=api_secret, mcp_url="")
+    try:
+        await candidate.get_account_balances()
+    except BinanceAccountError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"币安账户验证未通过（{type(exc).__name__}），原有凭据保持不变") from None
+
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        latest_pair = dict(await (await db.execute(
+            "SELECT key,value FROM system_configs WHERE key IN ('binance_api_key','binance_api_secret')"
+        )).fetchall())
+        if latest_pair != stored_pair:
+            raise HTTPException(status_code=409, detail="币安凭据在验证期间发生变化，请刷新后重试")
+        await db.executemany(
+            "INSERT INTO system_configs (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+            [("binance_api_key", api_key), ("binance_api_secret", api_secret)],
+        )
+        await db.commit()
+    await apply_runtime_config()
+    return {"success": True, "message": "币安现货和资金账户验证成功，凭据已安全更新并生效"}
+
 @app.post("/api/config/test")
 async def test_connection(req: TestConnectionRequest):
     """Test connectivity for Binance, LLM, Feishu, or WeCom."""
     svc = req.service.lower()
+    if svc == "binance":
+        api_key = req.api_key
+        if not api_key or "******" in api_key:
+            api_key = binance_client.api_key
+        api_secret = req.api_secret.get_secret_value() if req.api_secret else ""
+        if not api_secret or "******" in api_secret:
+            api_secret = binance_client.api_secret
+        if not api_key or not api_secret:
+            return {"success": False, "message": "请先配置完整的币安 API Key 和 API Secret"}
+        candidate = BinanceClient(api_key=api_key, api_secret=api_secret, mcp_url="")
+        try:
+            await candidate.get_account_balances()
+            return {"success": True, "message": "币安现货和资金账户鉴权成功，持仓读取正常"}
+        except BinanceAccountError as exc:
+            return {"success": False, "message": str(exc)}
+        except Exception as exc:
+            return {"success": False, "message": f"币安账户读取未通过（{type(exc).__name__}）"}
     async with httpx.AsyncClient(timeout=10.0) as client:
-        if svc == "binance":
-            api_key = req.api_key
-            if not api_key or "******" in api_key:
-                api_key = binance_client.api_key or settings.BINANCE_API_KEY
-
-            # 1. First test Binance Official REST API connectivity
-            rest_url = "https://api.binance.com/api/v3/ping"
-            headers = {}
-            if api_key and "******" not in api_key:
-                headers["X-MBX-APIKEY"] = api_key
-
-            rest_ok = False
-            rest_msg = ""
-            try:
-                r_rest = await client.get(rest_url, headers=headers)
-                if r_rest.status_code == 200:
-                    rest_ok = True
-                    rest_msg = "币安官方行情 API 连通正常 (HTTP 200)"
-                else:
-                    rest_msg = f"REST 返回: {r_rest.status_code}"
-            except Exception as e:
-                rest_msg = f"REST 连接异常: {str(e)}"
-
-            # 2. Test Binance MCP endpoint if configured
-            mcp_url = req.base_url or binance_client.mcp_url or "https://agent.binance.com/mcp/agentic"
-            mcp_msg = ""
-            mcp_ok = False
-            try:
-                # Test MCP JSON-RPC ping / initialize via POST
-                rpc_headers = {"Content-Type": "application/json"}
-                if api_key and "******" not in api_key:
-                    rpc_headers["X-MBX-APIKEY"] = api_key
-                r_mcp = await client.post(
-                    mcp_url,
-                    headers=rpc_headers,
-                    json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}},
-                    timeout=5.0
-                )
-                if r_mcp.status_code in (200, 204):
-                    mcp_ok = True
-                    mcp_msg = "币安 MCP Agentic 服务响应正常"
-                elif r_mcp.status_code == 401:
-                    mcp_msg = "币安 MCP 需要特定权限认证 (返回 401)"
-                else:
-                    mcp_msg = f"MCP 状态码: {r_mcp.status_code}"
-            except Exception as e:
-                mcp_msg = f"MCP 连接异常: {str(e)}"
-
-            if rest_ok:
-                return {
-                    "success": True,
-                    "message": f"币安连通测试成功！{rest_msg}。系统已具备稳定获取 bStocks 行情能力。" + (f" (MCP状态: {mcp_msg})" if mcp_msg else "")
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": f"币安 API 连接受阻: {rest_msg} / {mcp_msg}"
-                }
-
-        elif svc == "llm":
+        if svc == "llm":
             base_url = (req.base_url or analysis_agent.base_url or settings.OPENAI_BASE_URL or "https://api.openai.com/v1").rstrip("/")
             api_key = req.api_key
             if not api_key or "******" in api_key:

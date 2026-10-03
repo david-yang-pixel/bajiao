@@ -82,8 +82,6 @@ async def test_system_config_endpoints(tmp_path, monkeypatch):
 
         # 2. Save config
         payload = {
-            "binance_api_key": "test_api_key_123456",
-            "binance_api_secret": "test_secret_654321",
             "openai_api_key": "sk-test-openai-key-999",
             "openai_model": "deepseek-chat",
             "openai_base_url": "https://api.deepseek.com/v1",
@@ -93,6 +91,13 @@ async def test_system_config_endpoints(tmp_path, monkeypatch):
         post_res = await ac.post("/api/config", json=payload)
         assert post_res.status_code == 200
 
+        with patch("backend.app.services.binance_client.BinanceClient.get_account_balances", new_callable=AsyncMock) as balances:
+            balances.return_value = []
+            credentials = await ac.post("/api/config/binance-credentials", json={
+                "api_key": "A" * 64, "api_secret": "B" * 64,
+            })
+            assert credentials.status_code == 200
+
         # 3. Read back masked
         res2 = await ac.get("/api/config")
         assert res2.status_code == 200
@@ -101,7 +106,7 @@ async def test_system_config_endpoints(tmp_path, monkeypatch):
         assert data2["has_binance_secret"] is True
         assert data2["has_openai_key"] is True
         assert "******" in data2["binance_api_key"]
-        assert "******" in data2["binance_api_secret"]
+        assert data2["binance_api_secret"] == ""
         assert data2["openai_model"] == "deepseek-chat"
 
 @pytest.mark.asyncio
@@ -343,7 +348,6 @@ async def test_feishu_events_endpoint(tmp_path, monkeypatch):
             assert msg_res.status_code == 200
             assert msg_res.json() == {"code": 0}
             mock_handle.assert_called_once_with("持仓", "om_msg123", "oc_chat123", "ou_user1")
-
 
 
 

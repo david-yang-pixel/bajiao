@@ -10,6 +10,34 @@ from backend.app.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+class BinanceAccountError(RuntimeError):
+    """Account failure containing only safe status codes and fixed explanations."""
+
+    def __init__(self, wallet: str, response: httpx.Response):
+        self.status_code = response.status_code
+        self.code = None
+        try:
+            data = response.json()
+            code = data.get("code") if isinstance(data, dict) else None
+            if isinstance(code, int) and not isinstance(code, bool):
+                self.code = code
+        except ValueError:
+            pass
+        explanations = {
+            -1022: "签名校验失败，请检查配套的 API Key 和 API Secret",
+            -1021: "请求时间超出允许范围，请检查服务器时间",
+            -2014: "API Key 格式无效",
+            -2015: "API Key、读取权限或 IP 白名单校验失败",
+            -2008: "API Key 无效",
+            -1003: "请求过于频繁，请稍后重试",
+        }
+        status = f"HTTP {self.status_code}"
+        if self.code is not None:
+            status += f"，币安错误码 {self.code}"
+        reason = explanations.get(self.code, "账户请求被币安拒绝")
+        super().__init__(f"币安{wallet}读取失败（{status}）：{reason}；本次同步已取消，现有持仓保持不变")
+
 # Common bStocks symbols on Binance
 SUPPORTED_BSTOCKS = [
     "NVDABUSDT",
@@ -160,15 +188,16 @@ class BinanceClient:
 
         return klines
 
-    def _generate_signature(self, params: Dict[str, Any]) -> str:
+    def _generate_signature(self, params: Dict[str, Any], *, api_secret: Optional[str] = None) -> str:
         """
         Generate HMAC-SHA256 signature for Binance Private Signed Endpoints.
         """
-        if not self.api_secret:
+        secret = self.api_secret if api_secret is None else api_secret
+        if not secret:
             raise ValueError("BINANCE_API_SECRET 未配置，无法调用币安私有鉴权接口")
         query_str = urlencode(params)
         return hmac.new(
-            self.api_secret.encode("utf-8"),
+            secret.encode("utf-8"),
             query_str.encode("utf-8"),
             hashlib.sha256
         ).hexdigest()
@@ -180,7 +209,8 @@ class BinanceClient:
         2. Funding account (POST /sapi/v1/asset/get-funding-asset) - holds bStocks/Pay/Convert assets
         Returns all non-zero asset balances merged by asset.
         """
-        if not self.api_key or not self.api_secret:
+        api_key, api_secret = self.api_key, self.api_secret
+        if not api_key or not api_secret:
             raise ValueError("需要同时配置币安 API Key 和 API Secret 才能读取账户持仓")
 
         balances_map: Dict[str, Dict[str, Any]] = {}
@@ -191,15 +221,17 @@ class BinanceClient:
                 "timestamp": int(time.time() * 1000),
                 "recvWindow": 5000
             }
-            params["signature"] = self._generate_signature(params)
-            headers = {"X-MBX-APIKEY": self.api_key}
+            params["signature"] = self._generate_signature(params, api_secret=api_secret)
+            headers = {"X-MBX-APIKEY": api_key}
             url = f"{self.rest_base_url}/api/v3/account"
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.get(url, params=params, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
-                    for b in data.get("balances", []):
+                    if not isinstance(data, dict) or not isinstance(data.get("balances"), list):
+                        raise RuntimeError("币安现货账户响应格式异常")
+                    for b in data["balances"]:
                         asset = b.get("asset", "").upper()
                         free = float(b.get("free", 0))
                         locked = float(b.get("locked", 0))
@@ -213,9 +245,13 @@ class BinanceClient:
                                 "wallet": "现货账户"
                             }
                 else:
-                    logger.warning(f"获取币安现货账户失败: {resp.status_code} {resp.text}")
+                    raise BinanceAccountError("现货账户", resp)
+        except BinanceAccountError as e:
+            logger.warning("%s", e)
+            raise
         except Exception as e:
-            logger.warning(f"获取币安现货账户异常: {e}")
+            logger.warning("币安现货账户读取失败 (%s)", type(e).__name__)
+            raise RuntimeError("币安现货账户读取失败，本次同步已取消，现有持仓保持不变") from e
 
         # 2. Fetch Funding Account Balances (资金账户 - bStocks 常用账户)
         try:
@@ -224,8 +260,8 @@ class BinanceClient:
                 "timestamp": int(time.time() * 1000),
                 "recvWindow": 5000
             }
-            params["signature"] = self._generate_signature(params)
-            headers = {"X-MBX-APIKEY": self.api_key}
+            params["signature"] = self._generate_signature(params, api_secret=api_secret)
+            headers = {"X-MBX-APIKEY": api_key}
             url = f"{self.rest_base_url}/sapi/v1/asset/get-funding-asset"
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -252,10 +288,16 @@ class BinanceClient:
                                         "total": tot,
                                         "wallet": "资金账户"
                                     }
+                    else:
+                        raise RuntimeError("币安资金账户响应格式异常")
                 else:
-                    logger.info(f"获取币安资金账户提示: {resp.status_code} {resp.text}")
+                    raise BinanceAccountError("资金账户", resp)
+        except BinanceAccountError as e:
+            logger.warning("%s", e)
+            raise
         except Exception as e:
-            logger.warning(f"获取币安资金账户异常: {e}")
+            logger.warning("币安资金账户读取失败 (%s)", type(e).__name__)
+            raise RuntimeError("币安资金账户读取失败，本次同步已取消，现有持仓保持不变") from e
 
         return list(balances_map.values())
 
@@ -352,4 +394,3 @@ class BinanceClient:
             logger.warning(f"获取 {clean_symbol} 闪兑记录异常: {e}")
 
         return None
-

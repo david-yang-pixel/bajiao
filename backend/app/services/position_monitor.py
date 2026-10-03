@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Optional, Set
 import aiosqlite
 
-from backend.app.config import settings
+from backend.app.config import DEFAULT_CHECK_INTERVAL_HOURS, settings
 from backend.app.services.binance_client import BinanceClient
 from backend.app.services.notification import NotificationService
 from backend.app.services.quant_screener import QuantScreener
@@ -224,7 +224,7 @@ class PositionMonitor:
                     triggered.append(f"ladder_{step_val}")
 
         # 4. Periodic inspection notification (configured frequency e.g. every 15m, 30m, 1h, 2h, 4h)
-        interval_hours = float(pos.get("check_interval_hours") if pos.get("check_interval_hours") is not None else 1.0)
+        interval_hours = float(pos.get("check_interval_hours") if pos.get("check_interval_hours") is not None else DEFAULT_CHECK_INTERVAL_HOURS)
         is_periodic_due = False
 
         if interval_hours > 0:

@@ -183,7 +183,7 @@
           </button>
 
           <button
-            @click="openAddModal = true"
+            @click="openAddPosition"
             class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold px-3.5 py-1.5 rounded-lg shadow-sm shadow-indigo-200 flex items-center gap-1.5 transition">
             <i class="fa-solid fa-plus text-[11px]"></i>
             <span>手动录入</span>
@@ -354,7 +354,7 @@
                 从币安重新同步
               </button>
               <button
-                @click="openAddModal = true"
+              @click="openAddPosition"
                 class="px-4 py-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-semibold transition flex items-center gap-2">
                 <i class="fa-solid fa-plus text-[11px]"></i>
                 手动录入持仓
@@ -538,6 +538,11 @@
             <button @click="currentTab = 'settings'" class="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 underline">修改定时</button>
           </div>
 
+          <label class="flex items-center gap-2 text-xs text-slate-600">
+            <input v-model="manualAnalysisPush" type="checkbox" class="rounded border-slate-300 text-indigo-600">
+            本次手动研判完成后推送到飞书/企微（默认仅刷新页面）
+          </label>
+
           <!-- Empty State -->
           <div v-if="dailyPicks.length === 0" class="py-16 text-center border-2 border-dashed border-slate-200 rounded-2xl">
             <div class="w-14 h-14 rounded-full bg-slate-50 border border-slate-200 flex items-center justify-center text-slate-400 text-xl mx-auto mb-3">
@@ -608,7 +613,7 @@
 
               <!-- Action button -->
               <div class="pt-3 border-t border-slate-100 flex items-center justify-between">
-                <span class="text-[11px] text-slate-400">已自动向推送群发送精选卡片</span>
+                <span class="text-[11px] text-slate-400">加入盯盘后可单独设置提醒</span>
                 <button
                   @click="quickTrack(pick)"
                   class="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 text-slate-700 text-xs font-semibold transition flex items-center gap-1.5">
@@ -738,28 +743,40 @@
                 </button>
               </div>
 
-              <div>
-                <div class="flex items-center justify-between mb-1">
-                  <label class="block text-slate-600 text-xs font-medium">Binance API Key (公钥)</label>
-                  <span v-if="config.has_binance_key" class="text-[11px] font-semibold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100">
-                    <i class="fa-solid fa-circle-check text-[10px]"></i> 已配置生效
-                  </span>
-                </div>
-                <input v-model="config.binance_api_key" type="text"
-                       :placeholder="config.has_binance_key ? (config.binance_api_key || '••••••••') : '填入币安 API Key'"
-                       class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+              <div class="rounded-xl border border-slate-200 bg-white p-3 space-y-2">
+                <p class="text-xs text-slate-600">API Key：<span class="font-mono">{{ config.binance_api_key || '未配置' }}</span></p>
+                <p class="text-xs text-slate-600">API Secret：{{ config.has_binance_secret ? '已保存，页面不读取密钥' : '未配置' }}</p>
+                <p class="text-[11px] text-slate-500">保存其他设置不会更改币安凭据。更换时需同时填写 Key 和 Secret，并通过账户读取验证。</p>
+                <button v-if="!editingBinanceCredentials" @click="beginBinanceCredentialEdit"
+                        class="text-xs font-semibold text-indigo-600 hover:text-indigo-700">更换币安凭据</button>
               </div>
 
-              <div>
-                <div class="flex items-center justify-between mb-1">
-                  <label class="block text-slate-600 text-xs font-medium">Binance API Secret (私钥，仅用于读取现货持仓)</label>
-                  <span v-if="config.has_binance_secret" class="text-[11px] font-semibold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100">
-                    <i class="fa-solid fa-circle-check text-[10px]"></i> 已配置生效
-                  </span>
+              <div v-if="editingBinanceCredentials" class="space-y-3 rounded-xl border border-indigo-200 bg-white p-3">
+                <div>
+                  <label for="binance-current-secret" class="block text-slate-600 text-xs font-medium mb-1">当前 API Secret（验证更换权限）</label>
+                  <input id="binance-current-secret" v-model="binanceCredentialDraft.current_api_secret" type="password" autocomplete="off"
+                         placeholder="填写当前保存的 Secret"
+                         class="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono">
                 </div>
-                <input v-model="config.binance_api_secret" type="password"
-                       :placeholder="config.has_binance_secret ? '••••••••••••••••' : '填入币安 API Secret（只需只读权限）'"
-                       class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
+                <div>
+                  <label for="binance-new-key" class="block text-slate-600 text-xs font-medium mb-1">新的 Binance API Key</label>
+                  <input id="binance-new-key" v-model="binanceCredentialDraft.api_key" type="text" autocomplete="off"
+                         placeholder="填写完整 API Key"
+                         class="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono">
+                </div>
+                <div>
+                  <label for="binance-new-secret" class="block text-slate-600 text-xs font-medium mb-1">新的 Binance API Secret</label>
+                  <input id="binance-new-secret" v-model="binanceCredentialDraft.api_secret" type="password" autocomplete="new-password"
+                         placeholder="填写与 Key 配套的完整 Secret"
+                         class="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono">
+                </div>
+                <div class="flex gap-3 items-center">
+                  <button @click="updateBinanceCredentials" :disabled="savingBinanceCredentials"
+                          class="rounded-lg bg-indigo-600 text-white px-3 py-2 text-xs font-semibold disabled:opacity-50">
+                    {{ savingBinanceCredentials ? '正在验证账户...' : '验证并更新币安凭据' }}
+                  </button>
+                  <button @click="cancelBinanceCredentialEdit" :disabled="savingBinanceCredentials" class="text-xs text-slate-500">取消</button>
+                </div>
               </div>
 
               <div>
@@ -849,6 +866,17 @@
                        placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxx"
                        class="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-slate-900 font-mono text-xs focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500">
                 <p class="text-[11px] text-slate-400 mt-1">企业微信群添加群机器人获取 Webhook，推送 Markdown 告警通知。</p>
+              </div>
+            </div>
+
+            <div class="p-5 rounded-2xl border border-slate-200/80 bg-slate-50/40 space-y-3 lg:col-span-2">
+              <h3 class="font-bold text-slate-900 text-xs">新持仓默认播报周期</h3>
+              <div class="flex flex-wrap items-center gap-2">
+                <select v-model.number="config.default_check_interval_hours" aria-label="新持仓默认播报周期"
+                        class="bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-900 text-xs focus:outline-none focus:border-indigo-500">
+                  <option v-for="item in intervalOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
+                </select>
+                <span class="text-[11px] text-slate-500">用于新买入及首次同步的标的；重新同步保留该标的已有周期，关闭播报也会保留。</span>
               </div>
             </div>
 
@@ -1283,6 +1311,9 @@
         const openAddModal = ref(false);
         const editingPos = ref(null);
         const savingConfig = ref(false);
+        const editingBinanceCredentials = ref(false);
+        const savingBinanceCredentials = ref(false);
+        const binanceCredentialDraft = ref({ api_key: '', api_secret: '', current_api_secret: '' });
         const syncingBinance = ref(false);
         const testResult = ref(null);
         const toasts = ref([]);
@@ -1305,8 +1336,11 @@
           feishu_bot_connected: false,
           wecom_webhook_url: '',
           ai_picks_push_enabled: false,
-          ai_picks_push_time: '21:30'
+          ai_picks_push_time: '21:30',
+          default_check_interval_hours: 4.0
         });
+
+        const manualAnalysisPush = ref(false);
 
         const intervalOptions = [
           { label: '每 15 分钟', value: 0.25 },
@@ -1329,7 +1363,7 @@
           stop_loss_price: null,
           tp_pct: 5.0,
           sl_pct: 3.0,
-          check_interval_hours: 0.5,
+          check_interval_hours: config.value.default_check_interval_hours,
           ladder_alerts: [2.0, 3.0, 5.0, 8.0],
           include_ai_analysis: false
         });
@@ -1404,6 +1438,9 @@
             const res = await fetch('/api/config');
             const data = await res.json();
             config.value = { ...config.value, ...data };
+            if (!openAddModal.value) {
+              newPos.value.check_interval_hours = config.value.default_check_interval_hours;
+            }
           } catch (e) {
             console.error(e);
           }
@@ -1413,12 +1450,16 @@
           savingConfig.value = true;
           testResult.value = null;
           try {
+            const payload = { ...config.value };
+            delete payload.binance_api_key;
+            delete payload.binance_api_secret;
             const res = await fetch('/api/config', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(config.value)
+              body: JSON.stringify(payload)
             });
             const data = await res.json();
+            if (!res.ok) throw new Error(data.detail ? JSON.stringify(data.detail) : '配置保存失败');
             showToast(data.message || '配置已成功保存并实时生效', 'success');
             await fetchConfig();
           } catch (e) {
@@ -1428,12 +1469,44 @@
           }
         };
 
+        const beginBinanceCredentialEdit = () => {
+          binanceCredentialDraft.value = { api_key: '', api_secret: '', current_api_secret: '' };
+          editingBinanceCredentials.value = true;
+        };
+
+        const cancelBinanceCredentialEdit = () => {
+          binanceCredentialDraft.value = { api_key: '', api_secret: '', current_api_secret: '' };
+          editingBinanceCredentials.value = false;
+        };
+
+        const updateBinanceCredentials = async () => {
+          if (savingBinanceCredentials.value) return;
+          savingBinanceCredentials.value = true;
+          try {
+            const res = await fetch('/api/config/binance-credentials', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(binanceCredentialDraft.value)
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '请填写完整且配套的 Key 和 Secret');
+            showToast(data.message, 'success');
+            cancelBinanceCredentialEdit();
+            await fetchConfig();
+          } catch (e) {
+            showToast('凭据更新失败：' + e.message, 'error');
+          } finally {
+            savingBinanceCredentials.value = false;
+          }
+        };
+
         const testConn = async (service) => {
           testResult.value = { success: true, message: `正在测试 ${service} 连通性...` };
           try {
             const payload = {
               service: service,
-              api_key: service === 'binance' ? config.value.binance_api_key : config.value.openai_api_key,
+              api_key: service === 'binance' ? (editingBinanceCredentials.value ? binanceCredentialDraft.value.api_key : '') : config.value.openai_api_key,
+              api_secret: service === 'binance' && editingBinanceCredentials.value ? binanceCredentialDraft.value.api_secret : undefined,
               base_url: service === 'binance' ? config.value.binance_mcp_url : config.value.openai_base_url,
               model: config.value.openai_model,
               webhook_url: service === 'feishu' ? config.value.feishu_webhook_url : config.value.wecom_webhook_url,
@@ -1455,11 +1528,14 @@
         };
 
         const triggerAnalysis = async () => {
+          if (analyzing.value) return;
           analyzing.value = true;
           try {
             showToast('AI Agent 正在分析全市场代币化美股短线动能形态...', 'info');
-            const res = await fetch('/api/analysis/run', { method: 'POST' });
+            const pushQuery = manualAnalysisPush.value ? '?push_notifications=true' : '';
+            const res = await fetch('/api/analysis/run' + pushQuery, { method: 'POST' });
             const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || '研判请求失败');
             await fetchPicks();
             currentTab.value = 'picks';
             showToast(`短线研判完成！已刷新并生成 ${data.count || 0} 只最新精选标的建议`, 'success');
@@ -1467,6 +1543,7 @@
             showToast('选股分析执行失败: ' + e, 'error');
           } finally {
             analyzing.value = false;
+            manualAnalysisPush.value = false;
           }
         };
 
@@ -1558,7 +1635,7 @@
               quantity: parseFloat(newPos.value.quantity),
               take_profit_price: newPos.value.take_profit_price ? parseFloat(newPos.value.take_profit_price) : null,
               stop_loss_price: newPos.value.stop_loss_price ? parseFloat(newPos.value.stop_loss_price) : null,
-              check_interval_hours: parseFloat(newPos.value.check_interval_hours !== undefined ? newPos.value.check_interval_hours : 0.5),
+              check_interval_hours: parseFloat(newPos.value.check_interval_hours ?? config.value.default_check_interval_hours),
               ladder_alerts: newPos.value.ladder_alerts || [2.0, 3.0, 5.0, 8.0],
               include_ai_analysis: Boolean(newPos.value.include_ai_analysis)
             };
@@ -1577,7 +1654,7 @@
                 stop_loss_price: null,
                 tp_pct: 5.0,
                 sl_pct: 3.0,
-                check_interval_hours: 0.5,
+                check_interval_hours: config.value.default_check_interval_hours,
                 ladder_alerts: [2.0, 3.0, 5.0, 8.0],
                 include_ai_analysis: false
               };
@@ -1704,7 +1781,7 @@
             include_ai_analysis: Boolean(pos.include_ai_analysis),
             tp_pct: tp_pct !== null ? tp_pct : 5.0,
             sl_pct: sl_pct !== null ? sl_pct : 3.0,
-            check_interval_hours: pos.check_interval_hours !== undefined ? parseFloat(pos.check_interval_hours) : 0.5
+            check_interval_hours: parseFloat(pos.check_interval_hours ?? config.value.default_check_interval_hours)
           };
           if (buy > 0 && !pos.take_profit_price) {
             editingPos.value.take_profit_price = parseFloat((buy * 1.05).toFixed(4));
@@ -1725,7 +1802,7 @@
                 quantity: parseFloat(editingPos.value.quantity),
                 take_profit_price: parseFloat(editingPos.value.take_profit_price),
                 stop_loss_price: parseFloat(editingPos.value.stop_loss_price),
-                check_interval_hours: parseFloat(editingPos.value.check_interval_hours !== undefined ? editingPos.value.check_interval_hours : 0.5),
+                check_interval_hours: parseFloat(editingPos.value.check_interval_hours ?? config.value.default_check_interval_hours),
                 include_ai_analysis: Boolean(editingPos.value.include_ai_analysis)
               })
             });
@@ -1770,6 +1847,11 @@
           newPos.value.symbol = pick.symbol;
           newPos.value.take_profit_price = pick.target_price;
           newPos.value.stop_loss_price = pick.stop_loss_price;
+          openAddPosition();
+        };
+
+        const openAddPosition = () => {
+          newPos.value.check_interval_hours = config.value.default_check_interval_hours;
           openAddModal.value = true;
         };
 
@@ -1797,9 +1879,17 @@
           alertLogs,
           config,
           analyzing,
+          manualAnalysisPush,
           openAddModal,
+          openAddPosition,
           editingPos,
           savingConfig,
+          editingBinanceCredentials,
+          savingBinanceCredentials,
+          binanceCredentialDraft,
+          beginBinanceCredentialEdit,
+          cancelBinanceCredentialEdit,
+          updateBinanceCredentials,
           syncingBinance,
           testResult,
           toasts,

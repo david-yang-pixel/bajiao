@@ -1,10 +1,10 @@
 import aiosqlite
-from backend.app.config import settings
+from backend.app.config import DEFAULT_CHECK_INTERVAL_HOURS, settings
 
 async def init_db(db_path: str = None):
     target_path = db_path or settings.DB_PATH
     async with aiosqlite.connect(target_path) as db:
-        await db.execute("""
+        await db.execute(f"""
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
@@ -12,7 +12,7 @@ async def init_db(db_path: str = None):
                 quantity REAL NOT NULL,
                 take_profit_price REAL,
                 stop_loss_price REAL,
-                check_interval_hours REAL DEFAULT 0.5,
+                check_interval_hours REAL DEFAULT {DEFAULT_CHECK_INTERVAL_HOURS},
                 ladder_alerts TEXT DEFAULT '[]',
                 include_ai_analysis BOOLEAN DEFAULT 0,
                 is_active BOOLEAN DEFAULT 1
