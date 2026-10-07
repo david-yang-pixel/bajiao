@@ -870,14 +870,21 @@
             </div>
 
             <div class="p-5 rounded-2xl border border-slate-200/80 bg-slate-50/40 space-y-3 lg:col-span-2">
-              <h3 class="font-bold text-slate-900 text-xs">新持仓默认播报周期</h3>
+              <h3 class="font-bold text-slate-900 text-xs">新持仓默认播报设置</h3>
               <div class="flex flex-wrap items-center gap-2">
                 <select v-model.number="config.default_check_interval_hours" aria-label="新持仓默认播报周期"
                         class="bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-900 text-xs focus:outline-none focus:border-indigo-500">
                   <option v-for="item in intervalOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
                 </select>
-                <span class="text-[11px] text-slate-500">用于新买入及首次同步的标的；重新同步保留该标的已有周期，关闭播报也会保留。</span>
+                <label class="inline-flex items-center gap-2 cursor-pointer text-xs text-slate-700">
+                  <span class="relative inline-flex items-center">
+                    <input type="checkbox" v-model="config.default_include_ai_analysis" aria-label="新持仓默认附带 AI 短线趋势研判" class="sr-only peer">
+                    <span class="w-9 h-5 bg-slate-200 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-purple-600"></span>
+                  </span>
+                  默认附带 AI 短线趋势研判
+                </label>
               </div>
+              <p class="text-[11px] text-slate-500">用于新买入及同步进来的标的；只有你手动编辑过周期、阶梯或 AI 设置的标的，清仓后重新同步才会沿用之前的设置。</p>
             </div>
 
             <!-- Group 5: AI Stock Picks Scheduled Push -->
@@ -1337,7 +1344,8 @@
           wecom_webhook_url: '',
           ai_picks_push_enabled: false,
           ai_picks_push_time: '21:30',
-          default_check_interval_hours: 4.0
+          default_check_interval_hours: 4.0,
+          default_include_ai_analysis: true
         });
 
         const manualAnalysisPush = ref(false);
@@ -1365,7 +1373,7 @@
           sl_pct: 3.0,
           check_interval_hours: config.value.default_check_interval_hours,
           ladder_alerts: [2.0, 3.0, 5.0, 8.0],
-          include_ai_analysis: false
+          include_ai_analysis: config.value.default_include_ai_analysis
         });
 
         const showToast = (message, type = 'info') => {
@@ -1440,6 +1448,7 @@
             config.value = { ...config.value, ...data };
             if (!openAddModal.value) {
               newPos.value.check_interval_hours = config.value.default_check_interval_hours;
+              newPos.value.include_ai_analysis = config.value.default_include_ai_analysis;
             }
           } catch (e) {
             console.error(e);
@@ -1656,7 +1665,7 @@
                 sl_pct: 3.0,
                 check_interval_hours: config.value.default_check_interval_hours,
                 ladder_alerts: [2.0, 3.0, 5.0, 8.0],
-                include_ai_analysis: false
+                include_ai_analysis: config.value.default_include_ai_analysis
               };
               await fetchPositions();
               currentTab.value = 'positions';
@@ -1852,6 +1861,7 @@
 
         const openAddPosition = () => {
           newPos.value.check_interval_hours = config.value.default_check_interval_hours;
+          newPos.value.include_ai_analysis = config.value.default_include_ai_analysis;
           openAddModal.value = true;
         };
 

@@ -15,6 +15,7 @@ async def init_db(db_path: str = None):
                 check_interval_hours REAL DEFAULT {DEFAULT_CHECK_INTERVAL_HOURS},
                 ladder_alerts TEXT DEFAULT '[]',
                 include_ai_analysis BOOLEAN DEFAULT 0,
+                preferences_customized BOOLEAN DEFAULT 0,
                 is_active BOOLEAN DEFAULT 1
             )
         """)
@@ -22,6 +23,12 @@ async def init_db(db_path: str = None):
         # Migration: add include_ai_analysis to existing tables if missing
         try:
             await db.execute("ALTER TABLE positions ADD COLUMN include_ai_analysis BOOLEAN DEFAULT 0")
+        except Exception:
+            pass
+
+        # Migration: only user-chosen preferences carry over when a symbol is reimported
+        try:
+            await db.execute("ALTER TABLE positions ADD COLUMN preferences_customized BOOLEAN DEFAULT 0")
         except Exception:
             pass
 

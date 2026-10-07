@@ -16,7 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import JSONResponse
 
-from backend.app.config import DEFAULT_CHECK_INTERVAL_HOURS, settings
+from backend.app.config import DEFAULT_CHECK_INTERVAL_HOURS, DEFAULT_INCLUDE_AI_ANALYSIS, settings
 from backend.app.database import init_db
 from backend.app.models.schemas import (
     PositionCreate,
@@ -319,6 +319,17 @@ async def get_default_check_interval_hours(db: aiosqlite.Connection) -> float:
     return float(row[0]) if row else DEFAULT_CHECK_INTERVAL_HOURS
 
 
+async def get_default_include_ai_analysis(db: aiosqlite.Connection) -> bool:
+    cursor = await db.execute(
+        "SELECT value FROM system_configs WHERE key = 'default_include_ai_analysis'"
+    )
+    row = await cursor.fetchone()
+    return row[0] == "1" if row else DEFAULT_INCLUDE_AI_ANALYSIS
+
+
+PREFERENCE_FIELDS = {"check_interval_hours", "ladder_alerts", "include_ai_analysis"}
+
+
 @app.post("/api/positions")
 async def create_position(pos: PositionCreate):
     async with aiosqlite.connect(settings.DB_PATH) as db:
@@ -326,10 +337,14 @@ async def create_position(pos: PositionCreate):
         interval_hours = pos.check_interval_hours
         if interval_hours is None:
             interval_hours = await get_default_check_interval_hours(db)
+        include_ai = pos.include_ai_analysis
+        if include_ai is None:
+            include_ai = await get_default_include_ai_analysis(db)
+        customized = bool(pos.model_fields_set & PREFERENCE_FIELDS)
         cursor = await db.execute(
             """
-            INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, preferences_customized, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 pos.symbol.upper(),
@@ -339,7 +354,8 @@ async def create_position(pos: PositionCreate):
                 pos.stop_loss_price,
                 interval_hours,
                 ladder_json,
-                1 if pos.include_ai_analysis else 0
+                1 if include_ai else 0,
+                1 if customized else 0
             )
         )
         await db.commit()
@@ -379,6 +395,8 @@ async def update_position(position_id: int, pos: PositionUpdate):
         if pos.include_ai_analysis is not None:
             updates.append("include_ai_analysis = ?")
             params.append(1 if pos.include_ai_analysis else 0)
+        if pos.model_fields_set & PREFERENCE_FIELDS:
+            updates.append("preferences_customized = 1")
 
         if updates:
             params.append(position_id)
@@ -494,6 +512,7 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
     async with aiosqlite.connect(settings.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         default_interval = await get_default_check_interval_hours(db)
+        default_include_ai = await get_default_include_ai_analysis(db)
         cursor = await db.execute("SELECT symbol FROM positions WHERE is_active = 1")
         active_symbols = {row["symbol"] for row in await cursor.fetchall()}
 
@@ -579,10 +598,11 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
                     "wallet": b.get("wallet", "币安账户")
                 })
             else:
+                # Only settings the user chose carry over; legacy rows hold old hardcoded defaults.
                 cursor = await db.execute(
                     """
                     SELECT check_interval_hours, ladder_alerts, include_ai_analysis
-                    FROM positions WHERE symbol = ? AND is_active = 0
+                    FROM positions WHERE symbol = ? AND is_active = 0 AND preferences_customized = 1
                     ORDER BY id DESC LIMIT 1
                     """,
                     (matched_symbol,)
@@ -590,7 +610,7 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
                 previous = await cursor.fetchone()
                 interval_hours = default_interval
                 ladder_json = json.dumps(default_ladder)
-                include_ai = 0
+                include_ai = int(default_include_ai)
                 if previous:
                     if previous["check_interval_hours"] is not None:
                         interval_hours = previous["check_interval_hours"]
@@ -599,8 +619,8 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
                     include_ai = int(bool(previous["include_ai_analysis"]))
                 await db.execute(
                     """
-                    INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, preferences_customized, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                     """,
                     (
                         matched_symbol,
@@ -610,7 +630,8 @@ async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
                         sl_price,
                         interval_hours,
                         ladder_json,
-                        include_ai
+                        include_ai,
+                        1 if previous else 0
                     )
                 )
                 synced_items.append({
@@ -716,7 +737,8 @@ async def get_system_config():
         "wecom_webhook_url": cfg.get("wecom_webhook_url") or settings.WECOM_WEBHOOK_URL or "",
         "ai_picks_push_enabled": cfg.get("ai_picks_push_enabled") in ("1", "true", "True", True),
         "ai_picks_push_time": cfg.get("ai_picks_push_time") or "21:30",
-        "default_check_interval_hours": float(cfg.get("default_check_interval_hours", DEFAULT_CHECK_INTERVAL_HOURS))
+        "default_check_interval_hours": float(cfg.get("default_check_interval_hours", DEFAULT_CHECK_INTERVAL_HOURS)),
+        "default_include_ai_analysis": cfg["default_include_ai_analysis"] == "1" if "default_include_ai_analysis" in cfg else DEFAULT_INCLUDE_AI_ANALYSIS
     }
 
 @app.post("/api/config")
@@ -737,8 +759,9 @@ async def save_system_config(payload: SystemConfigSchema):
             if val:
                 fields_to_update[k] = val
 
-    if "ai_picks_push_enabled" in dumped and dumped["ai_picks_push_enabled"] is not None:
-        fields_to_update["ai_picks_push_enabled"] = "1" if dumped["ai_picks_push_enabled"] else "0"
+    for flag_k in ["ai_picks_push_enabled", "default_include_ai_analysis"]:
+        if flag_k in dumped and dumped[flag_k] is not None:
+            fields_to_update[flag_k] = "1" if dumped[flag_k] else "0"
 
     # Only overwrite keys if provided and not masked
     for secret_k in ["openai_api_key", "feishu_app_secret"]:

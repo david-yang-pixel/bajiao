@@ -10,7 +10,7 @@ class PositionCreate(BaseModel):
     stop_loss_price: Optional[float] = None
     check_interval_hours: Optional[float] = Field(default=None, ge=0, le=168, allow_inf_nan=False)
     ladder_alerts: List[float] = []
-    include_ai_analysis: bool = False
+    include_ai_analysis: Optional[bool] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -64,6 +64,7 @@ class SystemConfigSchema(BaseModel):
     ai_picks_push_enabled: Optional[bool] = None
     ai_picks_push_time: Optional[str] = None
     default_check_interval_hours: Optional[float] = Field(default=None, ge=0, le=168, allow_inf_nan=False)
+    default_include_ai_analysis: Optional[bool] = None
 
 class TestConnectionRequest(BaseModel):
     service: str # binance | llm | feishu | wecom | feishu_bot

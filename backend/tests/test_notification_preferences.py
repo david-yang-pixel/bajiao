@@ -79,8 +79,8 @@ async def test_sync_retains_settings_when_position_is_reimported(tmp_path, monke
     async with aiosqlite.connect(path) as db:
         await db.execute("""
             INSERT INTO positions (symbol, buy_price, quantity, check_interval_hours,
-                                   ladder_alerts, include_ai_analysis, is_active)
-            VALUES ('TSLABUSDT', 90, 1, ?, '[5.0, 10.0]', 1, 0)
+                                   ladder_alerts, include_ai_analysis, preferences_customized, is_active)
+            VALUES ('TSLABUSDT', 90, 1, ?, '[5.0, 10.0]', 1, 1, 0)
         """, (interval,))
         await db.commit()
     result = await main.perform_binance_sync()
@@ -92,6 +92,70 @@ async def test_sync_retains_settings_when_position_is_reimported(tmp_path, monke
             FROM positions WHERE is_active = 1
         """)
         assert await cursor.fetchall() == [(interval, '[5.0, 10.0]', 1, 2.0)]
+
+
+@pytest.mark.asyncio
+async def test_reimport_ignores_legacy_uncustomized_settings(tmp_path, monkeypatch):
+    path = await prepare_db(tmp_path, monkeypatch)
+    mock_holdings(monkeypatch)
+    async with aiosqlite.connect(path) as db:
+        # Row left by the old sync code: hardcoded 30m interval, AI off, never edited.
+        await db.execute("""
+            INSERT INTO positions (symbol, buy_price, quantity, check_interval_hours,
+                                   ladder_alerts, include_ai_analysis, is_active)
+            VALUES ('TSLABUSDT', 90, 1, 0.5, '[2.0, 3.0, 5.0, 8.0]', 0, 0)
+        """)
+        await db.commit()
+    await main.perform_binance_sync()
+    async with aiosqlite.connect(path) as db:
+        cursor = await db.execute("""
+            SELECT check_interval_hours, include_ai_analysis FROM positions WHERE is_active = 1
+        """)
+        assert await cursor.fetchall() == [(4.0, 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_ai", [True, False])
+async def test_new_positions_use_saved_ai_default(tmp_path, monkeypatch, include_ai):
+    path = await prepare_db(tmp_path, monkeypatch)
+    mock_holdings(monkeypatch)
+    monkeypatch.setattr(main, "apply_runtime_config", AsyncMock())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
+        assert (await client.get("/api/config")).json()["default_include_ai_analysis"] is True
+        saved = await client.post("/api/config", json={"default_include_ai_analysis": include_ai})
+        assert saved.status_code == 200
+        assert (await client.get("/api/config")).json()["default_include_ai_analysis"] is include_ai
+        created = await client.post("/api/positions", json={
+            "symbol": "NVDABUSDT", "buy_price": 100.0, "quantity": 1.0
+        })
+        assert created.status_code == 200
+    await main.perform_binance_sync()
+    async with aiosqlite.connect(path) as db:
+        cursor = await db.execute("SELECT include_ai_analysis, preferences_customized FROM positions ORDER BY id")
+        assert await cursor.fetchall() == [(int(include_ai), 0), (int(include_ai), 0)]
+
+
+@pytest.mark.asyncio
+async def test_edited_settings_survive_close_and_reimport(tmp_path, monkeypatch):
+    path = await prepare_db(tmp_path, monkeypatch)
+    mock_holdings(monkeypatch)
+    await main.perform_binance_sync()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
+        positions = (await client.get("/api/positions")).json()
+        updated = await client.put(f"/api/positions/{positions[0]['id']}", json={
+            "check_interval_hours": 8.0, "include_ai_analysis": False
+        })
+        assert updated.status_code == 200
+    holdings = main.binance_client.get_account_balances
+    monkeypatch.setattr(main.binance_client, "get_account_balances", AsyncMock(return_value=[]))
+    assert (await main.perform_binance_sync())["deactivated"] == ["TSLABUSDT"]
+    monkeypatch.setattr(main.binance_client, "get_account_balances", holdings)
+    await main.perform_binance_sync()
+    async with aiosqlite.connect(path) as db:
+        cursor = await db.execute("""
+            SELECT check_interval_hours, include_ai_analysis FROM positions WHERE is_active = 1
+        """)
+        assert await cursor.fetchall() == [(8.0, 0)]
 
 
 @pytest.mark.asyncio

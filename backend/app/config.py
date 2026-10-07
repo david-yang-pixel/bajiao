@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_CHECK_INTERVAL_HOURS = 4.0
+DEFAULT_INCLUDE_AI_ANALYSIS = True
 
 class Settings(BaseSettings):
     BINANCE_API_KEY: str = ""
