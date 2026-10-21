@@ -98,7 +98,7 @@ git diff --check
 
 ### 自动发布（CI/CD）
 
-向 `feat/swing-analysis` 推送会自动构建并测试镜像，发布至私有 GHCR，再部署到现有服务器；健康检查与数据保留检查通过后，仅清理本项目未使用的旧镜像。PR 只测试，不部署。流水线提供失败回滚，不覆盖服务器 `.env`、数据库或其他服务。
+向 `feat/swing-analysis` 推送会自动构建并测试镜像，发布至 GHCR，再部署到现有服务器；健康检查与数据保留检查通过后，仅清理本项目未使用的旧镜像。PR 只测试，不部署。流水线提供失败回滚，不覆盖服务器 `.env`、数据库或其他服务。
 
 首次接入运行 `python3 scripts/setup_cicd.py --ssh-host zendesk-agent-server`，生成专用受限部署密钥并配置 Actions Secrets。完整流程、回滚与清理边界见 [CI/CD 说明](docs/cicd.md)。
 

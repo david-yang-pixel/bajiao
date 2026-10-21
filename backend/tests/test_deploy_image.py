@@ -263,6 +263,20 @@ def test_shared_tagged_image_is_never_deleted(setup):
     assert UNUSED not in removed and UNUSED in docker.images
 
 
+def test_legacy_containerd_digest_is_cleaned_after_verified_deploy(setup):
+    runner, docker, _ = setup
+    docker.images[OLD]['RepoDigests'] = [cd.LEGACY_REPOSITORY + '@' + OLD]
+    removed = runner.deploy(request())
+    assert OLD in removed and OLD not in docker.images
+
+
+def test_foreign_digest_on_old_image_prevents_removal(setup):
+    runner, docker, _ = setup
+    docker.images[OLD]['RepoDigests'] = ['other-service@' + OLD]
+    removed = runner.deploy(request())
+    assert OLD not in removed and OLD in docker.images
+
+
 def test_docker_error_does_not_echo_upstream_secrets(monkeypatch):
     monkeypatch.setattr(subprocess, 'run', Mock(return_value=subprocess.CompletedProcess(
         [], 1, '', 'fixture-upstream-secret')))

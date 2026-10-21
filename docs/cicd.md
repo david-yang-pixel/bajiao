@@ -2,7 +2,7 @@
 
 ## 触发与目标
 
-- 源码仓库：`david-yang-pixel/bajiao`，公开；镜像仓库为同名 GHCR package，按私有镜像发布和认证拉取。
+- 源码仓库：`david-yang-pixel/bajiao`，按用户要求公开；同名 GHCR 镜像也公开可拉取。镜像只包含应用代码与依赖，不包含服务器环境配置、数据库或部署私钥。
 - 向当前默认分支 `feat/swing-analysis` 推送，自动测试、构建并部署；支持 Actions 页面手动运行。
 - Pull Request 仅构建与测试，不访问部署密钥或发布生产镜像。
 - 目标服务器使用既有 SSH 配置首次接入，项目目录固定 `/opt/bstocks-bot`，容器固定 `binance-bstocks-analysis-bot`，端口 8000 与现有 Nginx 保持一致。
