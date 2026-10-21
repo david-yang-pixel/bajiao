@@ -270,6 +270,15 @@ def test_legacy_containerd_digest_is_cleaned_after_verified_deploy(setup):
     assert OLD in removed and OLD not in docker.images
 
 
+def test_digest_reference_in_repotags_is_cleaned_for_owned_unused_image(setup):
+    runner, docker, _ = setup
+    reference = cd.REPOSITORY + '@' + UNUSED
+    docker.images[UNUSED]['RepoTags'] = [reference]
+    docker.images[UNUSED]['RepoDigests'] = [reference]
+    removed = runner.deploy(request())
+    assert UNUSED in removed and UNUSED not in docker.images
+
+
 def test_foreign_digest_on_old_image_prevents_removal(setup):
     runner, docker, _ = setup
     docker.images[OLD]['RepoDigests'] = ['other-service@' + OLD]

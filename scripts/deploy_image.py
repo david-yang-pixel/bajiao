@@ -280,10 +280,12 @@ class Deployment:
                 continue
             tags = image.get('RepoTags') or []
             digests = image.get('RepoDigests') or []
-            allowed_tag = lambda ref: ref.startswith(REPOSITORY + ':') or ref == LEGACY_REPOSITORY + ':latest'
             def allowed_digest(reference):
                 return (reference.startswith(REPOSITORY + '@sha256:')
                         or (candidate in managed and reference.startswith(LEGACY_REPOSITORY + '@sha256:')))
+            def allowed_tag(reference):
+                return (reference.startswith(REPOSITORY + ':')
+                        or reference == LEGACY_REPOSITORY + ':latest' or allowed_digest(reference))
             if (any(not allowed_tag(tag) for tag in tags)
                     or any(not allowed_digest(digest) for digest in digests)):
                 print('Skipping old image with references outside this project', flush=True)
