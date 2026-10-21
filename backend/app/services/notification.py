@@ -130,6 +130,10 @@ class NotificationService:
             "ladder": "🔥 【阶梯涨幅达成提醒】"
         }
         title = emoji_map.get(alert_type, "📢 【持仓变动提醒】")
+        equity = symbol.startswith('EQ_')
+        unit = 'USD' if equity else 'USDT'
+        price_label = '买卖中间价估值（非可成交价）' if equity else '当前最新价'
+        extra_note = f'{extra_note}；价格及盈亏单位 {unit}'
         pnl_sign = "+" if pnl_pct >= 0 else ""
         usd_str = f" (${pnl_usd:+.2f})" if pnl_usd is not None and abs(pnl_usd) > 0.001 else ""
         pnl_display = f"{pnl_sign}{pnl_pct:.2f}%{usd_str}"
@@ -148,8 +152,8 @@ class NotificationService:
             {
                 "tag": "div",
                 "fields": [
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**买入成本:**\n${buy_price:.2f}"}},
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**当前最新价:**\n**${curr_price:.2f}**"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**买入成本 ({unit}):**\n${buy_price:.2f}"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**{price_label} ({unit}):**\n**${curr_price:.2f}**"}},
                     {"is_short": True, "text": {"tag": "lark_md", "content": f"**实时盈亏:**\n{pnl_color_tag} **{pnl_display}**"}},
                     {"is_short": True, "text": {"tag": "lark_md", "content": f"**巡检状态:**\n{extra_note or '短线实时盯盘'}"}}
                 ]
@@ -191,8 +195,8 @@ class NotificationService:
             f"{title}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔹 标的代号: {symbol}\n"
-            f"💵 买入成本: ${buy_price:.2f}\n"
-            f"📈 当前最新价: ${curr_price:.2f}\n"
+            f"💵 买入成本: {buy_price:.2f} {unit}\n"
+            f"📈 {price_label}: {curr_price:.2f} {unit}\n"
             f"📊 实时盈亏: {pnl_display}\n"
             + (f"💬 状态说明: {extra_note}\n" if extra_note else "")
             + (f"━━━━━━━━━━━━━━━━━━━━\n{trend_plain_block}" if trend_plain_block else "")

@@ -1,6 +1,8 @@
 import hashlib
 import hmac
 import logging
+import math
+import re
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
@@ -49,6 +51,17 @@ SUPPORTED_BSTOCKS = [
     "METABUSDT",
     "COINBUSDT"
 ]
+
+def is_equity_asset(symbol: str) -> bool:
+    return bool(re.fullmatch(r'EQ_[A-Z][A-Z0-9.\-]{0,19}', symbol.upper()))
+
+
+def position_market(symbol: str) -> Dict[str, str]:
+    equity = is_equity_asset(symbol)
+    return {'asset_type': 'equity' if equity else 'spot',
+            'quote_currency': 'USD' if equity else 'USDT',
+            'price_method': 'bid_ask_midpoint' if equity else 'last_trade'}
+
 
 class BinanceClient:
     """
@@ -134,16 +147,84 @@ class BinanceClient:
         return await self._call_rest_api(endpoint_or_method, params)
 
     async def get_ticker_price(self, symbol: str) -> float:
+        """EQ_ uses native equity USD quotes; tokens retain the spot route."""
+        symbol = symbol.upper()
+        if is_equity_asset(symbol):
+            if not self.api_key:
+                raise ValueError('股票行情需要币安 API Key')
+            underlying = symbol[3:]
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(f'{self.rest_base_url}/sapi/v1/equity/market/quote',
+                    params={'symbol': underlying}, headers={'X-MBX-APIKEY': self.api_key})
+                response.raise_for_status()
+                data = response.json()
+            if not isinstance(data, dict) or data.get('symbol') != underlying:
+                raise ValueError('股票报价标识不匹配')
+            bid, ask = float(data.get('bidPrice', 0)), float(data.get('askPrice', 0))
+            if not all(math.isfinite(v) and v > 0 for v in (bid, ask)) or bid > ask:
+                raise ValueError('股票买卖报价无效或暂不可用')
+            return bid / 2 + ask / 2
+        data = await self._call_mcp_or_api('ticker/price', {'symbol': symbol})
+        if isinstance(data, dict) and 'price' in data:
+            price = float(data['price'])
+            if math.isfinite(price) and price > 0:
+                return price
+        raise ValueError(f'Unexpected price response for {symbol}')
+
+    async def get_equity_average_buy_price(self, symbol: str, quantity: float) -> Optional[float]:
+        """Moving-average USD cost excluding fees, only with complete matching inventory.
+
+        Reject incomplete, transferred or ambiguous history instead of substituting
+        a token/spot cost. A user-entered cost takes precedence in the sync service.
         """
-        Fetch the current ticker price for a given symbol.
-        Returns float price.
-        """
-        # REST endpoint: ticker/price?symbol=...
-        data = await self._call_mcp_or_api("ticker/price", {"symbol": symbol.upper()})
-        # data should be {"symbol": ..., "price": "142.50"}
-        if isinstance(data, dict) and "price" in data:
-            return float(data["price"])
-        raise ValueError(f"Unexpected price response for {symbol}: {data}")
+        if not is_equity_asset(symbol) or not self.api_key or not self.api_secret:
+            return None
+        try:
+            params = {'symbol': symbol[3:], 'startTime': 0, 'endTime': int(time.time()*1000),
+                      'current': 1, 'size': 100, 'timestamp': int(time.time()*1000), 'recvWindow': 5000}
+            params['signature'] = self._generate_signature(params)
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(f'{self.rest_base_url}/sapi/v1/equity/trade/history',
+                    params=params, headers={'X-MBX-APIKEY': self.api_key})
+                response.raise_for_status()
+                data = response.json()
+            rows = data['rows']
+            # Bounded to one page: larger history is explicitly unknown, not truncated.
+            if not isinstance(rows, list) or not rows or int(data['total']) != len(rows):
+                return None
+            rows = sorted(rows, key=lambda t: int(t['executionAt']))
+            sides_by_time = {}
+            for trade in rows:
+                timestamp = int(trade['executionAt'])
+                sides = sides_by_time.setdefault(timestamp, set())
+                sides.add(trade['side'])
+                if len(sides) > 1:
+                    return None  # Execution IDs do not document an ordering tie-break.
+            inventory = cost = 0.0
+            seen = set()
+            for trade in rows:
+                execution_id = trade['executionId']
+                if execution_id in seen or trade['symbol'] != symbol[3:]:
+                    return None
+                seen.add(execution_id)
+                qty, price = float(trade['qty']), float(trade['price'])
+                if not all(math.isfinite(v) and v > 0 for v in (qty, price)):
+                    return None
+                if trade['side'] == 'BUY':
+                    inventory += qty
+                    cost += qty * price
+                elif trade['side'] == 'SELL' and inventory > 0 and qty <= inventory + 1e-9:
+                    cost -= min(qty, inventory) * cost / inventory
+                    inventory = max(0, inventory - qty)
+                else:
+                    return None
+            if inventory <= 0 or not math.isclose(inventory, quantity, rel_tol=1e-7, abs_tol=1e-9):
+                return None
+            average = cost / inventory
+            return average if math.isfinite(average) and average > 0 else None
+        except Exception:
+            logger.warning('股票成交成本暂不可用 (%s)', symbol)
+            return None
 
     async def get_klines(
         self,

@@ -6,7 +6,7 @@ from typing import Annotated
 LadderPercent = Annotated[float, Field(gt=0, le=1000, allow_inf_nan=False)]
 
 class PositionCreate(BaseModel):
-    symbol: str = Field(pattern=r'^[A-Za-z][A-Za-z0-9]{0,24}$')
+    symbol: str = Field(pattern=r'^(?:[A-Za-z][A-Za-z0-9]{0,24}|EQ_[A-Z][A-Z0-9.\-]{0,19})$')
     buy_price: float = Field(gt=0, allow_inf_nan=False)
     quantity: float = Field(gt=0, allow_inf_nan=False)
     take_profit_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)

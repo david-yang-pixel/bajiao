@@ -31,7 +31,7 @@ from backend.app.models.schemas import (
     TestConnectionRequest,
     BinanceCredentialsUpdate,
 )
-from backend.app.services.binance_client import BinanceAccountError, BinanceClient
+from backend.app.services.binance_client import BinanceAccountError, BinanceClient, is_equity_asset, position_market
 from backend.app.services.quant_screener import QuantScreener
 from backend.app.services.analysis_agent import AnalysisAgent
 from backend.app.services.notification import NotificationService
@@ -364,13 +364,18 @@ async def list_positions():
         try:
             async with limit:
                 price = float(await binance_client.get_ticker_price(pos['symbol']))
-            cost, quantity = float(pos['buy_price']), float(pos['quantity'])
-            if not all(math.isfinite(v) and v > 0 for v in (price,cost,quantity)):
+            cost, quantity = float(pos['buy_price'] or 0), float(pos['quantity'])
+            if not all(math.isfinite(v) and v > 0 for v in (price,quantity)):
                 raise ValueError('invalid quote')
-            result.update(current_price=price,pnl_pct=round((price/cost-1)*100,2),
-                pnl_usd=round((price-cost)*quantity,4),price_status='live')
+            known = math.isfinite(cost) and cost > 0
+            result.update(current_price=price,pnl_pct=round((price/cost-1)*100,2) if known else None,
+                pnl_usd=round((price-cost)*quantity,4) if known else None,price_status='live')
         except Exception:
             result.update(current_price=None,pnl_pct=None,pnl_usd=None,price_status='unavailable')
+        known = math.isfinite(float(pos['buy_price'] or 0)) and float(pos['buy_price'] or 0) > 0
+        result.update(**position_market(pos['symbol']),cost_status='known' if known else 'unknown')
+        if not known:
+            result['buy_price'] = None
         return result
     return await asyncio.gather(*(enrich(pos) for pos in positions))
 
@@ -449,6 +454,7 @@ async def update_position(position_id: int, pos: PositionUpdate):
         if pos.buy_price is not None:
             updates.append("buy_price = ?")
             params.append(pos.buy_price)
+            updates.append("cost_source = 'manual'")
         if pos.quantity is not None:
             updates.append("quantity = ?")
             params.append(pos.quantity)
@@ -512,6 +518,8 @@ async def test_position_alert(position_id: int):
 
     # 2. Get latest ticker price
     buy_price = float(pos.get("buy_price") or 0.0)
+    if not math.isfinite(buy_price) or buy_price <= 0:
+        raise HTTPException(status_code=409, detail='请先补填真实持仓成本，未发送虚假盈亏提醒')
     try:
         curr_price = await binance_client.get_ticker_price(pos["symbol"])
     except Exception:
@@ -565,185 +573,141 @@ async def test_position_alert(position_id: int):
         "pnl_pct": round(pnl_pct, 2)
     }
 
+_account_sync_lock = asyncio.Lock()
+
+
 async def perform_binance_sync(min_notional: float = 1.0) -> Dict[str, Any]:
-    """
-    Sync user's real Binance Spot & Funding holdings into active positions monitor:
-    - Queries both Spot account (GET /api/v3/account) and Funding account (POST /sapi/v1/asset/get-funding-asset).
-    - Filters dust assets with total notional value < min_notional (default 1.0 USDT).
-    - Calculates accurate weighted average buy price from Spot trades or Convert flow.
-    - Preserves user-adjusted buy price for existing positions if no new trade history is available.
-    - Automatically deactivates closed positions that no longer exist or are below dust threshold.
-    """
+    # Scheduled and manual requests must not insert duplicate active holdings.
+    async with _account_sync_lock:
+        return await _perform_binance_sync(min_notional)
+
+
+async def _perform_binance_sync(min_notional: float) -> Dict[str, Any]:
+    """Sync native equity and spot balances without crossing price/cost units."""
     if not binance_client.api_key or not binance_client.api_secret:
-        return {
-            "success": False,
-            "count": 0,
-            "synced": [],
-            "deactivated": [],
-            "message": "未配置币安 API Key 或 API Secret"
-        }
-
+        return {'success': False, 'count': 0, 'synced': [], 'deactivated': [],
+                'skipped': [], 'warnings': [], 'message': '未配置币安 API Key 或 API Secret'}
+    # Both wallets must succeed before any database mutation.
     balances = await binance_client.get_account_balances()
-    synced_items = []
-    valid_symbols = set()
-
+    synced, skipped, warnings, valid_symbols = [], [], [], set()
+    reset_ids = []
     async with aiosqlite.connect(settings.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         default_interval = await get_default_check_interval_hours(db)
-        default_include_ai = await get_default_include_ai_analysis(db)
-        cursor = await db.execute("SELECT symbol FROM positions WHERE is_active = 1")
-        active_symbols = {row["symbol"] for row in await cursor.fetchall()}
-
-        for b in balances:
-            asset = b["asset"].upper()
-            total_qty = float(b["total"])
-
-            # Ignore common settlement coins and zero balances
-            if asset in ["USDT", "BUSD", "FDUSD", "USDC", "BNB", "LDUSDT", "DAI"]:
+        default_ai = await get_default_include_ai_analysis(db)
+        active = {r['symbol'] for r in await (await db.execute('SELECT symbol FROM positions WHERE is_active=1')).fetchall()}
+        for balance in balances:
+            asset, qty = balance['asset'].upper(), float(balance['total'])
+            if not math.isfinite(qty) or qty < 0:
+                raise RuntimeError('币安资产数量异常，本次同步已取消，现有持仓保持不变')
+            if asset in {'USDT','BUSD','FDUSD','USDC','BNB','LDUSDT','DAI'} or qty == 0:
                 continue
-            if total_qty <= 1e-6:
+            equity = is_equity_asset(asset)
+            if not equity and qty <= 1e-6:
+                skipped.append({'asset': asset, 'reason': '数量低于粉尘阈值'})
                 continue
-
-            # bStocks symbols matching (e.g. AMZNB -> AMZNBUSDT; AAPL -> AAPLBUSDT)
-            candidates = []
-            if asset.endswith("USDT"):
-                candidates.append(asset)
-            else:
-                candidates.append(f"{asset}USDT")
-                if not asset.endswith("B"):
-                    candidates.append(f"{asset}BUSDT")
-
-            matched_symbol = None
-            curr_price = 0.0
-
-            for sym in candidates:
+            # Only actual spot base assets become USDT pairs; EQ_ never becomes BUSDT.
+            candidates = [asset] if equity or asset.endswith('USDT') else [asset+'USDT']
+            symbol = asset if equity else None
+            current = None
+            for candidate in candidates:
                 try:
-                    price = await binance_client.get_ticker_price(sym)
-                    if price > 0:
-                        matched_symbol = sym
-                        curr_price = price
+                    price = float(await binance_client.get_ticker_price(candidate))
+                    if math.isfinite(price) and price > 0:
+                        symbol, current = candidate, price
                         break
                 except Exception:
-                    continue
-
-            if not matched_symbol:
-                if active_symbols.intersection(candidates):
-                    raise RuntimeError("币安行情读取失败，本次同步已取消，现有持仓保持不变")
+                    pass
+            if symbol is None:
+                if active.intersection(candidates):
+                    raise RuntimeError('币安行情读取失败，本次同步已取消，现有持仓保持不变')
+                skipped.append({'asset': asset, 'reason': '未找到有效 USDT 现货报价；未映射为其他代币'})
                 continue
-
-            notional = total_qty * curr_price
-            if notional < min_notional:
-                logger.info(
-                    f"忽略小额粉尘资产 {asset}: 数量 {total_qty}, 当前市值 ${notional:.4f} < ${min_notional}"
-                )
+            market = position_market(symbol)
+            notional = qty * current if current is not None else None
+            # Native stock balances remain visible even if small or not quoted.
+            if not equity and notional < min_notional:
+                skipped.append({'asset': asset, 'reason': f'市值低于 {min_notional:g} USDT 粉尘阈值'})
                 continue
+            valid_symbols.add(symbol)
+            if current is None:
+                warnings.append({'asset': asset, 'reason': '股票报价暂不可用，持仓已保留，不计算盈亏或触发行情提醒'})
 
-            valid_symbols.add(matched_symbol)
-
-            # Calculate accurate average buy price, fallback to current price
-            avg_buy = await binance_client.get_average_buy_price(matched_symbol)
-            buy_price = avg_buy if (avg_buy and avg_buy > 0) else curr_price
-
-            # New holdings use the saved reporting default; reimported symbols retain preferences.
-            tp_price = round(buy_price * 1.05, 4)
-            sl_price = round(buy_price * 0.97, 4)
-            default_ladder = [2.0, 3.0, 5.0, 8.0]
-
-            cursor = await db.execute(
-                "SELECT id, buy_price FROM positions WHERE symbol = ? AND is_active = 1",
-                (matched_symbol,)
-            )
+            cursor = await db.execute('SELECT * FROM positions WHERE symbol=? AND is_active=1 ORDER BY id DESC LIMIT 1', (symbol,))
             existing = await cursor.fetchone()
+            if equity and existing is None:
+                existing = await (await db.execute('SELECT * FROM positions WHERE symbol=? ORDER BY id DESC LIMIT 1', (symbol,))).fetchone()
+            # Manual costs survive sync; incomplete history is not a real cost.
+            old_cost = float(existing['buy_price'] or 0) if existing else 0
+            old_source = existing['cost_source'] if existing else 'unknown'
+            if equity:
+                average = None if old_cost > 0 and old_source == 'manual' else await binance_client.get_equity_average_buy_price(symbol, qty)
+            else:
+                average = await binance_client.get_average_buy_price(symbol)
+            if average is not None and (not math.isfinite(average) or average <= 0):
+                average = None
+            if equity and old_cost > 0 and old_source == 'manual':
+                cost, source = old_cost, 'manual'
+            elif average is not None:
+                cost, source = average, 'trade_history_ex_fees'
+            elif old_cost > 0 and (old_source == 'manual' or not equity):
+                cost, source = old_cost, old_source
+            else:
+                cost, source = 0.0, 'unknown'
 
             if existing:
-                # If avg_buy is not found from trade history, preserve user-set buy_price
-                final_buy_price = avg_buy if (avg_buy and avg_buy > 0) else (existing["buy_price"] if existing["buy_price"] and existing["buy_price"] > 0 else curr_price)
-                await db.execute(
-                    """
-                    UPDATE positions
-                    SET quantity = ?, buy_price = ?
-                    WHERE id = ?
-                    """,
-                    (total_qty, final_buy_price, existing["id"])
-                )
-                synced_items.append({
-                    "symbol": matched_symbol,
-                    "action": "updated",
-                    "quantity": total_qty,
-                    "buy_price": final_buy_price,
-                    "current_price": curr_price,
-                    "notional": round(notional, 2),
-                    "wallet": b.get("wallet", "币安账户")
-                })
+                if equity:
+                    # Evaluate against the live row, not the pre-network snapshot.
+                    await db.execute('''UPDATE positions SET quantity=?,
+                        buy_price=CASE WHEN cost_source='manual' AND buy_price>0 THEN buy_price ELSE ? END,
+                        cost_source=CASE WHEN cost_source='manual' AND buy_price>0 THEN cost_source ELSE ? END,
+                        is_active=1 WHERE id=?''', (qty,cost,source,existing['id']))
+                    live = await (await db.execute('SELECT buy_price,cost_source FROM positions WHERE id=?',(existing['id'],))).fetchone()
+                    cost, source = live['buy_price'], live['cost_source']
+                else:
+                    await db.execute('UPDATE positions SET quantity=?,buy_price=?,cost_source=?,is_active=1 WHERE id=?',
+                                     (qty,cost,source,existing['id']))
+                if not existing['is_active']:
+                    await db.execute('''UPDATE positions SET alert_reset_after_id=(
+                        SELECT COALESCE(MAX(id),0) FROM alert_logs WHERE position_id=?) WHERE id=?''',
+                        (existing['id'],existing['id']))
+                    reset_ids.append(existing['id'])
+                action = 'updated' if existing['is_active'] else 'reactivated'
             else:
-                # Only settings the user chose carry over; legacy rows hold old hardcoded defaults.
-                cursor = await db.execute(
-                    """
-                    SELECT check_interval_hours, ladder_alerts, include_ai_analysis
-                    FROM positions WHERE symbol = ? AND is_active = 0 AND preferences_customized = 1
-                    ORDER BY id DESC LIMIT 1
-                    """,
-                    (matched_symbol,)
-                )
-                previous = await cursor.fetchone()
-                interval_hours = default_interval
-                ladder_json = json.dumps(default_ladder)
-                include_ai = int(default_include_ai)
+                previous = await (await db.execute('''SELECT check_interval_hours,ladder_alerts,include_ai_analysis
+                    FROM positions WHERE symbol=? AND is_active=0 AND preferences_customized=1 ORDER BY id DESC LIMIT 1''', (symbol,))).fetchone()
+                interval, ladder, ai = default_interval, json.dumps([] if equity or cost <= 0 else [2.0,3.0,5.0,8.0]), int(default_ai)
                 if previous:
-                    if previous["check_interval_hours"] is not None:
-                        interval_hours = previous["check_interval_hours"]
-                    if previous["ladder_alerts"] is not None:
-                        ladder_json = previous["ladder_alerts"]
-                    include_ai = int(bool(previous["include_ai_analysis"]))
-                await db.execute(
-                    """
-                    INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, preferences_customized, is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                    """,
-                    (
-                        matched_symbol,
-                        buy_price,
-                        total_qty,
-                        tp_price,
-                        sl_price,
-                        interval_hours,
-                        ladder_json,
-                        include_ai,
-                        1 if previous else 0
-                    )
-                )
-                synced_items.append({
-                    "symbol": matched_symbol,
-                    "action": "added",
-                    "quantity": total_qty,
-                    "buy_price": buy_price,
-                    "current_price": curr_price,
-                    "notional": round(notional, 2),
-                    "wallet": b.get("wallet", "币安账户")
-                })
-
-        # Automatically deactivate active positions that have been cleared on Binance
-        cursor = await db.execute("SELECT id, symbol FROM positions WHERE is_active = 1")
-        active_rows = await cursor.fetchall()
+                    interval = previous['check_interval_hours'] if previous['check_interval_hours'] is not None else interval
+                    ladder = previous['ladder_alerts'] if previous['ladder_alerts'] is not None else ladder
+                    ai = int(bool(previous['include_ai_analysis']))
+                tp = round(cost*1.05,4) if cost > 0 and not equity else None
+                sl = round(cost*.97,4) if cost > 0 and not equity else None
+                await db.execute('''INSERT INTO positions(symbol,buy_price,quantity,take_profit_price,stop_loss_price,
+                    check_interval_hours,ladder_alerts,include_ai_analysis,preferences_customized,is_active,cost_source)
+                    VALUES(?,?,?,?,?,?,?,?,?,1,?)''', (symbol,cost,qty,tp,sl,interval,ladder,ai,int(previous is not None),source))
+                action = 'added'
+            if cost <= 0:
+                warnings.append({'asset': asset, 'reason': '成交历史不足以核对成本；请编辑填入真实成本，收益监控暂未启用'})
+            synced.append({'symbol':symbol,'action':action,'quantity':qty,'buy_price':cost if cost > 0 else None,
+                           'cost_status':'known' if cost > 0 else 'unknown','cost_source':source,
+                           'current_price':current,'notional':round(notional,2) if notional is not None else None,
+                           'wallet':balance.get('wallet','币安账户'), **market})
         deactivated = []
-        for r in active_rows:
-            if r["symbol"] not in valid_symbols:
-                await db.execute("UPDATE positions SET is_active = 0 WHERE id = ?", (r["id"],))
-                deactivated.append(r["symbol"])
-
+        for row in await (await db.execute('SELECT id,symbol FROM positions WHERE is_active=1')).fetchall():
+            if row['symbol'] not in valid_symbols:
+                await db.execute('UPDATE positions SET is_active=0 WHERE id=?',(row['id'],))
+                deactivated.append(row['symbol'])
         await db.commit()
-
-    msg = f"成功同步 {len(synced_items)} 个币安有效持仓"
+    for position_id in reset_ids:
+        position_monitor.clear_position_milestones(position_id)
+        position_monitor._last_periodic_times.pop(position_id, None)
+        position_monitor._periodic_started_times.pop(position_id, None)
+    message = f'成功同步 {len(synced)} 个币安持仓；跳过 {len(skipped)} 个资产，{len(warnings)} 项提示'
     if deactivated:
-        msg += f"，已自动平仓移除 {len(deactivated)} 个已卖出或粉尘标的 ({', '.join(deactivated)})"
-
-    return {
-        "success": True,
-        "count": len(synced_items),
-        "synced": synced_items,
-        "deactivated": deactivated,
-        "message": msg
-    }
+        message += f'；停止监控 {len(deactivated)} 个已卖出或粉尘标的'
+    return {'success':True,'count':len(synced),'synced':synced,'deactivated':deactivated,
+            'skipped':skipped,'warnings':warnings,'message':message}
 
 @app.post("/api/positions/sync-binance")
 async def sync_binance_positions():
