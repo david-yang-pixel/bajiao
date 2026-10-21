@@ -53,6 +53,9 @@
   function direction(value) { const n = num(value); return n === null || n === 0 ? '' : n > 0 ? 'positive' : 'negative'; }
   function isEquity(p) { return p?.asset_type === 'equity' || String(p?.symbol || '').startsWith('EQ_'); }
   function quoteCurrency(p) { return p?.quote_currency || (isEquity(p) ? 'USD' : 'USDT'); }
+  function costCurrency(p) { return p?.cost_currency || quoteCurrency(p); }
+  function currencyMismatch(p) { return p?.pnl_status === 'currency_mismatch' || p?.monitor_status === 'currency_mismatch' || (knownCost(p) && costCurrency(p) !== quoteCurrency(p)); }
+  function currencyMismatchNote(p) { return `原始成本为 ${costCurrency(p)}，报价为 ${quoteCurrency(p)}；未做汇率换算，盈亏及收益提醒暂停`; }
   function knownCost(p) { return p?.cost_status !== 'unknown' && num(p?.buy_price) > 0; }
   function canAnalyze(p) { return !isEquity(p) && Object.hasOwn(SYMBOLS, p?.symbol); }
   function date(value) {
@@ -193,26 +196,28 @@
     const positions = state.positions || []; $('metric-count').textContent = positions.length; $('position-count').textContent = `${positions.length} 笔持仓`;
     const currencies = [...new Set(positions.map(quoteCurrency))]; const mixed = currencies.length > 1;
     const currency = currencies[0] || '';
-    $('metric-value-unit').textContent = mixed ? 'USD / USDT' : currency; $('metric-pnl-unit').textContent = mixed ? 'USD / USDT' : currency;
+    $('metric-value-unit').textContent = currencies.join(' / '); $('metric-pnl-unit').textContent = currencies.join(' / ');
     const priced = positions.filter((p) => num(p.current_price) !== null && num(p.quantity) !== null);
     const costed = priced.filter(knownCost);
+    const mismatched = positions.some(currencyMismatch);
     const complete = positions.length > 0 && priced.length === positions.length;
     const costComplete = complete && costed.length === positions.length;
     const value = complete && !mixed ? priced.reduce((s, p) => s + num(p.current_price) * num(p.quantity), 0) : null;
-    const pnl = costComplete && !mixed ? costed.reduce((s, p) => s + (num(p.current_price) - num(p.buy_price)) * num(p.quantity), 0) : null;
-    $('metric-value').textContent = fmt(value); $('metric-value-note').textContent = !positions.length ? '暂无有效持仓' : mixed ? 'USD 与 USDT 不直接合计，请查看逐笔估值' : !complete ? `${positions.length - priced.length} 笔报价缺失，不显示合计` : `按最近读取的 ${currency} 报价估值，非可成交金额`;
-    $('metric-pnl').textContent = signed(pnl); $('metric-pnl').className = `numeric ${direction(pnl)}`; $('metric-pnl-note').textContent = mixed ? 'USD 与 USDT 不直接合计，请查看逐笔盈亏' : costComplete ? `基于真实 ${currency} 成本 · 不含费用` : '等待完整真实成本与报价';
+    const pnl = costComplete && !mixed && !mismatched ? costed.reduce((s, p) => s + (num(p.current_price) - num(p.buy_price)) * num(p.quantity), 0) : null;
+    $('metric-value').textContent = fmt(value); $('metric-value-note').textContent = !positions.length ? '暂无有效持仓' : mixed ? `${currencies.join(' 与 ')} 不直接合计，请查看逐笔估值` : !complete ? `${positions.length - priced.length} 笔报价缺失，不显示合计` : `按最近读取的 ${currency} 报价估值，非可成交金额`;
+    $('metric-pnl').textContent = signed(pnl); $('metric-pnl').className = `numeric ${direction(pnl)}`; $('metric-pnl-note').textContent = mismatched ? '原始成本与报价币种不同，未做汇率换算；不显示总盈亏' : mixed ? `${currencies.join(' 与 ')} 不直接合计，请查看逐笔盈亏` : costComplete ? `基于真实 ${currency} 成本 · 不含费用` : '等待完整真实成本与报价';
     if (!positions.length) { contentState('positions-content', '还没有监控中的持仓', '从币安同步已有股票或代币持仓，或手动录入原八对代币的成本与数量。这里不会展示示例账户。', { action: () => openPosition(), actionLabel: '添加第一笔持仓', iconName: 'portfolio' }); return; }
-    const { wrap, body } = makeTable(['资产（股票 / 代币）/ 数量', '成本 / 最新估值价', '未实现盈亏', '操作'], '有效持仓列表，价格与盈亏按每行币种显示，USD 与 USDT 不直接合计', 'position-table');
+    const { wrap, body } = makeTable(['资产（股票 / 代币）/ 数量', '成本 / 最新估值价', '未实现盈亏', '操作'], '有效持仓列表，成本按原始付款币种、报价按报价币种显示，不跨币种计算盈亏或合计', 'position-table');
     positions.forEach((p) => {
-      const unit = quoteCurrency(p); const hasCost = knownCost(p);
+      const unit = quoteCurrency(p), costUnit = costCurrency(p); const hasCost = knownCost(p), mismatch = currencyMismatch(p);
       const current = num(p.current_price), buy = hasCost ? num(p.buy_price) : null, qty = num(p.quantity);
-      const pnlValue = current !== null && buy !== null && qty !== null ? (current - buy) * qty : null;
-      const pnlPct = current !== null && buy !== null ? ((current - buy) / buy) * 100 : null;
+      const pnlValue = !mismatch && current !== null && buy !== null && qty !== null ? (current - buy) * qty : null;
+      const pnlPct = !mismatch && current !== null && buy !== null ? ((current - buy) / buy) * 100 : null;
       const row = el('tr'); const symbol = el('strong', 'symbol-text', str(p.symbol));
       row.append(td(symbol, `${isEquity(p) ? '股票' : '代币'} · ${unit} · 数量 ${fmt(qty, 6)}`));
-      const priceCell = td(el('span', 'numeric', buy === null ? `成本未知 · ${unit}` : `${fmt(buy)} ${unit}`), current === null ? `报价暂缺 · ${unit}` : `估值价 ${fmt(current)} ${unit}`); row.append(priceCell);
-      const gain = el('strong', `numeric ${direction(pnlValue)}`, `${signed(pnlValue)} ${unit}`); row.append(td(gain, !hasCost ? '成本未知，收益监控待启用' : pnlPct === null ? '报价暂缺，盈亏未知' : pct(pnlPct)));
+      const priceCell = td(el('span', 'numeric', buy === null ? `成本未知 · ${costUnit}` : `${fmt(buy)} ${costUnit}`), current === null ? `报价暂缺 · ${unit}` : `估值价 ${fmt(current)} ${unit}`); row.append(priceCell);
+      if (p.cost_source === 'token_conversion_history' && hasCost) priceCell.append(el('span', 'secondary', '原股票代币买入 → 官方赎回 · 原始付款成本'));
+      const gain = el('strong', `numeric ${direction(pnlValue)}`, mismatch ? '—' : `${signed(pnlValue)} ${unit}`); row.append(td(gain, mismatch ? currencyMismatchNote(p) : !hasCost ? '成本未知，收益监控待启用' : pnlPct === null ? '报价暂缺，盈亏未知' : pct(pnlPct)));
       const actions = el('div', 'row-actions');
       const analyze = button('AI 分析', () => analyzePosition(p), 'text-button'); analyze.disabled = !canAnalyze(p); analyze.title = canAnalyze(p) ? '研究原八个代币对应美股' : '仅支持原八个代币研究映射，暂不支持 EQ 股票分析';
       actions.append(button('设置', () => openPosition(p), 'text-button'), analyze);
@@ -222,12 +227,13 @@
       rules.append(el('span', '', `止盈 ${num(p.take_profit_price) === null ? '未设' : `${fmt(p.take_profit_price)} ${unit}`} / 止损 ${num(p.stop_loss_price) === null ? '未设' : `${fmt(p.stop_loss_price)} ${unit}`}`), el('span', '', interval === 0 ? '定期汇报已关闭' : interval === null ? '汇报周期未提供' : `每 ${interval} 小时汇报`));
       if (isEquity(p)) rules.append(el('span', '', 'USD 买卖中间价估值，非可成交价'));
       else if (p.price_method === 'last_trade') rules.append(el('span', '', `${unit} 最新成交价，非保证成交价`));
-      if (!hasCost) rules.append(el('span', '', `请补填真实 ${unit} 买入成本后启用收益监控；勿以现价代填`));
+      if (mismatch) rules.append(el('span', '', currencyMismatchNote(p)));
+      else if (!hasCost) rules.append(el('span', '', `请补填真实 ${costUnit} 买入成本后启用收益监控；勿以现价代填`));
       if (!canAnalyze(p)) rules.append(el('span', '', 'AI 研究仅支持原八个代币映射，暂不支持此资产'));
       const ladders = ladderArray(p.ladder_alerts); if (ladders.length) rules.append(el('span', '', `阶梯 ${ladders.map((v) => `${v > 0 ? '+' : ''}${v}%`).join(' / ')}`));
       if (p.include_ai_analysis && canAnalyze(p)) rules.append(el('span', '', '含 AI 分析'));
       const testAlert = button('测试提醒', (b) => busy(b, '发送中…', async () => { try { const r = await api(`/positions/${encodeURIComponent(p.id)}/test-alert`, { method: 'POST', timeout: 120000 }); toast(r.message || '测试请求成功，请核对推送记录。'); } catch (e) { toast(errorText(e), 'failed'); } }), 'text-button');
-      testAlert.disabled = !hasCost; testAlert.title = hasCost ? '发送持仓测试提醒' : `请先补填真实 ${unit} 成本，再测试收益提醒`;
+      testAlert.disabled = !hasCost || mismatch; testAlert.title = mismatch ? currencyMismatchNote(p) : hasCost ? '发送持仓测试提醒' : `请先补填真实 ${costUnit} 成本，再测试收益提醒`;
       rules.append(testAlert, button('停止监控', (b) => stopPosition(p, b), 'text-button'));
       rulesCell.append(rules); rulesRow.append(rulesCell); body.append(rulesRow);
     });
@@ -280,15 +286,16 @@
     }
     select.value = symbol || Object.keys(SYMBOLS)[0]; select.disabled = !!position;
     const unit = position ? quoteCurrency(position) : 'USDT';
+    const costSelect = $('position-cost-currency'); costSelect.replaceChildren();
+    (isEquity(position) ? ['USD', 'USDT', 'USDC'] : ['USDT']).forEach((currency) => { const o = el('option', '', currency); o.value = currency; costSelect.append(o); });
+    costSelect.value = isEquity(position) ? costCurrency(position) : 'USDT'; costSelect.disabled = !isEquity(position);
     $('position-cost').required = !position;
     $('position-cost').value = position && knownCost(position) ? position.buy_price : ''; $('position-quantity').value = position?.quantity ?? '';
-    $('position-cost-label').textContent = `买入成本（${unit}${position ? '，可留空保留' : ''}）`;
     $('position-target-label').textContent = `止盈提醒价（${unit}，可选）`; $('position-stop-label').textContent = `止损提醒价（${unit}，可选）`;
-    $('position-cost').placeholder = `真实 ${unit} 每单位买入成本`;
     $('position-quantity').placeholder = position && isEquity(position) ? '实际持有股数' : '实际持有代币数';
     $('position-target').placeholder = `${unit} 提醒阈值`; $('position-stop').placeholder = `${unit} 提醒阈值`;
-    $('position-price-note').textContent = position && isEquity(position) ? '股票成本及阈值使用 USD。报价为 USD 买卖中间价估值，非可成交价；不得用现价代填成本。保存仅监控，不下单。' : '请填写代币真实 USDT 成本与数量。不要填入底层美股研究价格或以现价代填成本；保存仅监控，不下单。';
-    $('position-cost-note').textContent = position && !knownCost(position) ? `成本未知：请补填真实 ${unit} 成本后启用收益监控。留空可仅保存阈值与周期，不会以现价填充。` : position ? '留空不修改已有成本；只填写真实每单位买入成本。' : '请输入真实每单位买入成本，不会自动使用现价。';
+    $('position-price-note').textContent = position && isEquity(position) ? '股票成本保留原始付款币种；现价及阈值使用 USD。报价为 USD 买卖中间价估值，非可成交价；币种不同则暂停盈亏及收益提醒，不自动换算。保存仅监控，不下单。' : '请填写代币真实 USDT 成本与数量。不要填入底层美股研究价格或以现价代填成本；保存仅监控，不下单。';
+    updatePositionCostNote();
     $('position-target').value = position?.take_profit_price ?? ''; $('position-stop').value = position?.stop_loss_price ?? '';
     $('position-interval').value = position?.check_interval_hours ?? state.config?.default_check_interval_hours ?? 4;
     $('position-ladder').value = position ? ladderArray(position.ladder_alerts).join(', ') : '';
@@ -300,6 +307,18 @@
     for (const input of form.querySelectorAll('input')) input.setCustomValidity('');
     $('position-dialog').showModal(); if (candidateSymbol || position) $('position-cost').focus(); else select.focus();
   }
+  function updatePositionCostNote() {
+    const position = state.editing, unit = $('position-cost-currency').value;
+    const cost = num($('position-cost').value), hasCost = position && knownCost(position);
+    const changedCurrency = position && unit !== costCurrency(position);
+    $('position-cost-label').textContent = `买入成本（${unit}${position ? '，可留空保留' : ''}）`;
+    $('position-cost').placeholder = `真实 ${unit} 每单位买入成本`;
+    const notes = hasCost ? [`已知成本为 ${fmt(position.buy_price)} ${costCurrency(position)}，这是原始付款币种，无需改数。金额与币种不变或留空时保留已有成本及自动来源。`] : position ? [`成本未知：可补填真实 ${unit} 成本；留空仅保存其他设置，不修改成本与币种。`] : ['请输入真实 USDT 每单位买入成本，不会自动使用现价。'];
+    if (changedCurrency) notes.push(cost === null ? '成本留空，本次币种选择不会保存。' : hasCost && cost === num(position.buy_price) ? `切换币种不是兑换，未自动换算；金额仍与原成本相同，请确认已填写真实 ${unit} 成本后再保存。` : `切换币种不是兑换，未自动换算；请填写真实 ${unit} 成本。`);
+    if (position && currencyMismatch(position)) notes.push(currencyMismatchNote(position));
+    else if (position && cost !== null && unit !== quoteCurrency(position)) notes.push(`所填成本为 ${unit}，报价为 ${quoteCurrency(position)}；未做汇率换算，保存后盈亏及收益提醒暂停`);
+    $('position-cost-note').textContent = notes.join(' ');
+  }
   async function savePosition(e) {
     e.preventDefault(); if (state.positionSaving) return;
     const form = $('position-form');
@@ -309,7 +328,8 @@
     if (!form.reportValidity()) return;
     const editing = state.editing;
     const payload = { quantity: num($('position-quantity').value), take_profit_price: num($('position-target').value), stop_loss_price: num($('position-stop').value), check_interval_hours: num($('position-interval').value), ladder_alerts: [...new Set(ladders)], include_ai_analysis: $('position-ai').checked };
-    const cost = num($('position-cost').value); if (cost !== null) payload.buy_price = cost;
+    const cost = num($('position-cost').value), costUnit = isEquity(editing) ? $('position-cost-currency').value : 'USDT';
+    if (cost !== null && (!editing || !knownCost(editing) || cost !== num(editing.buy_price) || costUnit !== costCurrency(editing))) { payload.buy_price = cost; payload.cost_currency = costUnit; }
     if (!editing) payload.symbol = $('position-symbol').value;
     const selectedSymbol = editing?.symbol || payload.symbol;
     if (!editing && !Object.hasOwn(SYMBOLS, selectedSymbol)) { message('position-save-error', '请选择原有 8 个代币对之一。'); return; }
@@ -616,6 +636,8 @@
 
   $('position-form').addEventListener('submit', savePosition);
   $('position-form').querySelectorAll('input').forEach((n) => n.addEventListener('input', () => n.setCustomValidity('')));
+  $('position-cost-currency').addEventListener('change', updatePositionCostNote);
+  $('position-cost').addEventListener('input', updatePositionCostNote);
   $('position-dialog').addEventListener('cancel', (e) => { if (state.positionSaving) e.preventDefault(); });
   document.querySelectorAll('[data-close-dialog]').forEach((n) => n.addEventListener('click', () => { const d = n.closest('dialog'); if (d.id === 'position-dialog' && state.positionSaving) return; d.close(); }));
   $('detail-dialog').addEventListener('close', () => { state.detailSeq += 1; });

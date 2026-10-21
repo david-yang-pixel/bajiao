@@ -24,6 +24,7 @@ async def prepare(tmp_path, monkeypatch, balances=None):
     monkeypatch.setattr(main.binance_client, 'get_ticker_price', AsyncMock(return_value=100.0))
     monkeypatch.setattr(main.binance_client, 'get_average_buy_price', AsyncMock(return_value=None))
     monkeypatch.setattr(main.binance_client, 'get_equity_average_buy_price', AsyncMock(return_value=None), raising=False)
+    monkeypatch.setattr(main.binance_client, 'get_equity_conversion_cost', AsyncMock(return_value=None))
     return path
 
 

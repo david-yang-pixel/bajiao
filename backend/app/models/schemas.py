@@ -1,6 +1,6 @@
 import re
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
-from typing import List, Optional
+from typing import List, Optional, Literal
 from typing import Annotated
 
 LadderPercent = Annotated[float, Field(gt=0, le=1000, allow_inf_nan=False)]
@@ -8,6 +8,7 @@ LadderPercent = Annotated[float, Field(gt=0, le=1000, allow_inf_nan=False)]
 class PositionCreate(BaseModel):
     symbol: str = Field(pattern=r'^(?:[A-Za-z][A-Za-z0-9]{0,24}|EQ_[A-Z][A-Z0-9.\-]{0,19})$')
     buy_price: float = Field(gt=0, allow_inf_nan=False)
+    cost_currency: Optional[Literal['USD', 'USDT', 'USDC']] = None
     quantity: float = Field(gt=0, allow_inf_nan=False)
     take_profit_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     stop_loss_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
@@ -23,6 +24,7 @@ class PositionOut(PositionCreate):
 
 class PositionUpdate(BaseModel):
     buy_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    cost_currency: Optional[Literal['USD', 'USDT', 'USDC']] = None
     quantity: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     take_profit_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     stop_loss_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)

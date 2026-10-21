@@ -27,7 +27,8 @@ async def init_db(db_path: str = None):
                 preferences_customized BOOLEAN DEFAULT 0, is_active BOOLEAN DEFAULT 1
             )
         ''')
-        await _add_columns(db, 'positions', {'cost_source': "TEXT NOT NULL DEFAULT 'manual'"})
+        await _add_columns(db, 'positions', {'cost_source': "TEXT NOT NULL DEFAULT 'manual'",
+            'cost_currency': "TEXT NOT NULL DEFAULT ''"})
         await _add_columns(db, 'positions', {'include_ai_analysis':'BOOLEAN DEFAULT 0',
             'preferences_customized':'BOOLEAN DEFAULT 0', 'alert_reset_after_id':'INTEGER NOT NULL DEFAULT 0'})
         await db.execute('''CREATE TABLE IF NOT EXISTS daily_picks (

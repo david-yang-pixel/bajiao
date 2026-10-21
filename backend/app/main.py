@@ -361,6 +361,9 @@ async def list_positions():
     limit = asyncio.Semaphore(3)
     async def enrich(pos):
         result = dict(pos)
+        market = position_market(pos['symbol'])
+        currency = pos.get('cost_currency') or market['quote_currency']
+        comparable = currency == market['quote_currency']
         try:
             async with limit:
                 price = float(await binance_client.get_ticker_price(pos['symbol']))
@@ -368,12 +371,14 @@ async def list_positions():
             if not all(math.isfinite(v) and v > 0 for v in (price,quantity)):
                 raise ValueError('invalid quote')
             known = math.isfinite(cost) and cost > 0
-            result.update(current_price=price,pnl_pct=round((price/cost-1)*100,2) if known else None,
-                pnl_usd=round((price-cost)*quantity,4) if known else None,price_status='live')
+            result.update(current_price=price,pnl_pct=round((price/cost-1)*100,2) if known and comparable else None,
+                pnl_usd=round((price-cost)*quantity,4) if known and comparable else None,price_status='live')
         except Exception:
             result.update(current_price=None,pnl_pct=None,pnl_usd=None,price_status='unavailable')
         known = math.isfinite(float(pos['buy_price'] or 0)) and float(pos['buy_price'] or 0) > 0
-        result.update(**position_market(pos['symbol']),cost_status='known' if known else 'unknown')
+        status = 'cost_unknown' if not known else 'currency_mismatch' if not comparable else 'ready'
+        result.update(**market,cost_status='known' if known else 'unknown',cost_currency=currency,
+                      pnl_status=status if status != 'ready' else result['price_status'],monitor_status=status)
         if not known:
             result['buy_price'] = None
         return result
@@ -400,6 +405,9 @@ PREFERENCE_FIELDS = {"check_interval_hours", "ladder_alerts", "include_ai_analys
 
 @app.post("/api/positions")
 async def create_position(pos: PositionCreate):
+    cost_currency = pos.cost_currency or position_market(pos.symbol)['quote_currency']
+    if not is_equity_asset(pos.symbol) and cost_currency != 'USDT':
+        raise HTTPException(status_code=422, detail='现货持仓成本币种必须为 USDT')
     async with aiosqlite.connect(settings.DB_PATH) as db:
         ladder_json = json.dumps(pos.ladder_alerts)
         interval_hours = pos.check_interval_hours
@@ -411,8 +419,8 @@ async def create_position(pos: PositionCreate):
         customized = bool(pos.model_fields_set & PREFERENCE_FIELDS)
         cursor = await db.execute(
             """
-            INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, preferences_customized, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO positions (symbol, buy_price, quantity, take_profit_price, stop_loss_price, check_interval_hours, ladder_alerts, include_ai_analysis, preferences_customized, is_active, cost_currency)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 pos.symbol.upper(),
@@ -423,7 +431,8 @@ async def create_position(pos: PositionCreate):
                 interval_hours,
                 ladder_json,
                 1 if include_ai else 0,
-                1 if customized else 0
+                1 if customized else 0,
+                cost_currency
             )
         )
         await db.commit()
@@ -439,10 +448,17 @@ async def update_position(position_id: int, pos: PositionUpdate):
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Position not found")
+        old_currency = row['cost_currency'] or position_market(row['symbol'])['quote_currency']
+        if pos.cost_currency is not None:
+            if not is_equity_asset(row['symbol']) and pos.cost_currency != 'USDT':
+                raise HTTPException(status_code=422, detail='现货持仓成本币种必须为 USDT')
+            if pos.cost_currency != old_currency and pos.buy_price is None:
+                raise HTTPException(status_code=422, detail='变更成本币种时请填写对应币种的真实成本，不会自动兑换')
 
         threshold_changed = any(k in pos.model_fields_set and getattr(pos,k) != row[k]
             for k in ('take_profit_price','stop_loss_price'))
         threshold_changed = threshold_changed or (pos.buy_price is not None and pos.buy_price != row['buy_price'])
+        threshold_changed = threshold_changed or (pos.cost_currency is not None and pos.cost_currency != old_currency)
         if pos.ladder_alerts is not None:
             try:
                 previous_ladder = json.loads(row['ladder_alerts'] or '[]')
@@ -455,6 +471,9 @@ async def update_position(position_id: int, pos: PositionUpdate):
             updates.append("buy_price = ?")
             params.append(pos.buy_price)
             updates.append("cost_source = 'manual'")
+        if pos.cost_currency is not None:
+            updates.append('cost_currency = ?')
+            params.append(pos.cost_currency)
         if pos.quantity is not None:
             updates.append("quantity = ?")
             params.append(pos.quantity)
@@ -520,6 +539,9 @@ async def test_position_alert(position_id: int):
     buy_price = float(pos.get("buy_price") or 0.0)
     if not math.isfinite(buy_price) or buy_price <= 0:
         raise HTTPException(status_code=409, detail='请先补填真实持仓成本，未发送虚假盈亏提醒')
+    quote_currency = position_market(pos['symbol'])['quote_currency']
+    if (pos.get('cost_currency') or quote_currency) != quote_currency:
+        raise HTTPException(status_code=409, detail='成本与行情币种不同，未做汇率换算，不发送跨币种虚假盈亏')
     try:
         curr_price = await binance_client.get_ticker_price(pos["symbol"])
     except Exception:
@@ -640,18 +662,26 @@ async def _perform_binance_sync(min_notional: float) -> Dict[str, Any]:
             # Manual costs survive sync; incomplete history is not a real cost.
             old_cost = float(existing['buy_price'] or 0) if existing else 0
             old_source = existing['cost_source'] if existing else 'unknown'
+            old_currency = (existing['cost_currency'] or market['quote_currency']) if existing else market['quote_currency']
+            cost_currency = market['quote_currency']
+            recovered = None
             if equity:
                 average = None if old_cost > 0 and old_source == 'manual' else await binance_client.get_equity_average_buy_price(symbol, qty)
+                if average is None and not (old_cost > 0 and old_source == 'manual'):
+                    recovered = await binance_client.get_equity_conversion_cost(symbol, qty,
+                        asset_balances={r['asset'].upper():float(r['total']) for r in balances})
             else:
                 average = await binance_client.get_average_buy_price(symbol)
             if average is not None and (not math.isfinite(average) or average <= 0):
                 average = None
             if equity and old_cost > 0 and old_source == 'manual':
-                cost, source = old_cost, 'manual'
+                cost, source, cost_currency = old_cost, 'manual', old_currency
             elif average is not None:
                 cost, source = average, 'trade_history_ex_fees'
+            elif recovered is not None:
+                cost, source, cost_currency = recovered['price'], 'token_conversion_history', recovered['currency']
             elif old_cost > 0 and (old_source == 'manual' or not equity):
-                cost, source = old_cost, old_source
+                cost, source, cost_currency = old_cost, old_source, old_currency
             else:
                 cost, source = 0.0, 'unknown'
 
@@ -661,12 +691,13 @@ async def _perform_binance_sync(min_notional: float) -> Dict[str, Any]:
                     await db.execute('''UPDATE positions SET quantity=?,
                         buy_price=CASE WHEN cost_source='manual' AND buy_price>0 THEN buy_price ELSE ? END,
                         cost_source=CASE WHEN cost_source='manual' AND buy_price>0 THEN cost_source ELSE ? END,
-                        is_active=1 WHERE id=?''', (qty,cost,source,existing['id']))
-                    live = await (await db.execute('SELECT buy_price,cost_source FROM positions WHERE id=?',(existing['id'],))).fetchone()
-                    cost, source = live['buy_price'], live['cost_source']
+                        cost_currency=CASE WHEN cost_source='manual' AND buy_price>0 THEN cost_currency ELSE ? END,
+                        is_active=1 WHERE id=?''', (qty,cost,source,cost_currency,existing['id']))
+                    live = await (await db.execute('SELECT buy_price,cost_source,cost_currency FROM positions WHERE id=?',(existing['id'],))).fetchone()
+                    cost, source, cost_currency = live['buy_price'], live['cost_source'], live['cost_currency'] or market['quote_currency']
                 else:
-                    await db.execute('UPDATE positions SET quantity=?,buy_price=?,cost_source=?,is_active=1 WHERE id=?',
-                                     (qty,cost,source,existing['id']))
+                    await db.execute('UPDATE positions SET quantity=?,buy_price=?,cost_source=?,cost_currency=?,is_active=1 WHERE id=?',
+                                     (qty,cost,source,cost_currency,existing['id']))
                 if not existing['is_active']:
                     await db.execute('''UPDATE positions SET alert_reset_after_id=(
                         SELECT COALESCE(MAX(id),0) FROM alert_logs WHERE position_id=?) WHERE id=?''',
@@ -684,13 +715,15 @@ async def _perform_binance_sync(min_notional: float) -> Dict[str, Any]:
                 tp = round(cost*1.05,4) if cost > 0 and not equity else None
                 sl = round(cost*.97,4) if cost > 0 and not equity else None
                 await db.execute('''INSERT INTO positions(symbol,buy_price,quantity,take_profit_price,stop_loss_price,
-                    check_interval_hours,ladder_alerts,include_ai_analysis,preferences_customized,is_active,cost_source)
-                    VALUES(?,?,?,?,?,?,?,?,?,1,?)''', (symbol,cost,qty,tp,sl,interval,ladder,ai,int(previous is not None),source))
+                    check_interval_hours,ladder_alerts,include_ai_analysis,preferences_customized,is_active,cost_source,cost_currency)
+                    VALUES(?,?,?,?,?,?,?,?,?,1,?,?)''', (symbol,cost,qty,tp,sl,interval,ladder,ai,int(previous is not None),source,cost_currency))
                 action = 'added'
             if cost <= 0:
                 warnings.append({'asset': asset, 'reason': '成交历史不足以核对成本；请编辑填入真实成本，收益监控暂未启用'})
+            elif cost_currency != market['quote_currency']:
+                warnings.append({'asset': asset, 'reason': f'已读取原始 {cost_currency} 成本；报价为 {market["quote_currency"]}，未做汇率换算，盈亏及收益提醒暂停'})
             synced.append({'symbol':symbol,'action':action,'quantity':qty,'buy_price':cost if cost > 0 else None,
-                           'cost_status':'known' if cost > 0 else 'unknown','cost_source':source,
+                           'cost_status':'known' if cost > 0 else 'unknown','cost_source':source,'cost_currency':cost_currency,
                            'current_price':current,'notional':round(notional,2) if notional is not None else None,
                            'wallet':balance.get('wallet','币安账户'), **market})
         deactivated = []

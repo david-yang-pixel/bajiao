@@ -226,6 +226,76 @@ class BinanceClient:
             logger.warning('股票成交成本暂不可用 (%s)', symbol)
             return None
 
+    async def _call_signed_read(self, path: str, params: Dict[str, Any]) -> Any:
+        """Private read-only GET; never expose signed URLs or response bodies."""
+        params = dict(params, timestamp=int(time.time()*1000), recvWindow=5000)
+        params['signature'] = self._generate_signature(params)
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(self.rest_base_url + path, params=params,
+                                        headers={'X-MBX-APIKEY': self.api_key})
+            response.raise_for_status()
+            return response.json()
+
+    async def get_equity_conversion_cost(self, symbol: str, quantity: float,
+                                        asset_balances: Optional[Dict[str, float]] = None) -> Optional[Dict[str, Any]]:
+        """Trace an explicit redemption back to original paid token acquisitions.
+
+        Bounded to complete source pages and 90 days of Convert history; never
+        infer a USD/stablecoin rate or silently use an incomplete ledger.
+        """
+        from backend.app.services.equity_cost_basis import reconstruct_equity_cost
+        if not is_equity_asset(symbol) or not self.api_key or not self.api_secret:
+            return None
+        try:
+            now = int(time.time()*1000)
+            day = 86400000
+            start = max(0, now - 90*day)
+            conversion_data = await self._call_signed_read('/sapi/v1/equity/tokenized/history',
+                {'startTime':0, 'endTime':now, 'size':100})
+            if conversion_data.get('hasMore') is not False:
+                return None
+            conversions = [r for r in conversion_data['rows']
+                           if r.get('underlyingAsset') == symbol[3:] and r.get('status') == 'S']
+            tokens = {r['tokenizedAsset'] for r in conversions}
+            if len(tokens) != 1:
+                return None
+            token = next(iter(tokens))
+            if not re.fullmatch(r'[A-Z][A-Z0-9]{0,24}', token):
+                return None
+            spot = await self._call_signed_read('/api/v3/myTrades',
+                {'symbol':token+'USDT','fromId':0,'limit':1000})
+            if not isinstance(spot,list) or len(spot) >= 1000:
+                return None
+            native = await self._call_signed_read('/sapi/v1/equity/trade/history',
+                {'symbol':symbol[3:],'startTime':0,'endTime':now,'current':1,'size':100})
+            if not isinstance(native.get('rows'),list) or int(native['total']) != len(native['rows']):
+                return None
+            times = [int(r['time']) for r in spot] + [int(r['updatedAt']) for r in conversions]
+            times += [int(r['executionAt']) for r in native['rows']]
+            if any(t < start or t > now for t in times):
+                return None
+            flows = []
+            end = now
+            while end >= start:
+                window_start = max(start, end - 30*day + 1)
+                data = await self._call_signed_read('/sapi/v1/convert/tradeFlow',
+                    {'startTime':window_start,'endTime':end,'limit':1000})
+                if data.get('moreData') is not False or not isinstance(data.get('list'),list):
+                    return None
+                flows.extend(data['list'])
+                end = window_start - 1
+            if asset_balances is None:
+                fresh = {r['asset']:float(r['total']) for r in await self.get_account_balances()}
+                if not math.isclose(fresh.get(symbol,0), quantity, rel_tol=1e-7, abs_tol=1e-9):
+                    return None
+                asset_balances = fresh
+            return reconstruct_equity_cost(symbol=symbol,quantity=quantity,
+                token_quantity=asset_balances.get(token,0),conversions=conversions,
+                spot=spot,flows=flows,trades=native['rows'])
+        except Exception:
+            logger.warning('转换成本链路暂不可完整核对 (%s)', symbol)
+            return None
+
     async def get_klines(
         self,
         symbol: str,

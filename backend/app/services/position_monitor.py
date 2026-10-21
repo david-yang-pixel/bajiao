@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 import aiosqlite
 
 from backend.app.config import DEFAULT_CHECK_INTERVAL_HOURS, settings
-from backend.app.services.binance_client import BinanceClient
+from backend.app.services.binance_client import BinanceClient, position_market
 from backend.app.services.notification import NotificationService
 from backend.app.services.quant_screener import QuantScreener
 from backend.app.services.analysis_agent import AnalysisAgent
@@ -185,6 +185,9 @@ class PositionMonitor:
         if buy_price is None or buy_price <= 0:
             logger.warning("Invalid cost price for pos %s", pos_id)
             return triggered
+        quote_currency = position_market(symbol)['quote_currency']
+        if (pos.get('cost_currency') or quote_currency) != quote_currency:
+            return triggered  # No implicit USD/stablecoin conversion in return alerts.
         qty = self._finite_float(pos.get("quantity")) or 0.0
         try:
             curr_price = self._finite_float(await self.binance_client.get_ticker_price(symbol))
