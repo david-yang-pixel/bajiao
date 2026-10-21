@@ -270,7 +270,7 @@ async def safe_config_validation_error(request: Request, exc: RequestValidationE
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "service": "binance-bstocks-bot"}
+    return {"status": "ok", "service": "binance-bstocks-bot", "revision": os.environ.get('APP_REVISION', 'unknown')}
 
 @app.get("/api/bstocks/symbols")
 async def get_symbols():

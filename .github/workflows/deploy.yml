@@ -1,0 +1,99 @@
+name: Build, test, and deploy
+
+on:
+  push:
+    branches: [feat/swing-analysis]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check frontend syntax
+        working-directory: backend/app
+        run: node --check static/app.js
+      - name: Build runtime image
+        run: >-
+          docker build --pull --platform linux/amd64
+          --build-arg APP_REVISION="$GITHUB_SHA"
+          --tag "ghcr.io/david-yang-pixel/bajiao:$GITHUB_SHA" .
+      - name: Test built image without network access
+        run: |
+          docker run --rm --network none --entrypoint python \
+            --env PYTHONDONTWRITEBYTECODE=1 --env DB_PATH=/tmp/test.db \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/backend/tests,dst=/app/backend/tests,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/scripts,dst=/app/scripts,readonly" \
+            "ghcr.io/david-yang-pixel/bajiao:$GITHUB_SHA" \
+            -m pytest backend/tests -q -p no:cacheprovider
+      - name: Publish tested image
+        id: publish
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/feat/swing-analysis'
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG
+          DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          IMAGE_TAG="ghcr.io/david-yang-pixel/bajiao:$GITHUB_SHA"
+          docker push "$IMAGE_TAG"
+          # Read the digest recorded by this successful push, not a mutable tag lookup.
+          IMAGE="$(docker image inspect "$IMAGE_TAG" --format '{{json .RepoDigests}}' | python3 -c '
+          import json, re, sys
+          refs = [ref for ref in json.load(sys.stdin) if re.fullmatch(
+              r"ghcr\.io/david-yang-pixel/bajiao@sha256:[0-9a-f]{64}", ref)]
+          if len(refs) != 1:
+              raise SystemExit("Expected exactly one pushed repository digest")
+          print(refs[0])
+          ')"
+          printf 'image=%s\n' "$IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build-test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/feat/swing-analysis'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out deployment client
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify current branch HEAD and deploy immutable image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ needs.build-test.outputs.image }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'root' }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(gh api repos/david-yang-pixel/bajiao/git/ref/heads/feat/swing-analysis --jq '.object.sha')"
+          if [ "$HEAD_SHA" != "$GITHUB_SHA" ]; then
+            echo 'Refusing deployment: branch HEAD has changed.' >&2
+            exit 1
+          fi
+          python3 scripts/cd_client.py

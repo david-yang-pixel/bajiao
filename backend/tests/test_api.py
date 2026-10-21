@@ -9,12 +9,13 @@ from backend.app import main
 from backend.app.database import init_db
 
 @pytest.mark.asyncio
-async def test_health_check():
+async def test_health_check(monkeypatch):
+    monkeypatch.setenv('APP_REVISION', 'fixture-revision')
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         res = await ac.get("/api/health")
         assert res.status_code == 200
-        assert res.json() == {"status": "ok", "service": "binance-bstocks-bot"}
+        assert res.json() == {"status": "ok", "service": "binance-bstocks-bot", "revision": "fixture-revision"}
 
 @pytest.mark.asyncio
 async def test_symbols_endpoint():

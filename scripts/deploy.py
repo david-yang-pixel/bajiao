@@ -26,10 +26,9 @@ def application_files(repo):
 
 
 def release_files(repo):
-    # The offline suite imports scripts.deploy; include it as test support, not live app source.
-    return application_files(repo) + sorted((repo / 'backend/tests').glob('*.py')) + [
-        repo / 'backend/requirements.txt', repo / 'scripts/deploy_remote.py', repo / 'scripts/deploy.py',
-    ]
+    # Include deployment helpers used by the offline regression suite.
+    return (application_files(repo) + sorted((repo / 'backend/tests').glob('*.py'))
+            + sorted((repo / 'scripts').glob('*.py')) + [repo / 'backend/requirements.txt'])
 
 
 def main():

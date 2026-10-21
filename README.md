@@ -96,9 +96,13 @@ git diff --check
 
 单元测试拦截未模拟的外部 HTTP，不需要真实账户、模型或消息渠道。Node 仅用于可选的脚本语法检查，不是运行依赖。
 
-`python3 scripts/deploy.py` 用于已有服务器更新，执行前需要独立授权并准备服务器配置；首次更新需通过 `--baseline` 指定现有版本校验清单。脚本打包应用代码、静态资源、本地 Skill Markdown 和测试，排除 `.env`、数据库与缓存；不要用测试数据覆盖服务器 `data/`，不要重建已有 `.env`。发布前备份数据库，发布后确认健康检查、配置与账户读取；本次代码测试不代表已部署或已验证真实供应商连接。
+### 自动发布（CI/CD）
 
-本次新增 `tzdata` 依赖：若服务器 requirements 与当前版本不同，代码热更新脚本会主动取消，需另行构建镜像并更新容器环境变量。不要跳过依赖检查。
+向 `feat/swing-analysis` 推送会自动构建并测试镜像，发布至私有 GHCR，再部署到现有服务器；健康检查与数据保留检查通过后，仅清理本项目未使用的旧镜像。PR 只测试，不部署。流水线提供失败回滚，不覆盖服务器 `.env`、数据库或其他服务。
+
+首次接入运行 `python3 scripts/setup_cicd.py --ssh-host zendesk-agent-server`，生成专用受限部署密钥并配置 Actions Secrets。完整流程、回滚与清理边界见 [CI/CD 说明](docs/cicd.md)。
+
+原 `scripts/deploy.py` 仅保留作旧版本代码热更新工具。生产切换到镜像流水线后，不要与旧 Compose 源码挂载或热更新脚本混用；依赖变化由新镜像承担。
 
 当前模块、API 与数据说明见 [波段分析架构](docs/swing-analysis.md)。旧的历史设计记录位于 `docs/superpowers/`，当前实现与本说明优先。
 
