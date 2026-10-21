@@ -11,6 +11,27 @@ import tempfile
 import uuid
 
 
+def application_files(repo):
+    assets = {'.html','.js','.css','.svg','.png','.jpg','.jpeg','.webp','.ico','.woff','.woff2'}
+    files = []
+    for path in (repo / 'backend/app').rglob('*'):
+        if not path.is_file() or '__pycache__' in path.parts:
+            continue
+        if path.suffix == '.py' or ('static' in path.parts and path.suffix in assets) or (
+                'analysis_skills' in path.parts and path.suffix == '.md'):
+            if path.is_symlink():
+                raise RuntimeError('Deployment refuses symlinked source files')
+            files.append(path)
+    return sorted(files)
+
+
+def release_files(repo):
+    # The offline suite imports scripts.deploy; include it as test support, not live app source.
+    return application_files(repo) + sorted((repo / 'backend/tests').glob('*.py')) + [
+        repo / 'backend/requirements.txt', repo / 'scripts/deploy_remote.py', repo / 'scripts/deploy.py',
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="zendesk-agent-server")
@@ -22,9 +43,7 @@ def main():
     release = "credential-guard-" + uuid.uuid4().hex[:12]
     stage = args.root.rstrip("/") + "/.deploy/" + release
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", args.host]
-    source = sorted(p for p in (repo / "backend/app").rglob("*")
-                    if p.is_file() and "__pycache__" not in p.parts
-                    and (p.suffix == ".py" or "static" in p.parts))
+    source = application_files(repo)
     manifest = {"release": release, "files": [
         {"path": str(p.relative_to(repo)), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
         for p in source
@@ -34,9 +53,7 @@ def main():
         manifest_path = Path(temporary) / "manifest.json"
         manifest_path.write_text(json.dumps(manifest))
         with tarfile.open(bundle, "w:gz") as tar:
-            files = source + sorted((repo / "backend/tests").glob("*.py")) + [
-                repo / "backend/requirements.txt", repo / "scripts/deploy_remote.py",
-            ]
+            files = release_files(repo)
             for p in files:
                 if p.is_symlink():
                     raise RuntimeError("Deployment refuses symlinked source files")

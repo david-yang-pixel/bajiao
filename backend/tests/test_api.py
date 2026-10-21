@@ -5,6 +5,7 @@ from httpx import ASGITransport, AsyncClient
 from unittest.mock import AsyncMock, patch
 
 from backend.app.main import app
+from backend.app import main
 from backend.app.database import init_db
 
 @pytest.mark.asyncio
@@ -265,12 +266,11 @@ async def test_position_with_include_ai_analysis_alert(tmp_path, monkeypatch):
             assert test_res.status_code == 200
             assert test_res.json()["success"] is True
 
-            # Verify get_symbol_trend_analysis was called
-            mock_trend.assert_called_once_with("NVDAUSDT")
-            # Verify notification_service was called with trend_analysis
+            # Risk notification is independent of model latency/configuration.
             mock_alert.assert_called_once()
-            call_kwargs = mock_alert.call_args[1]
-            assert call_kwargs["trend_analysis"] == mock_analysis
+            assert mock_alert.call_args.kwargs['trend_analysis'] is None
+            await main.position_monitor.close()
+            main.position_monitor._closed = False
 
         # Test updating include_ai_analysis to False
         up_res = await ac.put(f"/api/positions/{pos_id}", json={

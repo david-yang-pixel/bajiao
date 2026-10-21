@@ -1,23 +1,14 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from backend.app.services.analysis_agent import AnalysisAgent
+from backend.app.services.analysis_errors import AnalysisUnavailable
 
 @pytest.mark.asyncio
-async def test_analysis_agent_fallback():
-    # Without API key, should use robust rule-based reasoning
-    agent = AnalysisAgent(api_key="")
-    result = await agent.analyze_candidate(
-        symbol="NVDABUSDT",
-        score=75,
-        signals=["MA多头排列", "放量突破"],
-        metrics={"close": 120.0, "ma5": 118.0, "ma20": 110.0}
-    )
-
-    assert result["symbol"] == "NVDABUSDT"
-    assert result["target_price"] > 120.0
-    assert result["stop_loss_price"] < 120.0
-    assert "NVDABUSDT" in result["symbol"]
-    assert "MA多头排列" in result["reason"]
+async def test_analysis_agent_has_no_synthetic_fallback():
+    agent = AnalysisAgent(api_key='')
+    with pytest.raises(AnalysisUnavailable, match='API Key'):
+        await agent.analyze_candidate(symbol='NVDABUSDT',score=75,
+            signals=['MA多头排列'],metrics={'close':120.0})
 
 @pytest.mark.asyncio
 async def test_analysis_agent_llm_success():

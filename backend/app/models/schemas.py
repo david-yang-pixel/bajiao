@@ -1,15 +1,18 @@
 import re
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from typing import List, Optional
+from typing import Annotated
+
+LadderPercent = Annotated[float, Field(gt=0, le=1000, allow_inf_nan=False)]
 
 class PositionCreate(BaseModel):
-    symbol: str
-    buy_price: float
-    quantity: float
-    take_profit_price: Optional[float] = None
-    stop_loss_price: Optional[float] = None
+    symbol: str = Field(pattern=r'^[A-Za-z][A-Za-z0-9]{0,24}$')
+    buy_price: float = Field(gt=0, allow_inf_nan=False)
+    quantity: float = Field(gt=0, allow_inf_nan=False)
+    take_profit_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    stop_loss_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     check_interval_hours: Optional[float] = Field(default=None, ge=0, le=168, allow_inf_nan=False)
-    ladder_alerts: List[float] = []
+    ladder_alerts: List[LadderPercent] = Field(default_factory=list)
     include_ai_analysis: Optional[bool] = None
     
     model_config = ConfigDict(from_attributes=True)
@@ -19,11 +22,11 @@ class PositionOut(PositionCreate):
     is_active: bool
 
 class PositionUpdate(BaseModel):
-    buy_price: Optional[float] = None
-    quantity: Optional[float] = None
-    take_profit_price: Optional[float] = None
-    stop_loss_price: Optional[float] = None
-    ladder_alerts: Optional[List[float]] = None
+    buy_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    quantity: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    take_profit_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    stop_loss_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    ladder_alerts: Optional[List[LadderPercent]] = None
     check_interval_hours: Optional[float] = Field(default=None, ge=0, le=168, allow_inf_nan=False)
     include_ai_analysis: Optional[bool] = None
 
@@ -62,9 +65,25 @@ class SystemConfigSchema(BaseModel):
     feishu_app_secret: Optional[str] = None
     wecom_webhook_url: Optional[str] = None
     ai_picks_push_enabled: Optional[bool] = None
-    ai_picks_push_time: Optional[str] = None
+    ai_picks_push_time: Optional[str] = Field(default=None, pattern=r'^(?:[01]\d|2[0-3]):[0-5]\d$')
     default_check_interval_hours: Optional[float] = Field(default=None, ge=0, le=168, allow_inf_nan=False)
     default_include_ai_analysis: Optional[bool] = None
+    fmp_api_key: Optional[SecretStr] = None
+    analysis_top_n: Optional[int] = Field(default=None, ge=3, le=5)
+    analysis_min_score: Optional[int] = Field(default=None, ge=40, le=100)
+    earnings_blackout_days: Optional[int] = Field(default=None, ge=0, le=14)
+    ai_picks_push_timezone: Optional[str] = None
+
+    @field_validator('ai_picks_push_timezone')
+    @classmethod
+    def valid_timezone(cls, value):
+        if value is not None:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+            try:
+                ZoneInfo(value)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ValueError('请选择有效的 IANA 时区') from None
+        return value
 
 class TestConnectionRequest(BaseModel):
     service: str # binance | llm | feishu | wecom | feishu_bot

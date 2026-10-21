@@ -1,8 +1,12 @@
 import asyncio
+import base64
+import binascii
+from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 import json
 import hmac
+import math
 import logging
 import os
 import time
@@ -33,6 +37,10 @@ from backend.app.services.analysis_agent import AnalysisAgent
 from backend.app.services.notification import NotificationService
 from backend.app.services.position_monitor import PositionMonitor
 from backend.app.services.feishu_bot_service import FeishuBotService
+from backend.app.services.us_market_data import USMarketData, MarketDataError
+from backend.app.services.swing_analysis import SwingAnalysisService, AnalysisUnavailable, AnalysisBusy
+from backend.app.services.swing_screener import STOCK_UNIVERSE, HORIZON
+from backend.app.services.analysis_skills import skill_metadata
 
 logging.basicConfig(level=logging.INFO)
 # HTTPX logs signed request URLs at INFO, including short-lived signatures.
@@ -56,6 +64,9 @@ feishu_bot_service = FeishuBotService(
     analysis_agent=analysis_agent,
     position_monitor=position_monitor
 )
+us_market_data = USMarketData()
+swing_service = SwingAnalysisService(us_market_data, analysis_agent, notification_service)
+position_monitor.trend_provider = swing_service.analyze_position
 
 _runtime_config_lock = asyncio.Lock()
 
@@ -80,7 +91,7 @@ async def _load_runtime_config():
         b_mcp = cfg.get("binance_mcp_url") or settings.BINANCE_MCP_URL or "https://agent.binance.com/mcp/agentic"
         oa_key = cfg.get("openai_api_key") or settings.OPENAI_API_KEY
         oa_base = cfg.get("openai_base_url") or settings.OPENAI_BASE_URL or "https://api.openai.com/v1"
-        oa_model = cfg.get("openai_model") or "gpt-4o-mini"
+        oa_model = cfg.get("openai_model") or settings.OPENAI_MODEL
         feishu_url = cfg.get("feishu_webhook_url") or settings.FEISHU_WEBHOOK_URL
         feishu_app_id = cfg.get("feishu_app_id") or settings.FEISHU_APP_ID
         feishu_app_secret = cfg.get("feishu_app_secret") or settings.FEISHU_APP_SECRET
@@ -95,6 +106,8 @@ async def _load_runtime_config():
         analysis_agent.api_key = oa_key
         analysis_agent.base_url = oa_base
         analysis_agent.model = oa_model
+        us_market_data.api_key = cfg.get('fmp_api_key') or settings.FMP_API_KEY
+        swing_service._position_cache.clear()
 
         # Update notification service
         notification_service.feishu_webhook = feishu_url or ""
@@ -114,93 +127,146 @@ async def _load_runtime_config():
     except Exception as e:
         logger.error(f"Error applying runtime config: {e}")
 
-# Background worker loop
+# Independent workers: slow research and account requests never serialize risk scans.
 _monitor_task = None
-_last_ai_picks_push_date = ""
+_background_tasks = []
+
+
+async def _stored_config():
+    return {r['key']:r['value'] for r in await swing_service.store.rows('SELECT key,value FROM system_configs')}
+
+
+async def _run_swing(push_notifications=False, run_key=None):
+    cfg = await _stored_config()
+    return await swing_service.run(top_n=int(cfg.get('analysis_top_n',3)),
+        min_score=int(cfg.get('analysis_min_score',60)),
+        earnings_blackout_days=int(cfg.get('earnings_blackout_days',3)),
+        push_notifications=push_notifications, run_key=run_key)
+
+
+async def scheduled_analysis_tick(now=None):
+    cfg = await _stored_config()
+    if cfg.get('ai_picks_push_enabled') not in ('1','true','True'):
+        return None
+    zone = ZoneInfo(cfg.get('ai_picks_push_timezone') or 'Asia/Shanghai')
+    local = (now or datetime.now(timezone.utc)).astimezone(zone)
+    if local.strftime('%H:%M') < (cfg.get('ai_picks_push_time') or '21:30'):
+        return None
+    # >= catches up after a missed minute; DB run_key survives process restarts.
+    return await _run_swing(push_notifications=True,run_key=f'schedule:{local.date().isoformat()}')
+
 
 async def background_monitoring_loop():
-    global _last_ai_picks_push_date
-    logger.info("Background position monitoring loop started (30s interval).")
-    tick_count = 0
-    tz_bj = timezone(timedelta(hours=8))
     while True:
         try:
-            await asyncio.sleep(30)
-            tick_count += 1
             await position_monitor.scan_all_positions(force_periodic=False)
+        except Exception:
+            logger.warning('Position scan failed; retrying next tick')
+        await asyncio.sleep(30)
 
-            # Every 10 mins (20 ticks), silently sync Binance positions if API keys are configured
-            if tick_count % 20 == 0 and binance_client.api_key and binance_client.api_secret:
-                try:
-                    await perform_binance_sync(min_notional=1.0)
-                except Exception as sync_err:
-                    logger.warning(f"Periodic binance sync warning: {sync_err}")
 
-            # Check daily scheduled AI stock picks push (Beijing Time UTC+8)
+async def background_sync_loop():
+    while True:
+        await asyncio.sleep(600)
+        if binance_client.api_key and binance_client.api_secret:
             try:
-                now_bj = datetime.now(tz_bj)
-                current_hm = now_bj.strftime("%H:%M")
-                today_date = now_bj.strftime("%Y-%m-%d")
+                await perform_binance_sync(min_notional=1.0)
+            except Exception:
+                logger.warning('Account sync unavailable; existing holdings preserved')
 
-                async with aiosqlite.connect(settings.DB_PATH) as db:
-                    db.row_factory = aiosqlite.Row
-                    cursor = await db.execute(
-                        "SELECT key, value FROM system_configs WHERE key IN ('ai_picks_push_enabled', 'ai_picks_push_time')"
-                    )
-                    rows = await cursor.fetchall()
-                    sched_cfg = {r["key"]: r["value"] for r in rows}
-                    is_sched_enabled = sched_cfg.get("ai_picks_push_enabled") in ("1", "true", "True", True)
-                    sched_time = sched_cfg.get("ai_picks_push_time") or "21:30"
 
-                    if is_sched_enabled and current_hm == sched_time and _last_ai_picks_push_date != today_date:
-                        _last_ai_picks_push_date = today_date
-                        logger.info(f"Triggering scheduled daily AI stock picks push for {today_date} at {current_hm} (Beijing Time)...")
-                        await run_daily_analysis(push_notifications=True)
-            except Exception as sched_err:
-                logger.error(f"Error checking scheduled AI picks push: {sched_err}")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Error in background monitor tick: {e}")
+async def background_analysis_loop():
+    while True:
+        try:
+            await scheduled_analysis_tick()
+        except (AnalysisUnavailable, AnalysisBusy):
+            pass
+        except Exception:
+            logger.warning('Scheduled analysis failed; check runtime configuration')
+        await asyncio.sleep(30)
+
+
+async def background_maintenance_loop():
+    ticks = 0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await swing_service.retry_pushes()
+            ticks += 1
+            if ticks % 60 == 0 and us_market_data.api_key:
+                await swing_service.review()
+        except Exception:
+            logger.warning('Delivery/review maintenance unavailable; will retry')
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _monitor_task
-    logger.info("Initializing database...")
+    global _monitor_task, _background_tasks
     await init_db()
     await apply_runtime_config()
-    _monitor_task = asyncio.create_task(background_monitoring_loop())
-    yield
-    if _monitor_task:
-        _monitor_task.cancel()
-        try:
-            await _monitor_task
-        except asyncio.CancelledError:
-            pass
-    feishu_bot_service.stop()
-    logger.info("App shutdown complete.")
+    await swing_service.store.recover_interrupted()
+    _background_tasks = [asyncio.create_task(worker()) for worker in (
+        background_monitoring_loop, background_sync_loop, background_analysis_loop, background_maintenance_loop)]
+    _monitor_task = _background_tasks[0]
+    if not settings.ADMIN_PASSWORD:
+        logger.warning('Console access password is not configured; restrict access to trusted networks')
+    try:
+        yield
+    finally:
+        for task in _background_tasks:
+            task.cancel()
+        await asyncio.gather(*_background_tasks,return_exceptions=True)
+        await position_monitor.close()
+        feishu_bot_service.stop()
 
 app = FastAPI(
     title="Binance bStocks Analysis & Alert Bot API",
     version="1.0.0",
     lifespan=lifespan
 )
+@app.middleware('http')
+async def console_access(request: Request, call_next):
+    if settings.ADMIN_PASSWORD and request.url.path != '/api/health':
+        authorized = False
+        try:
+            scheme, credentials = request.headers.get('authorization','').split(' ',1)
+            user, password = base64.b64decode(credentials,validate=True).decode('utf-8').split(':',1)
+            authorized = scheme.lower() == 'basic' and user == 'admin' and hmac.compare_digest(
+                password.encode('utf-8'),settings.ADMIN_PASSWORD.encode('utf-8'))
+        except (ValueError,UnicodeError,binascii.Error):
+            pass
+        if not authorized:
+            return JSONResponse(status_code=401,content={'detail':'需要控制台访问认证'},
+                headers={'WWW-Authenticate':'Basic realm="bStocks", charset="UTF-8"'})
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    if request.url.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.exception_handler(AnalysisUnavailable)
+async def analysis_unavailable(request, exc):
+    return JSONResponse(status_code=503,content={'detail':str(exc)})
+
+
+@app.exception_handler(AnalysisBusy)
+async def analysis_busy(request, exc):
+    return JSONResponse(status_code=409,content={'detail':str(exc)})
+
+
+@app.exception_handler(MarketDataError)
+async def market_unavailable(request, exc):
+    return JSONResponse(status_code=503,content={'detail':str(exc)})
 
 
 @app.exception_handler(RequestValidationError)
 async def safe_config_validation_error(request: Request, exc: RequestValidationError):
-    if request.url.path.startswith("/api/config"):
-        errors = [{k: e[k] for k in ("loc", "msg", "type") if k in e} for e in exc.errors()]
-        return JSONResponse(status_code=422, content={"detail": errors})
-    return await request_validation_exception_handler(request, exc)
+    errors = [{k:e[k] for k in ('loc','msg','type') if k in e} for e in exc.errors()]
+    return JSONResponse(status_code=422,content={'detail':errors})
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Same-origin console; deliberately no wildcard credentialed CORS.
 
 @app.get("/api/health")
 async def health_check():
@@ -227,89 +293,86 @@ async def get_klines(symbol: str = Query(...), interval: str = "1d", limit: int 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/api/analysis/run")
+@app.post('/api/analysis/run')
 async def run_daily_analysis(push_notifications: bool = False):
-    candidates = await quant_screener.screen_candidates(binance_client, min_score=40)
-    top_candidates = candidates[:3] if candidates else []
+    return await _run_swing(push_notifications=push_notifications)
 
-    results = []
-    async with aiosqlite.connect(settings.DB_PATH) as db:
-        # Clear previous picks so the newly generated run completely refreshes the recommendations
-        await db.execute("DELETE FROM daily_picks")
-        await db.commit()
 
-        for cand in top_candidates:
-            symbol = cand["symbol"]
-            analysis = await analysis_agent.analyze_candidate(
-                symbol=symbol,
-                score=cand["score"],
-                signals=cand["signals"],
-                metrics=cand["metrics"]
-            )
-            analysis["score"] = cand["score"]
-            results.append(analysis)
+@app.get('/api/analysis/status')
+async def analysis_status():
+    runs = await swing_service.store.list_runs(1)
+    running = await swing_service.store.rows("SELECT id FROM analysis_runs WHERE status='running'")
+    return {'horizon':HORIZON,'universe':[{'symbol':s,'underlying_symbol':u} for s,u in STOCK_UNIVERSE.items()],
+        'skills':skill_metadata(),'configured':{'market_data':bool(us_market_data.api_key),
+        'model':bool(analysis_agent.api_key),'notifications':bool(notification_service.feishu_webhook or notification_service.wecom_webhook)},
+        'latest_run':runs[0] if runs else None,'is_running':bool(running) or swing_service.is_running}
 
-            await db.execute(
-                """
-                INSERT INTO daily_picks (symbol, reason, target_price)
-                VALUES (?, ?, ?)
-                """,
-                (symbol, analysis["reason"], analysis["target_price"])
-            )
-            await db.commit()
 
-            if push_notifications:
-                await notification_service.send_daily_pick_card(
-                    symbol=symbol,
-                    reason=analysis["reason"],
-                    target_price=analysis["target_price"],
-                    stop_loss=analysis["stop_loss_price"],
-                    score=cand["score"]
-                )
+@app.get('/api/analysis/runs')
+async def analysis_runs(limit: int = Query(default=20,ge=1,le=100)):
+    return await swing_service.store.list_runs(limit)
 
-    return {"count": len(results), "picks": results}
 
-@app.get("/api/analysis/picks")
+@app.post('/api/analysis/runs/{run_id}/push')
+async def push_analysis_run(run_id: int):
+    try:
+        return await swing_service.push_run(run_id)
+    except LookupError:
+        raise HTTPException(status_code=404,detail='分析记录不存在') from None
+
+
+@app.post('/api/analysis/review')
+async def review_analysis():
+    return await swing_service.review()
+
+
+@app.get('/api/analysis/reviews')
+async def analysis_reviews():
+    return await swing_service.store.list_reviews()
+
+
+@app.get('/api/analysis/picks')
 async def get_latest_picks():
-    async with aiosqlite.connect(settings.DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM daily_picks ORDER BY id DESC")
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+    return await swing_service.store.list_picks()
 
-@app.delete("/api/analysis/picks")
+
+@app.delete('/api/analysis/picks')
 async def clear_all_picks():
-    async with aiosqlite.connect(settings.DB_PATH) as db:
-        await db.execute("DELETE FROM daily_picks")
-        await db.commit()
-    return {"message": "All picks cleared successfully"}
+    await swing_service.store.hide_picks()
+    return {'message':'已隐藏当前候选，历史报告与复盘仍保留'}
 
-@app.delete("/api/analysis/picks/{pick_id}")
+
+@app.delete('/api/analysis/picks/{pick_id}')
 async def delete_single_pick(pick_id: int):
-    async with aiosqlite.connect(settings.DB_PATH) as db:
-        await db.execute("DELETE FROM daily_picks WHERE id = ?", (pick_id,))
-        await db.commit()
-    return {"message": "Pick deleted successfully"}
+    await swing_service.store.hide_picks(pick_id)
+    return {'message':'已隐藏该候选，历史报告仍保留'}
+
+
+@app.post('/api/positions/{position_id}/analyze')
+async def analyze_held_position(position_id: int):
+    positions = await swing_service.store.rows('SELECT symbol FROM positions WHERE id=? AND is_active=1',(position_id,))
+    if not positions:
+        raise HTTPException(status_code=404,detail='未找到正在监控的持仓')
+    return await swing_service.analyze_position(positions[0]['symbol'])
 
 @app.get("/api/positions", response_model=List[Dict[str, Any]])
 async def list_positions():
     positions = await position_monitor.get_active_positions()
-    enriched = []
-    for pos in positions:
-        curr_price = None
-        pnl_pct = 0.0
+    limit = asyncio.Semaphore(3)
+    async def enrich(pos):
+        result = dict(pos)
         try:
-            curr_price = await binance_client.get_ticker_price(pos["symbol"])
-            buy_price = float(pos["buy_price"])
-            pnl_pct = ((curr_price - buy_price) / buy_price) * 100.0
+            async with limit:
+                price = float(await binance_client.get_ticker_price(pos['symbol']))
+            cost, quantity = float(pos['buy_price']), float(pos['quantity'])
+            if not all(math.isfinite(v) and v > 0 for v in (price,cost,quantity)):
+                raise ValueError('invalid quote')
+            result.update(current_price=price,pnl_pct=round((price/cost-1)*100,2),
+                pnl_usd=round((price-cost)*quantity,4),price_status='live')
         except Exception:
-            pass
-
-        pos_dict = dict(pos)
-        pos_dict["current_price"] = curr_price
-        pos_dict["pnl_pct"] = round(pnl_pct, 2)
-        enriched.append(pos_dict)
-    return enriched
+            result.update(current_price=None,pnl_pct=None,pnl_usd=None,price_status='unavailable')
+        return result
+    return await asyncio.gather(*(enrich(pos) for pos in positions))
 
 async def get_default_check_interval_hours(db: aiosqlite.Connection) -> float:
     cursor = await db.execute(
@@ -372,6 +435,15 @@ async def update_position(position_id: int, pos: PositionUpdate):
         if not row:
             raise HTTPException(status_code=404, detail="Position not found")
 
+        threshold_changed = any(k in pos.model_fields_set and getattr(pos,k) != row[k]
+            for k in ('take_profit_price','stop_loss_price'))
+        threshold_changed = threshold_changed or (pos.buy_price is not None and pos.buy_price != row['buy_price'])
+        if pos.ladder_alerts is not None:
+            try:
+                previous_ladder = json.loads(row['ladder_alerts'] or '[]')
+            except (ValueError,TypeError):
+                previous_ladder = []
+            threshold_changed = threshold_changed or pos.ladder_alerts != previous_ladder
         updates = []
         params = []
         if pos.buy_price is not None:
@@ -380,10 +452,10 @@ async def update_position(position_id: int, pos: PositionUpdate):
         if pos.quantity is not None:
             updates.append("quantity = ?")
             params.append(pos.quantity)
-        if pos.take_profit_price is not None:
+        if 'take_profit_price' in pos.model_fields_set:
             updates.append("take_profit_price = ?")
             params.append(pos.take_profit_price)
-        if pos.stop_loss_price is not None:
+        if 'stop_loss_price' in pos.model_fields_set:
             updates.append("stop_loss_price = ?")
             params.append(pos.stop_loss_price)
         if pos.check_interval_hours is not None:
@@ -401,9 +473,13 @@ async def update_position(position_id: int, pos: PositionUpdate):
         if updates:
             params.append(position_id)
             await db.execute(f"UPDATE positions SET {', '.join(updates)} WHERE id = ?", params)
+            if threshold_changed:
+                await db.execute('''UPDATE positions SET alert_reset_after_id=(
+                    SELECT COALESCE(MAX(id),0) FROM alert_logs WHERE position_id=?) WHERE id=?''',
+                    (position_id,position_id))
             await db.commit()
 
-        if pos.buy_price is not None or pos.ladder_alerts is not None:
+        if threshold_changed:
             position_monitor.clear_position_milestones(position_id)
 
     return {"message": "Position updated successfully"}
@@ -439,7 +515,7 @@ async def test_position_alert(position_id: int):
     try:
         curr_price = await binance_client.get_ticker_price(pos["symbol"])
     except Exception:
-        curr_price = buy_price
+        raise HTTPException(status_code=503,detail='币安行情暂不可用，未用买入成本冒充现价') from None
 
     pnl_pct = ((curr_price - buy_price) / buy_price) * 100.0 if buy_price > 0 else 0.0
 
@@ -455,9 +531,8 @@ async def test_position_alert(position_id: int):
 
     note = f"手动点击测试（当前设定周期: {interval_str}）"
 
+    # Risk/test notification never waits for the separate AI supplement.
     trend_analysis = None
-    if bool(pos.get("include_ai_analysis")):
-        trend_analysis = await position_monitor.get_symbol_trend_analysis(pos["symbol"])
 
     sent = await notification_service.send_position_alert(
         symbol=pos["symbol"],
@@ -470,6 +545,7 @@ async def test_position_alert(position_id: int):
     )
 
     if not sent:
+        await position_monitor.log_alert(pos['id'],pos['symbol'],note,'periodic',status='failed')
         raise HTTPException(
             status_code=502,
             detail="飞书/企微机器人发送失败，请检查系统配置中的 Webhook 地址是否有效或机器人是否已被群移除。"
@@ -478,10 +554,12 @@ async def test_position_alert(position_id: int):
     # Record to alert logs
     await position_monitor.log_alert(pos["id"], pos["symbol"], note, "periodic")
     position_monitor._last_periodic_times[pos["id"]] = time.time()
+    if pos.get('include_ai_analysis'):
+        position_monitor._schedule_supplement(pos['id'],pos['symbol'],buy_price,curr_price,note)
 
     return {
         "success": True,
-        "message": f"已成功向飞书推送 {pos['symbol']} 实时持仓卡片！最新价: ${curr_price:.2f}, 盈亏: {pnl_pct:+.2f}%",
+        "message": f"已推送 {pos['symbol']} 持仓提醒；AI 分析（如已配置）单独补充",
         "triggered": ["periodic"],
         "curr_price": round(curr_price, 2),
         "pnl_pct": round(pnl_pct, 2)
@@ -718,6 +796,7 @@ async def get_system_config():
     raw_binance_secret = cfg.get("binance_api_secret") or settings.BINANCE_API_SECRET
     raw_openai_key = cfg.get("openai_api_key") or settings.OPENAI_API_KEY
     raw_feishu_secret = cfg.get("feishu_app_secret") or settings.FEISHU_APP_SECRET
+    raw_fmp_key = cfg.get('fmp_api_key') or settings.FMP_API_KEY
 
     return {
         "binance_api_key": mask(raw_binance_key),
@@ -727,7 +806,7 @@ async def get_system_config():
         "has_binance_secret": bool(raw_binance_secret),
         "openai_api_key": mask(raw_openai_key),
         "openai_base_url": cfg.get("openai_base_url") or settings.OPENAI_BASE_URL or "https://api.openai.com/v1",
-        "openai_model": cfg.get("openai_model") or "gpt-4o-mini",
+        "openai_model": cfg.get("openai_model") or settings.OPENAI_MODEL,
         "has_openai_key": bool(raw_openai_key),
         "feishu_webhook_url": cfg.get("feishu_webhook_url") or settings.FEISHU_WEBHOOK_URL or "",
         "feishu_app_id": cfg.get("feishu_app_id") or settings.FEISHU_APP_ID or "",
@@ -738,7 +817,12 @@ async def get_system_config():
         "ai_picks_push_enabled": cfg.get("ai_picks_push_enabled") in ("1", "true", "True", True),
         "ai_picks_push_time": cfg.get("ai_picks_push_time") or "21:30",
         "default_check_interval_hours": float(cfg.get("default_check_interval_hours", DEFAULT_CHECK_INTERVAL_HOURS)),
-        "default_include_ai_analysis": cfg["default_include_ai_analysis"] == "1" if "default_include_ai_analysis" in cfg else DEFAULT_INCLUDE_AI_ANALYSIS
+        "default_include_ai_analysis": cfg["default_include_ai_analysis"] == "1" if "default_include_ai_analysis" in cfg else DEFAULT_INCLUDE_AI_ANALYSIS,
+        'fmp_api_key':'','has_fmp_key':bool(raw_fmp_key),
+        'analysis_horizon':HORIZON,'analysis_top_n':int(cfg.get('analysis_top_n',3)),
+        'analysis_min_score':int(cfg.get('analysis_min_score',60)),
+        'earnings_blackout_days':int(cfg.get('earnings_blackout_days',3)),
+        'ai_picks_push_timezone':cfg.get('ai_picks_push_timezone') or 'Asia/Shanghai'
     }
 
 @app.post("/api/config")
@@ -753,7 +837,7 @@ async def save_system_config(payload: SystemConfigSchema):
         if value and "******" not in value:
             raise HTTPException(status_code=400, detail="普通设置保存不会修改币安凭据，请使用“验证并更新币安凭据”操作")
 
-    for k in ["binance_mcp_url", "openai_base_url", "openai_model", "feishu_webhook_url", "wecom_webhook_url", "ai_picks_push_time", "feishu_app_id", "default_check_interval_hours"]:
+    for k in ["binance_mcp_url", "openai_base_url", "openai_model", "feishu_webhook_url", "wecom_webhook_url", "ai_picks_push_time", "feishu_app_id", "default_check_interval_hours", 'analysis_top_n','analysis_min_score','earnings_blackout_days','ai_picks_push_timezone']:
         if k in dumped and dumped[k] is not None:
             val = str(dumped[k]).strip()
             if val:
@@ -767,6 +851,10 @@ async def save_system_config(payload: SystemConfigSchema):
     for secret_k in ["openai_api_key", "feishu_app_secret"]:
         if secret_k in dumped and dumped[secret_k] and "******" not in str(dumped[secret_k]):
             fields_to_update[secret_k] = str(dumped[secret_k]).strip()
+    if payload.fmp_api_key is not None:
+        value = payload.fmp_api_key.get_secret_value().strip()
+        if value and '*' not in value:
+            fields_to_update['fmp_api_key'] = value
 
     async with aiosqlite.connect(settings.DB_PATH) as db:
         for k, v in fields_to_update.items():
@@ -824,6 +912,20 @@ async def update_binance_credentials(payload: BinanceCredentialsUpdate, request:
 async def test_connection(req: TestConnectionRequest):
     """Test connectivity for Binance, LLM, Feishu, or WeCom."""
     svc = req.service.lower()
+    if svc == 'fmp':
+        key = req.api_key
+        if not key or '*' in key:
+            cfg = await _stored_config()
+            key = cfg.get('fmp_api_key') or settings.FMP_API_KEY
+        provider = USMarketData(api_key=key or '')
+        try:
+            history = await provider.get_history('NVDA')
+            research = await provider.get_research('NVDA')
+            if len(history) < 252 or not research['financials']:
+                return {'success':False,'message':'FMP 已连接，但完整波段分析所需历史或财务数据不足'}
+            return {'success':True,'message':'FMP 日线、季度财务、新闻和财报日历读取成功'}
+        except MarketDataError as exc:
+            return {'success':False,'message':str(exc)}
     if svc == "binance":
         api_key = req.api_key
         if not api_key or "******" in api_key:
@@ -864,9 +966,9 @@ async def test_connection(req: TestConnectionRequest):
                 if res.status_code == 200:
                     return {"success": True, "message": f"大模型接口连通成功 ({model})"}
                 else:
-                    return {"success": False, "message": f"模型调用失败: HTTP {res.status_code} - {res.text[:200]}"}
+                    return {"success": False, "message": f"模型调用失败（HTTP {res.status_code}），请检查配置与额度"}
             except Exception as e:
-                return {"success": False, "message": f"大模型接口请求异常: {str(e)}"}
+                return {"success": False, "message": "大模型接口网络或响应异常"}
 
         elif svc == "feishu":
             url = req.webhook_url or notification_service.feishu_webhook_url
@@ -881,12 +983,12 @@ async def test_connection(req: TestConnectionRequest):
                     }
                 )
                 data = res.json()
-                if data.get("code") == 0 or res.status_code == 200:
+                if res.status_code == 200 and (data.get('code') == 0 or data.get('StatusCode') == 0):
                     return {"success": True, "message": "飞书测试消息已发送"}
                 else:
-                    return {"success": False, "message": f"飞书返回错误: {res.text}"}
+                    return {"success": False, "message": "飞书返回非成功状态，请检查 Webhook"}
             except Exception as e:
-                return {"success": False, "message": f"飞书连接异常: {str(e)}"}
+                return {"success": False, "message": "飞书连接异常，请检查 Webhook"}
 
         elif svc == "wecom":
             url = req.webhook_url or notification_service.wecom_webhook_url
@@ -904,9 +1006,9 @@ async def test_connection(req: TestConnectionRequest):
                 if data.get("errcode") == 0:
                     return {"success": True, "message": "企业微信测试消息已发送"}
                 else:
-                    return {"success": False, "message": f"企业微信返回错误: {res.text}"}
+                    return {"success": False, "message": "企业微信返回非成功状态，请检查 Webhook"}
             except Exception as e:
-                return {"success": False, "message": f"企业微信连接异常: {str(e)}"}
+                return {"success": False, "message": "企业微信连接异常，请检查 Webhook"}
 
         elif svc in ["feishu_bot", "feishu_app"]:
             async with aiosqlite.connect(settings.DB_PATH) as db:
@@ -933,9 +1035,9 @@ async def test_connection(req: TestConnectionRequest):
                     status_text = "长连接正常运行" if feishu_bot_service.is_connected else "鉴权通过（长连接已就绪）"
                     return {"success": True, "message": f"飞书自建应用机器人鉴权成功！当前状态: {status_text}"}
                 else:
-                    return {"success": False, "message": f"飞书应用鉴权失败: {data.get('msg')} (code: {data.get('code')})"}
+                    return {"success": False, "message": "飞书应用鉴权失败，请检查 App ID/Secret"}
             except Exception as e:
-                return {"success": False, "message": f"飞书应用连接异常: {str(e)}"}
+                return {"success": False, "message": "飞书应用连接异常"}
 
         else:
             raise HTTPException(status_code=400, detail="不支持的服务测试类型")

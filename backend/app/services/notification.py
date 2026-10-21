@@ -54,6 +54,14 @@ class NotificationService:
     def wecom_webhook_url(self, val: Optional[str]):
         self._wecom_webhook = val or ""
 
+    async def send_channel_text(self, channel: str, content: str) -> bool:
+        """Explicit channel result for persisted, independently retryable deliveries."""
+        if channel == 'feishu' and self.feishu_webhook:
+            return await self._post(self.feishu_webhook, {'msg_type':'text','content':{'text':content}})
+        if channel == 'wecom' and self.wecom_webhook:
+            return await self._post(self.wecom_webhook, {'msgtype':'text','text':{'content':content}})
+        return False
+
     async def send_text(self, content: str) -> bool:
         """
         Send plain text notification to configured webhooks.
@@ -230,19 +238,19 @@ class NotificationService:
                             data = await data
                         if isinstance(data, dict):
                             if "code" in data and data["code"] != 0:
-                                logger.warning(f"Webhook {url} returned error code: {data}")
+                                logger.warning('Webhook returned a nonzero code')
                                 return False
                             if "StatusCode" in data and data["StatusCode"] != 0:
-                                logger.warning(f"Webhook {url} returned error code: {data}")
+                                logger.warning('Webhook returned a nonzero status')
                                 return False
                             if "errcode" in data and data["errcode"] != 0:
-                                logger.warning(f"Webhook {url} returned error code: {data}")
+                                logger.warning('Webhook returned a nonzero errcode')
                                 return False
                     except Exception:
-                        pass
-                    return True
-                logger.warning(f"Webhook post failed [{resp.status_code}]: {resp.text}")
+                        return False
+                    return isinstance(data, dict) and any(data.get(k) == 0 for k in ('code','StatusCode','errcode'))
+                logger.warning('Webhook request failed (HTTP %s)', resp.status_code)
                 return False
         except Exception as e:
-            logger.error(f"Error posting notification to {url}: {e}")
+            logger.error('Notification request failed (%s)', type(e).__name__)
             return False

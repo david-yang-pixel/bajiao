@@ -9,6 +9,7 @@ async def test_notification_service_daily_pick():
     with patch("httpx.AsyncClient.post") as mock_post:
         mock_resp = AsyncMock()
         mock_resp.status_code = 200
+        mock_resp.json.return_value = {'code': 0}
         mock_post.return_value = mock_resp
 
         ok = await svc.send_daily_pick_card(
@@ -32,6 +33,7 @@ async def test_notification_service_position_alert():
     with patch("httpx.AsyncClient.post") as mock_post:
         mock_resp = AsyncMock()
         mock_resp.status_code = 200
+        mock_resp.json.return_value = {'errcode': 0}
         mock_post.return_value = mock_resp
 
         ok = await svc.send_position_alert(

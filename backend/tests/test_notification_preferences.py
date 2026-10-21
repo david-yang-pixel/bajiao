@@ -31,22 +31,15 @@ def mock_holdings(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("push", [False, True])
 async def test_manual_analysis_only_sends_when_requested(tmp_path, monkeypatch, push):
-    await prepare_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(main.quant_screener, "screen_candidates", AsyncMock(return_value=[
-        {"symbol": "TSLABUSDT", "score": 55, "signals": [], "metrics": {}}
-    ]))
-    monkeypatch.setattr(main.analysis_agent, "analyze_candidate", AsyncMock(return_value={
-        "reason": "test", "target_price": 110.0, "stop_loss_price": 95.0
-    }))
-    send = AsyncMock(return_value=True)
-    monkeypatch.setattr(main.notification_service, "send_daily_pick_card", send)
-
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
-        response = await client.post("/api/analysis/run" + ("?push_notifications=true" if push else ""))
+    from backend.tests.test_swing_analysis import service
+    runner, market, agent, notifier, path = await service(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, 'swing_service', runner)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://test') as client:
+        response = await client.post('/api/analysis/run' + ('?push_notifications=true' if push else ''))
         assert response.status_code == 200
-        assert response.json()["count"] == 1
-        assert len((await client.get("/api/analysis/picks")).json()) == 1
-    assert send.await_count == int(push)
+        assert response.json()['count'] == 3
+        assert len((await client.get('/api/analysis/picks')).json()) == 3
+    assert bool(notifier.send_channel_text.await_count) is push
 
 
 @pytest.mark.asyncio
@@ -231,31 +224,18 @@ async def test_confirmed_empty_balance_still_closes_position(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_daily_schedule_explicitly_pushes_only_once(tmp_path, monkeypatch):
-    path = await prepare_db(tmp_path, monkeypatch)
+    from backend.tests.test_swing_analysis import service
+    from datetime import timezone
+    runner, market, agent, notifier, path = await service(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, 'swing_service', runner)
     async with aiosqlite.connect(path) as db:
-        await db.executemany("INSERT INTO system_configs (key, value) VALUES (?, ?)", [
-            ("ai_picks_push_enabled", "1"), ("ai_picks_push_time", "21:30")
-        ])
+        await db.executemany('INSERT INTO system_configs (key,value) VALUES (?,?)', [
+            ('ai_picks_push_enabled','1'), ('ai_picks_push_time','21:30')])
         await db.commit()
-
-    class ScheduledTime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return cls(2026, 10, 2, 21, 30, tzinfo=tz)
-
-    calls = 0
-
-    async def two_ticks_then_cancel(seconds):
-        nonlocal calls
-        calls += 1
-        if calls > 2:
-            raise asyncio.CancelledError
-
-    run = AsyncMock()
-    monkeypatch.setattr(main, "datetime", ScheduledTime)
-    monkeypatch.setattr(main, "_last_ai_picks_push_date", "")
-    monkeypatch.setattr(main, "run_daily_analysis", run)
-    monkeypatch.setattr(main.position_monitor, "scan_all_positions", AsyncMock())
-    monkeypatch.setattr(main.asyncio, "sleep", two_ticks_then_cancel)
-    await main.background_monitoring_loop()
-    run.assert_awaited_once_with(push_notifications=True)
+    now = datetime(2026,10,2,13,31,tzinfo=timezone.utc)
+    await main.scheduled_analysis_tick(now)
+    count = notifier.send_channel_text.await_count
+    assert count > 0
+    await main.scheduled_analysis_tick(now)
+    assert notifier.send_channel_text.await_count == count
+    assert len(await runner.store.list_runs()) == 1

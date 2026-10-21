@@ -14,9 +14,14 @@ services:
       - BINANCE_API_SECRET=${BINANCE_API_SECRET:-}
       - BINANCE_MCP_URL=${BINANCE_MCP_URL:-https://agent.binance.com/mcp/agentic}
       - FEISHU_WEBHOOK_URL=${FEISHU_WEBHOOK_URL:-}
+      - FEISHU_APP_ID=${FEISHU_APP_ID:-}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET:-}
       - WECOM_WEBHOOK_URL=${WECOM_WEBHOOK_URL:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - FMP_API_KEY=${FMP_API_KEY:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       - DB_PATH=/app/data/bstocks.db
     volumes:
       - ./data:/app/data
