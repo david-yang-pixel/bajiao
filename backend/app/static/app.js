@@ -4,10 +4,10 @@
   const $ = (id) => document.getElementById(id);
   const SYMBOLS = Object.freeze({ NVDABUSDT: 'NVDA', TSLABUSDT: 'TSLA', AAPLBUSDT: 'AAPL', MSFTBUSDT: 'MSFT', AMZNBUSDT: 'AMZN', GOOGBUSDT: 'GOOG', METABUSDT: 'META', COINBUSDT: 'COIN' });
   const views = {
-    positions: ['持仓监控', 'PORTFOLIO MONITOR', '把价格交给监控，把注意力留给决策。'],
-    picks: ['每日波段精选', 'DAILY SWING RESEARCH', '在 2–4 周的时间尺度，寻找值得进一步研究的机会。'],
-    logs: ['推送记录', 'NOTIFICATION JOURNAL', '每一次提醒，都有迹可循。'],
-    settings: ['配置中心', 'WORKSPACE SETTINGS', '连接数据、模型与通知，让研究按你的节奏运行。']
+    positions: ['持仓监控', '账户持仓与提醒设置'],
+    picks: ['每日波段精选', '8 个标的 · 2–4 周 · 最多 3–5 个候选'],
+    logs: ['推送记录', '查看通知投递状态'],
+    settings: ['配置中心', '账户、数据、模型与通知']
   };
   const state = { view: null, positions: null, picks: null, picksError: false, logs: null, runs: null, reviews: null, status: null, statusError: '', config: null, configDirty: false, launching: false, syncing: false, editing: null, positionSaving: false, detailSeq: 0, statusLoading: false, poll: null };
   const paths = {
@@ -149,8 +149,8 @@
     const changed = state.view !== view; state.view = view;
     Object.keys(views).forEach((key) => { $(`view-${key}`).hidden = key !== view; });
     document.querySelectorAll('[data-view]').forEach((n) => { if (n.dataset.view === view) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current'); });
-    $('page-title').replaceChildren(document.createTextNode(views[view][0]), el('span', 'title-dot', '.'));
-    $('breadcrumb-current').textContent = views[view][0]; $('page-eyebrow').textContent = views[view][1]; $('page-description').textContent = views[view][2];
+    $('page-title').textContent = views[view][0];
+    $('breadcrumb-current').textContent = views[view][0]; $('page-description').textContent = views[view][1];
     document.title = `${views[view][0]} · 八角波段工作台`; renderHeading();
     if (changed) { window.scrollTo(0, 0); loadView(); }
   }
@@ -195,7 +195,6 @@
   function renderPositions() {
     const positions = state.positions || []; $('metric-count').textContent = positions.length; $('position-count').textContent = `${positions.length} 笔持仓`;
     const currencies = [...new Set(positions.map(quoteCurrency))]; const mixed = currencies.length > 1;
-    const currency = currencies[0] || '';
     $('metric-value-unit').textContent = currencies.join(' / '); $('metric-pnl-unit').textContent = currencies.join(' / ');
     const priced = positions.filter((p) => num(p.current_price) !== null && num(p.quantity) !== null);
     const costed = priced.filter(knownCost);
@@ -204,10 +203,10 @@
     const costComplete = complete && costed.length === positions.length;
     const value = complete && !mixed ? priced.reduce((s, p) => s + num(p.current_price) * num(p.quantity), 0) : null;
     const pnl = costComplete && !mixed && !mismatched ? costed.reduce((s, p) => s + (num(p.current_price) - num(p.buy_price)) * num(p.quantity), 0) : null;
-    $('metric-value').textContent = fmt(value); $('metric-value-note').textContent = !positions.length ? '暂无有效持仓' : mixed ? `${currencies.join(' 与 ')} 不直接合计，请查看逐笔估值` : !complete ? `${positions.length - priced.length} 笔报价缺失，不显示合计` : `按最近读取的 ${currency} 报价估值，非可成交金额`;
-    $('metric-pnl').textContent = signed(pnl); $('metric-pnl').className = `numeric ${direction(pnl)}`; $('metric-pnl-note').textContent = mismatched ? '原始成本与报价币种不同，未做汇率换算；不显示总盈亏' : mixed ? `${currencies.join(' 与 ')} 不直接合计，请查看逐笔盈亏` : costComplete ? `基于真实 ${currency} 成本 · 不含费用` : '等待完整真实成本与报价';
-    if (!positions.length) { contentState('positions-content', '还没有监控中的持仓', '从币安同步已有股票或代币持仓，或手动录入原八对代币的成本与数量。这里不会展示示例账户。', { action: () => openPosition(), actionLabel: '添加第一笔持仓', iconName: 'portfolio' }); return; }
-    const { wrap, body } = makeTable(['资产（股票 / 代币）/ 数量', '成本 / 最新估值价', '未实现盈亏', '操作'], '有效持仓列表，成本按原始付款币种、报价按报价币种显示，不跨币种计算盈亏或合计', 'position-table');
+    $('metric-value').textContent = fmt(value); $('metric-value-note').textContent = !positions.length ? '暂无有效持仓' : mixed ? '跨币种不直接合计' : !complete ? `${positions.length - priced.length} 笔报价暂缺` : '币安最新报价估值';
+    $('metric-pnl').textContent = signed(pnl); $('metric-pnl').className = `numeric ${direction(pnl)}`; $('metric-pnl-note').textContent = mismatched ? '成本币种不同，未换算汇率' : mixed ? '跨币种不直接合计' : costComplete ? '按成本计算，未计全部费用' : '等待成本与报价';
+    if (!positions.length) { contentState('positions-content', '暂无持仓', '同步币安账户，或手动添加持仓。', { action: () => openPosition(), actionLabel: '添加第一笔持仓', iconName: 'portfolio' }); return; }
+    const { wrap, body } = makeTable(['资产 / 数量', '成本 / 估值价', '未实现盈亏', '操作'], '持仓列表：成本与报价分别标注币种，不跨币种计算盈亏', 'position-table');
     positions.forEach((p) => {
       const unit = quoteCurrency(p), costUnit = costCurrency(p); const hasCost = knownCost(p), mismatch = currencyMismatch(p);
       const current = num(p.current_price), buy = hasCost ? num(p.buy_price) : null, qty = num(p.quantity);
@@ -216,8 +215,11 @@
       const row = el('tr'); const symbol = el('strong', 'symbol-text', str(p.symbol));
       row.append(td(symbol, `${isEquity(p) ? '股票' : '代币'} · ${unit} · 数量 ${fmt(qty, 6)}`));
       const priceCell = td(el('span', 'numeric', buy === null ? `成本未知 · ${costUnit}` : `${fmt(buy)} ${costUnit}`), current === null ? `报价暂缺 · ${unit}` : `估值价 ${fmt(current)} ${unit}`); row.append(priceCell);
-      if (p.cost_source === 'token_conversion_history' && hasCost) priceCell.append(el('span', 'secondary', '原股票代币买入 → 官方赎回 · 原始付款成本'));
-      const gain = el('strong', `numeric ${direction(pnlValue)}`, mismatch ? '—' : `${signed(pnlValue)} ${unit}`); row.append(td(gain, mismatch ? currencyMismatchNote(p) : !hasCost ? '成本未知，收益监控待启用' : pnlPct === null ? '报价暂缺，盈亏未知' : pct(pnlPct)));
+      if (p.cost_source === 'token_conversion_history' && hasCost) priceCell.title = '成本来源：原股票代币买入 → 官方赎回';
+      const gain = el('strong', `numeric ${direction(pnlValue)}`, mismatch ? '—' : `${signed(pnlValue)} ${unit}`);
+      const gainCell = td(gain, mismatch ? '未换算汇率 · 收益提醒暂停' : !hasCost ? '待补成本 · 收益提醒暂停' : pnlPct === null ? '报价暂缺' : pct(pnlPct));
+      if (mismatch) gainCell.title = currencyMismatchNote(p);
+      row.append(gainCell);
       const actions = el('div', 'row-actions');
       const analyze = button('AI 分析', () => analyzePosition(p), 'text-button'); analyze.disabled = !canAnalyze(p); analyze.title = canAnalyze(p) ? '研究原八个代币对应美股' : '仅支持原八个代币研究映射，暂不支持 EQ 股票分析';
       actions.append(button('设置', () => openPosition(p), 'text-button'), analyze);
@@ -225,17 +227,13 @@
       const rulesRow = el('tr', 'position-detail-row'); const rulesCell = el('td'); rulesCell.colSpan = 4;
       const rules = el('div', 'position-rule'); const interval = num(p.check_interval_hours);
       rules.append(el('span', '', `止盈 ${num(p.take_profit_price) === null ? '未设' : `${fmt(p.take_profit_price)} ${unit}`} / 止损 ${num(p.stop_loss_price) === null ? '未设' : `${fmt(p.stop_loss_price)} ${unit}`}`), el('span', '', interval === 0 ? '定期汇报已关闭' : interval === null ? '汇报周期未提供' : `每 ${interval} 小时汇报`));
-      if (isEquity(p)) rules.append(el('span', '', 'USD 买卖中间价估值，非可成交价'));
-      else if (p.price_method === 'last_trade') rules.append(el('span', '', `${unit} 最新成交价，非保证成交价`));
-      if (mismatch) rules.append(el('span', '', currencyMismatchNote(p)));
-      else if (!hasCost) rules.append(el('span', '', `请补填真实 ${costUnit} 买入成本后启用收益监控；勿以现价代填`));
-      if (!canAnalyze(p)) rules.append(el('span', '', 'AI 研究仅支持原八个代币映射，暂不支持此资产'));
       const ladders = ladderArray(p.ladder_alerts); if (ladders.length) rules.append(el('span', '', `阶梯 ${ladders.map((v) => `${v > 0 ? '+' : ''}${v}%`).join(' / ')}`));
       if (p.include_ai_analysis && canAnalyze(p)) rules.append(el('span', '', '含 AI 分析'));
       const testAlert = button('测试提醒', (b) => busy(b, '发送中…', async () => { try { const r = await api(`/positions/${encodeURIComponent(p.id)}/test-alert`, { method: 'POST', timeout: 120000 }); toast(r.message || '测试请求成功，请核对推送记录。'); } catch (e) { toast(errorText(e), 'failed'); } }), 'text-button');
       testAlert.disabled = !hasCost || mismatch; testAlert.title = mismatch ? currencyMismatchNote(p) : hasCost ? '发送持仓测试提醒' : `请先补填真实 ${costUnit} 成本，再测试收益提醒`;
-      rules.append(testAlert, button('停止监控', (b) => stopPosition(p, b), 'text-button'));
-      rulesCell.append(rules); rulesRow.append(rulesCell); body.append(rulesRow);
+      const tools = el('div', 'position-tools'); tools.append(testAlert, button('停止监控', (b) => stopPosition(p, b), 'text-button'));
+      const details = el('div', 'position-details'); details.append(rules, tools);
+      rulesCell.append(details); rulesRow.append(rulesCell); body.append(rulesRow);
     });
     $('positions-content').replaceChildren(wrap);
   }
