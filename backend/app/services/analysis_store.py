@@ -102,7 +102,8 @@ class AnalysisStore:
             return True
 
     async def unnotified_events(self):
-        return await self.rows('SELECT * FROM pick_events WHERE notified=0 ORDER BY id')
+        return await self.rows('''SELECT e.*,p.symbol AS symbol,json_extract(p.report_json,'$.underlying_symbol') AS underlying_symbol
+            FROM pick_events e JOIN daily_picks p ON p.id=e.pick_id WHERE e.notified=0 ORDER BY e.id''')
 
     async def mark_events_notified(self, ids):
         if ids:

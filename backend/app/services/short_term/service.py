@@ -10,6 +10,7 @@ from backend.app.services.analysis_errors import AnalysisBusy, AnalysisUnavailab
 from .constants import (AGENT_CONCURRENCY, DAILY_SESSION_LIMIT, PICK_HORIZON_SESSIONS, PRESCREEN_LIMIT,
                         REUSE_MAX_AGE_HOURS, REUSE_PRICE_ATR_MULT, SCHEDULE_TZ)
 from .factors import compute_factors
+from .messages import build_run_message
 from .macro_calendar import events_between
 from .prescreen import prescreen
 from .universe import MarketDataUnavailable, UniverseCache, get_token_quote
@@ -57,6 +58,7 @@ class ShortTermService:
         self.config_provider = config_provider
         self.universe = UniverseCache(binance)
         self._lock = asyncio.Lock()
+        self._push_lock = asyncio.Lock()
         self._bars: dict[str, list] = {}
 
     @property
@@ -127,12 +129,133 @@ class ShortTermService:
         today = self.now().date()
         return {**out, 'events': events_between(today, today + timedelta(days=7))}
 
-    # ---- Task 10 placeholders ----
+    # ---- tracking / review / push ----
+    @staticmethod
+    def _bar_hit(bars, target, stop):
+        """First bar touching stop (stop wins same-bar ties) or target -> (event, level)."""
+        for b in bars:
+            if b['low'] <= stop:
+                return 'stopped', stop
+            if b['high'] >= target:
+                return 'target_hit', target
+        return None
+
     async def track_active(self) -> list[dict]:
-        return []
+        picks = await self.store.active_short_term_picks()
+        if not picks:
+            return []
+        recorded: list[dict] = []
+        try:
+            bars = await self.alpaca.get_daily_bars(list(dict.fromkeys(p['underlying_symbol'] for p in picks)))
+        except MarketDataUnavailable as exc:
+            logger.warning('短线跟踪行情不可用: %s', exc)
+            return recorded
+        try:
+            spot = await self.binance.get_spot_symbols()
+        except Exception:
+            logger.warning('短线跟踪现货状态不可用', exc_info=True)
+            spot = {}
+        latest_cache: dict[str, float | None] = {}
+
+        async def record(pick, event, price, detail):
+            if await self.store.record_pick_event(pick['id'], event, price, detail):
+                recorded.append({'pick_id': pick['id'], 'event': event, 'price_usd': price, 'detail': detail,
+                                 'symbol': pick['symbol'], 'underlying_symbol': pick['underlying_symbol']})
+
+        for pick in picks:
+            under, target, stop = pick['underlying_symbol'], pick['target_price_usd'], pick['stop_price_usd']
+            status = spot.get(pick['symbol'])
+            if status is not None and status != 'TRADING':
+                await record(pick, 'halted', None, f"{pick['symbol']} 现货状态 {status}")
+            after = [b for b in bars.get(under) or [] if b['date'] > pick['as_of']]
+            hit = self._bar_hit(after, target, stop)
+            if hit:
+                await record(pick, hit[0], hit[1], '日线触及止损' if hit[0] == 'stopped' else '日线触及目标')
+                continue
+            if under not in latest_cache:
+                try:
+                    latest_cache[under] = await self.alpaca.get_latest_price(under)
+                except MarketDataUnavailable:
+                    latest_cache[under] = None
+            price = latest_cache[under]
+            if price is not None and price >= target:
+                await record(pick, 'target_hit', price, '最新价达到目标')
+            elif price is not None and price <= stop:
+                await record(pick, 'stopped', price, '最新价触及止损')
+            elif len(after) >= PICK_HORIZON_SESSIONS:
+                await record(pick, 'expired', after[-1]['close'], f'已满 {PICK_HORIZON_SESSIONS} 个交易日')
+        return recorded
+
+    async def review(self) -> dict:
+        h = PICK_HORIZON_SESSIONS
+        picks = [p for p in await self.store.list_picks(include_hidden=True, all_runs=True)
+                 if p.get('strategy') == 'short_term_1w']
+        done = {r['pick_id'] for r in await self.store.rows(
+            'SELECT pick_id FROM analysis_reviews WHERE horizon_sessions=?', (h,))}
+        pending = [p for p in picks if p['id'] not in done]
+        if not pending:
+            return {'count': 0, 'errors': [], 'message': '还没有可复盘的短线推荐'}
+        try:
+            bars = await self.alpaca.get_daily_bars(
+                list(dict.fromkeys([*(p['underlying_symbol'] for p in pending), 'SPY'])))
+        except MarketDataUnavailable as exc:
+            return {'count': 0, 'errors': ['*'], 'message': str(exc)}
+        spy = {b['date']: b['close'] for b in bars.get('SPY') or []}
+        count, errors = 0, []
+        for pick in pending:
+            under = pick['underlying_symbol']
+            after = [b for b in bars.get(under) or [] if b['date'] > pick['as_of']][:h]
+            if len(after) < h:
+                continue
+            last = after[-1]
+            if pick['as_of'] not in spy or last['date'] not in spy:
+                errors.append(under)
+                continue
+            change = (last['close'] / pick['current_price_usd'] - 1) * 100
+            market = (spy[last['date']] / spy[pick['as_of']] - 1) * 100
+            hit = self._bar_hit(after, pick['target_price_usd'], pick['stop_price_usd'])
+            outcome = {'stopped': 'stop', 'target_hit': 'target'}[hit[0]] if hit else 'open'
+            count += await self.store.execute(
+                '''INSERT OR IGNORE INTO analysis_reviews
+                (pick_id,horizon_sessions,as_of,return_pct,benchmark_return_pct,excess_return_pct,outcome)
+                VALUES (?,?,?,?,?,?,?)''',
+                (pick['id'], h, last['date'], round(change, 4), round(market, 4), round(change - market, 4), outcome))
+        return {'count': count, 'errors': errors, 'message': f'基于实际 {h} 个后续交易日收盘价的观察收益；不是含成本交易回测'}
 
     async def push_run(self, run_id, force=True) -> dict:
-        return {'success': False, 'status': 'not_implemented'}
+        async with self._push_lock:
+            run = await self.store.get_run(run_id)
+            if not run:
+                raise LookupError('分析记录不存在')
+            if run['status'] == 'running':
+                raise AnalysisBusy('分析尚未完成')
+            channels = [n for n, url in [('feishu', self.notifier.feishu_webhook), ('wecom', self.notifier.wecom_webhook)] if url]
+            if not channels:
+                return {'success': False, 'status': 'failed', 'message': '未配置推送渠道'}
+            existing = await self.store.rows('SELECT 1 FROM analysis_deliveries WHERE run_id=? LIMIT 1', (run_id,))
+            if not existing:
+                new_picks = await self.store.list_picks(run_id, include_hidden=True)
+                events = await self.store.unnotified_events()
+                tracking = len(await self.store.active_short_term_picks())
+                await self.store.queue_deliveries(run_id, channels, build_run_message(run, new_picks, events, tracking))
+                await self.store.mark_events_notified([e['id'] for e in events])
+            rows = await self.store.rows('SELECT * FROM analysis_deliveries WHERE run_id=? ORDER BY channel,part', (run_id,))
+            for delivery in rows:
+                if delivery['channel'] not in channels or not await self.store.claim_delivery(delivery['id'], force):
+                    continue
+                try:
+                    success = bool(await self.notifier.send_channel_text(delivery['channel'], delivery['body']))
+                except Exception:
+                    success = False
+                await self.store.delivery_result(delivery, success)
+            status = await self.store.update_push_status(run_id)
+            return {'success': status == 'success', 'status': status,
+                    'message': '所有渠道推送成功' if status == 'success' else '推送未全部成功，已保留失败状态，可配置渠道后重试'}
+
+    async def retry_pushes(self):
+        rows = await self.store.rows("SELECT id FROM analysis_runs WHERE push_requested=1 AND push_status IN ('pending','failed','partial') ORDER BY id DESC LIMIT 20")
+        for row in rows:
+            await self.push_run(row['id'], force=False)
 
     # ---- orchestration ----
     async def _result(self, run_id) -> dict:
