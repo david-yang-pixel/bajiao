@@ -175,3 +175,62 @@ async def test_missing_alpaca_config_raises_unavailable(svc_factory):
         await svc.run()
     with pytest.raises(ValueError):
         await svc_factory({}).run(top_n=6)
+
+
+@pytest.mark.asyncio
+async def test_reused_pick_rejected_when_price_already_below_stored_stop(svc_factory):
+    svc = svc_factory({})
+    run_id, _ = await svc.store.begin_run('seed')
+    stale = agent_pick('NVDA')
+    stale['stop_price'] = PRICE + 0.5 * ATR  # current price is already below the stored stop
+    stale['target_price'] = PRICE + 3 * ATR
+    stale['current_price'] = PRICE + 1.0 * ATR
+    sid = await svc.store.start_session(run_id, 'NVDA', 'pick')
+    await svc.store.finish_session(sid, 'ok', 'selected', PRICE + 0.5 * ATR, ATR,
+                                   {'decision': 'selected', 'pick': stale, 'tool_log': TOOL_LOG}, '')
+    await svc.store.finish_run(run_id, 'no_candidates', [], [], [], 'seed')
+    r = await svc.run(top_n=5)
+    assert svc.agent.calls == [] or all(c[0] != 'NVDA' for c in svc.agent.calls)
+    assert 'NVDA' not in [p['underlying_symbol'] for p in r['picks']]
+    run = await svc.store.get_run(r['run_id'])
+    assert any(d['symbol'] == 'NVDA' and d['decision'] == 'rejected_by_validation' for d in run['diagnostics'])
+
+
+@pytest.mark.asyncio
+async def test_cancelled_run_marked_failed_and_next_run_can_start(svc_factory):
+    import asyncio
+    svc = svc_factory({'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')})
+    started = asyncio.Event()
+
+    async def hang(symbol, token_symbol, purpose, context):
+        started.set()
+        await asyncio.sleep(60)
+    svc.agent.analyze = hang
+    task = asyncio.create_task(svc.run())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    runs = await svc.store.list_runs()
+    assert runs[0]['status'] == 'failed'
+    left = await svc.store.rows("SELECT status FROM agent_sessions WHERE status='running'")
+    assert left == []
+    svc.agent = FakeAgent({'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')})
+    assert (await svc.run())['status'] == 'completed'
+
+
+@pytest.mark.asyncio
+async def test_store_failure_for_one_symbol_keeps_other_symbol(svc_factory):
+    svc = svc_factory({'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')})
+    orig = svc.store.finish_session
+
+    async def flaky(sid, status, decision, *a, **k):
+        rows = await svc.store.rows('SELECT symbol FROM agent_sessions WHERE id=?', (sid,))
+        if rows[0]['symbol'] == 'NVDA':
+            raise RuntimeError('db down')
+        return await orig(sid, status, decision, *a, **k)
+    svc.store.finish_session = flaky
+    r = await svc.run()
+    assert r['status'] == 'partial' and [p['underlying_symbol'] for p in r['picks']] == ['TSLA']
+    run = await svc.store.get_run(r['run_id'])
+    assert any(e['symbol'] == 'NVDA' and e['stage'] == 'agent' for e in run['errors'])

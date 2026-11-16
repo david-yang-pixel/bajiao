@@ -154,19 +154,30 @@ class ShortTermService:
             errors, diagnostics, picks = [], [], []
             status, message = 'failed', 'AI 分析或数据未完成，本轮未产生新推荐'
             try:
-                picks, status, message = await self._analyze(run_id, top_n, errors, diagnostics)
-            except MarketDataUnavailable as exc:
-                errors.append({'symbol': '*', 'stage': 'data', 'message': str(exc)})
+                try:
+                    picks, status, message = await self._analyze(run_id, top_n, errors, diagnostics)
+                except MarketDataUnavailable as exc:
+                    errors.append({'symbol': '*', 'stage': 'data', 'message': str(exc)})
+                if picks:
+                    await self.store.insert_short_term_picks(run_id, picks)
+                await self.store.finish_run(run_id, status, [], errors, diagnostics, message)
+                await self.store.execute('UPDATE analysis_runs SET count=? WHERE id=?', (len(picks), run_id))
+            except asyncio.CancelledError:
+                await self._abort_run(run_id, [], '分析被中断，可稍后重新运行')
+                raise
             except Exception:
                 logger.exception('短线分析执行异常')
-                errors.append({'symbol': '*', 'stage': 'data', 'message': '分析执行异常，请检查数据与模型服务'})
-            if picks:
-                await self.store.insert_short_term_picks(run_id, picks)
-            await self.store.finish_run(run_id, status, [], errors, diagnostics, message)
-            await self.store.execute('UPDATE analysis_runs SET count=? WHERE id=?', (len(picks), run_id))
+                msg = '分析执行异常，请检查数据与模型服务'
+                await self._abort_run(run_id, [{'symbol': '*', 'stage': 'data', 'message': msg}], msg)
             if push_notifications:
                 await self.push_run(run_id)
             return await self._result(run_id)
+
+    async def _abort_run(self, run_id, errors, message):
+        await self.store.execute(
+            "UPDATE agent_sessions SET status='error',error='分析被中断',finished_at=? WHERE run_id=? AND status='running'",
+            (datetime.now(timezone.utc).isoformat(), run_id))
+        await self.store.finish_run(run_id, 'failed', [], errors, [], message)
 
     async def _analyze(self, run_id, top_n, errors, diagnostics):
         try:
@@ -202,7 +213,9 @@ class ShortTermService:
             if reused:
                 diagnostics.append({'symbol': sym, 'decision': 'reused',
                                     'reason': f"复用 {reused['finished_at']} 的分析结论（{reused['decision']}）"})
-                outcomes.append((cand, reused['result'].get('pick'), reused['result'].get('tool_log') or [],
+                stored = reused['result'].get('pick')
+                current = {**stored, 'current_price': factors[sym]['price']} if stored else None
+                outcomes.append((cand, current, reused['result'].get('tool_log') or [],
                                  reused['decision'] == 'selected'))
             elif used >= limit:
                 diagnostics.append({'symbol': sym, 'decision': 'quota_skip', 'reason': f'今日 AI 会话已达上限 {limit}'})
@@ -271,6 +284,15 @@ class ShortTermService:
         return last
 
     async def _agent_session(self, run_id, cand, f, pair):
+        sym = cand['symbol']
+        try:
+            return await self._agent_session_inner(run_id, cand, f, pair)
+        except Exception:
+            logger.exception('%s 会话记录或调用失败', sym)
+            from .agent_client import AgentResult
+            return AgentResult(status='error', error_code='session_failed', error_message='AI 分析会话执行失败')
+
+    async def _agent_session_inner(self, run_id, cand, f, pair):
         sym = cand['symbol']
         sid = await self.store.start_session(run_id, sym, 'pick')
         context = {'as_of': f['as_of'], 'reference_price_usd': f['price'], 'position': None}
