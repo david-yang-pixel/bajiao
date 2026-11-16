@@ -51,6 +51,15 @@ def expires_after(as_of: str, sessions: int = PICK_HORIZON_SESSIONS) -> str:
     return d.isoformat()
 
 
+def _health_problem(health: dict) -> str | None:
+    status, auth = health.get('status'), health.get('auth')
+    if status == 'ok' and auth == 'valid':
+        return None
+    if status == 'ok' and auth in ('missing', 'expired'):
+        return f"AI 分析服务不可用：{AGENT_ERRORS['auth_' + auth]}"
+    return f"AI 分析服务不可用：agent 服务状态 {status or '未知'}，登录状态 {auth or '未知'}"
+
+
 def _sources(pick: dict, tool_log: list[dict]) -> list[dict]:
     """Cited tool calls; the summary is what the tool actually returned (tool_log), not the model's wording."""
     by_id = {e.get('call_id'): e for e in tool_log}
@@ -69,6 +78,8 @@ class ShortTermService:
         self.universe = UniverseCache(binance)
         self._lock = asyncio.Lock()
         self._push_lock = asyncio.Lock()
+        # One limit for every agent call (run sessions and position reviews) = the agent's own MAX_CONCURRENT.
+        self._agent_sem = asyncio.Semaphore(AGENT_CONCURRENCY)
         self._bars: dict[str, list] = {}
         self._position_cache: dict[str, tuple[float, dict]] = {}
 
@@ -290,13 +301,14 @@ class ShortTermService:
             raise AnalysisUnavailable('今日 AI 分析额度已用完')
         position = {'buy_price_usdt': buy_price_usdt, 'quantity': quantity} if buy_price_usdt is not None or quantity is not None else None
         context = {'as_of': f['as_of'], 'reference_price_usd': f['price'], 'position': position}
-        sid = await self.store.start_session(None, under, 'position_review')
-        try:
-            res = await self.agent.analyze(under, pair.symbol, 'position_review', context)
-        except Exception:
-            logger.exception('持仓复核 agent 调用异常')
-            from .agent_client import AgentResult
-            res = AgentResult(status='error', error_code='exception', error_message='AI 分析调用异常')
+        async with self._agent_sem:
+            sid = await self.store.start_session(None, under, 'position_review')
+            try:
+                res = await self.agent.analyze(under, pair.symbol, 'position_review', context)
+            except Exception:
+                logger.exception('持仓复核 agent 调用异常')
+                from .agent_client import AgentResult
+                res = AgentResult(status='error', error_code='exception', error_message='AI 分析调用异常')
         message = '' if res.status == 'ok' else (AGENT_ERRORS.get(res.error_code) or res.error_message)
         await self.store.finish_session(
             sid, 'ok' if res.status == 'ok' else 'error', res.decision, f['price'], f['atr14'],
@@ -391,8 +403,7 @@ class ShortTermService:
         since = now.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
         used = await self.store.sessions_started_since(since)
         limit = self.session_limit
-        sem = asyncio.Semaphore(AGENT_CONCURRENCY)
-        outcomes, pending = [], []
+        outcomes, pending, quota_skipped = [], [], 0
         for cand in candidates:
             sym = cand['symbol']
             reused = await self._reusable(sym, factors[sym], now)
@@ -404,21 +415,31 @@ class ShortTermService:
                 outcomes.append((cand, current, reused['result'].get('tool_log') or [],
                                  reused['decision'] == 'selected'))
             elif used >= limit:
-                diagnostics.append({'symbol': sym, 'decision': 'quota_skip', 'reason': f'今日 AI 会话已达上限 {limit}'})
+                quota_skipped += 1
+                diagnostics.append({'symbol': sym, 'decision': 'quota_skip',
+                                    'reason': f'额度保护跳过：今日 AI 会话已达上限 {limit}'})
             else:
                 used += 1
                 pending.append(cand)
 
+        if candidates and quota_skipped == len(candidates):
+            return [], 'failed', f'今日 AI 会话已达上限 {limit}，本轮 {quota_skipped} 只候选全部额度保护跳过'
+        if pending:
+            problem = _health_problem(await self.agent.health())
+            if problem:  # start no session (and burn no quota) against an agent that cannot answer
+                errors.append({'symbol': '*', 'stage': 'agent', 'message': problem})
+                return [], 'failed', problem
+
         async def work(cand):
-            async with sem:
+            async with self._agent_sem:
                 return await self._agent_session(run_id, cand, factors[cand['symbol']], pairs[cand['symbol']])
         results = await asyncio.gather(*(work(c) for c in pending))
-        had_error = False
+        failures = []
         for cand, res in zip(pending, results):
             sym = cand['symbol']
             if res.status != 'ok':
-                had_error = True
-                errors.append({'symbol': sym, 'stage': 'agent', 'message': AGENT_ERRORS.get(res.error_code) or res.error_message})
+                failures.append(AGENT_ERRORS.get(res.error_code) or res.error_message)
+                errors.append({'symbol': sym, 'stage': 'agent', 'message': failures[-1]})
             elif res.decision == 'selected':
                 outcomes.append((cand, res.pick, res.tool_log, True))
             else:
@@ -433,7 +454,7 @@ class ShortTermService:
             try:
                 report = await self._validated_report(cand, pick or {}, tool_log, factors[sym], pairs[sym], diagnostics)
             except MarketDataUnavailable as exc:
-                had_error = True
+                failures.append(str(exc))
                 errors.append({'symbol': sym, 'stage': 'data', 'message': str(exc)})
                 continue
             if report:
@@ -444,9 +465,10 @@ class ShortTermService:
         for r in selected[top_n:]:
             diagnostics.append({'symbol': r['underlying_symbol'], 'decision': 'rejected', 'reason': f'盈亏比排名超出前 {top_n}'})
         picks = selected[:top_n]
-        if had_error:
+        if failures:
+            reason = '；'.join(dict.fromkeys(m for m in failures if m))[:200] or '原因未知'
             status, message = ('partial', f'部分 AI 分析未完成；保留 {len(picks)} 只已验证候选') if picks else \
-                ('failed', 'AI 分析或数据未完成，本轮未产生新推荐')
+                ('failed', f'AI 分析或数据未完成，本轮未产生新推荐：{reason}')
         elif picks:
             status, message = 'completed', f'完成短线分析，筛选出 {len(picks)} 只候选'
         else:

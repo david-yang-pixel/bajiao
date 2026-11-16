@@ -256,3 +256,26 @@ async def test_daily_schedule_explicitly_pushes_only_once(tmp_path, monkeypatch)
     assert len(notifier.sent) == count
     runs = await runner.store.list_runs()
     assert len(runs) == 1 and runs[0]['run_key'] == 'schedule:2026-10-02:21:30'
+
+
+@pytest.mark.asyncio
+async def test_scheduled_slot_with_fast_failing_agent_runs_once_and_reports_failure(tmp_path, monkeypatch):
+    from datetime import timedelta, timezone
+    from backend.app.services.short_term.agent_client import AgentResult
+    runner, notifier, path = await short_term_runner(tmp_path, monkeypatch)
+    err = AgentResult(status='error', error_code='auth_expired', error_message='x')
+    runner.agent.results = {'NVDA': err, 'TSLA': err}
+    async with aiosqlite.connect(path) as db:
+        await db.executemany('INSERT INTO system_configs (key,value) VALUES (?,?)', [
+            ('ai_picks_push_enabled','1'), ('ai_picks_schedule_times','21:30')])
+        await db.commit()
+    start = datetime(2026,10,2,13,31,tzinfo=timezone.utc)  # 21:31 Asia/Singapore
+    for minutes in range(0, 150, 10):  # ticks through the 3 h catch-up window, each past the 5-minute guard
+        await main.scheduled_analysis_tick(start + timedelta(minutes=minutes))
+        old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        await runner.store.execute('UPDATE analysis_runs SET finished_at=? WHERE finished_at IS NOT NULL', (old,))
+    runs = await runner.store.list_runs()
+    assert len(runs) == 1 and runs[0]['status'] == 'failed' and '凭据已过期' in runs[0]['message']
+    assert len(runner.agent.calls) == 2  # one attempt per candidate, no auto-retry of the slot
+    assert await runner.store.sessions_started_since('') == 2
+    assert len(notifier.sent) == 1 and '本轮分析未完成' in notifier.sent[0][1]

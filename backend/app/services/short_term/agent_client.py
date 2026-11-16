@@ -22,8 +22,14 @@ def _error(code: str, message: str) -> AgentResult:
     return AgentResult(status='error', error_code=code, error_message=message)
 
 
+# The agent ends every /analyze within its 300 s session deadline, counted from request start (MCP startup
+# included), plus a bounded MCP shutdown (agent/src/session.ts). 400 s leaves margin for HTTP/runtime overhead,
+# so a slow session is reported by the agent as "timeout" rather than cut off here.
+ANALYZE_TIMEOUT_S = 400.0
+
+
 class AgentClient:
-    def __init__(self, base_url: str, token_provider: Callable[[], str], timeout_s: float = 330.0):
+    def __init__(self, base_url: str, token_provider: Callable[[], str], timeout_s: float = ANALYZE_TIMEOUT_S):
         self.base_url = base_url.rstrip('/')
         self.token_provider = token_provider
         self.timeout_s = timeout_s

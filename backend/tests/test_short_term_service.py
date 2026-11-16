@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -61,6 +62,10 @@ class FakeAlpaca:
 class FakeAgent:
     def __init__(self, results):
         self.results, self.calls = results, []
+        self.health_state = {'status': 'ok', 'auth': 'valid'}
+
+    async def health(self):
+        return dict(self.health_state)
 
     async def analyze(self, symbol, token_symbol, purpose, context):
         self.calls.append((symbol, token_symbol, purpose, context))
@@ -143,7 +148,8 @@ async def test_daily_quota_skips_agent(svc_factory):
         await svc.store.start_session(run_id, 'AAPL', 'pick')
     await svc.store.finish_run(run_id, 'no_candidates', [], [], [], 'seed')
     r = await svc.run(top_n=5)
-    assert svc.agent.calls == [] and r['status'] == 'no_candidates'
+    # every candidate skipped by the quota guard is not a normal "no opportunity" round
+    assert svc.agent.calls == [] and r['status'] == 'failed' and '额度保护跳过' in r['message']
     run = await svc.store.get_run(r['run_id'])
     assert [d['decision'] for d in run['diagnostics']].count('quota_skip') == 2
 
@@ -236,3 +242,90 @@ async def test_store_failure_for_one_symbol_keeps_other_symbol(svc_factory):
     assert r['status'] == 'partial' and [p['underlying_symbol'] for p in r['picks']] == ['TSLA']
     run = await svc.store.get_run(r['run_id'])
     assert any(e['symbol'] == 'NVDA' and e['stage'] == 'agent' for e in run['errors'])
+
+
+async def _age_run(store, run_id, minutes=10):
+    """Pretend the run finished `minutes` ago (past the 5-minute re-claim guard)."""
+    ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    await store.execute('UPDATE analysis_runs SET finished_at=? WHERE id=?', (ts, run_id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('health, reason', [({'status': 'unreachable', 'auth': 'unknown'}, 'unreachable'),
+                                            ({'status': 'ok', 'auth': 'expired'}, '凭据已过期'),
+                                            ({'status': 'ok', 'auth': 'missing'}, '凭据缺失')])
+async def test_unhealthy_agent_fails_run_without_starting_sessions(svc_factory, health, reason):
+    svc = svc_factory({'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')})
+    svc.agent.health_state = health
+    r = await svc.run()
+    assert r['status'] == 'failed' and r['picks'] == []
+    assert r['message'].startswith('AI 分析服务不可用：') and reason in r['message']
+    assert svc.agent.calls == [] and await svc.store.rows('SELECT id FROM agent_sessions') == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_slot_failed_after_sessions_is_not_retried_and_keeps_quota(svc_factory):
+    err = AgentResult(status='error', error_code='model_error', error_message='模型调用失败：boom')
+    svc = svc_factory({'NVDA': err, 'TSLA': err})
+    key = 'schedule:2026-11-16:09:00'
+    first = await svc.run(push_notifications=False, run_key=key)
+    assert first['status'] == 'failed' and '模型调用失败' in first['message']
+    for _ in range(3):  # the 30 s scheduler keeps ticking through the 3 h catch-up window
+        await _age_run(svc.store, first['run_id'])
+        again = await svc.run(run_key=key)
+        assert again['run_id'] == first['run_id'] and again['status'] == 'failed'
+    assert len(svc.agent.calls) == 2
+    assert await svc.store.sessions_started_since('') == 2  # 22 of 24 left for the next slot
+    svc.agent.results = {'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')}
+    nxt = await svc.run(run_key='schedule:2026-11-16:21:00')
+    assert nxt['status'] == 'completed' and len(svc.agent.calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_scheduled_slot_failed_before_sessions_retries_and_pushes_new_result(svc_factory):
+    from backend.tests.test_short_term_tracking import FakeNotifier
+    svc = svc_factory({'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')})
+    svc.notifier = FakeNotifier()
+    svc.agent.health_state = {'status': 'unreachable', 'auth': 'unknown'}
+    key = 'schedule:2026-11-16:09:00'
+    first = await svc.run(push_notifications=True, run_key=key)
+    assert first['status'] == 'failed' and len(svc.notifier.sent) == 1
+    assert '本轮分析未完成：AI 分析服务不可用' in svc.notifier.sent[0][1]
+    await svc.run(push_notifications=True, run_key=key)  # within 5 minutes: not re-claimed
+    assert len(svc.notifier.sent) == 1
+    svc.agent.health_state = {'status': 'ok', 'auth': 'valid'}
+    await _age_run(svc.store, first['run_id'])
+    retry = await svc.run(push_notifications=True, run_key=key)
+    assert retry['run_id'] == first['run_id'] and retry['status'] == 'completed' and retry['count'] == 2
+    assert len(svc.notifier.sent) == 2 and '本轮新增 2 只' in svc.notifier.sent[1][1]
+    assert (await svc.store.get_run(first['run_id']))['push_status'] == 'success'
+
+
+@pytest.mark.asyncio
+async def test_position_review_shares_agent_concurrency_limit_with_runs(svc_factory, monkeypatch):
+    monkeypatch.setattr(svc_mod, 'AGENT_CONCURRENCY', 2)
+    svc = svc_factory({'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')})
+    release, full = asyncio.Event(), asyncio.Event()
+    state = {'inflight': 0, 'peak': 0}
+    orig = svc.agent.analyze
+
+    async def analyze(symbol, token_symbol, purpose, context):
+        state['inflight'] += 1
+        state['peak'] = max(state['peak'], state['inflight'])
+        if state['inflight'] >= 2:
+            full.set()
+        try:
+            await release.wait()
+            return await orig(symbol, token_symbol, purpose, context)
+        finally:
+            state['inflight'] -= 1
+    svc.agent.analyze = analyze
+    run_task = asyncio.create_task(svc.run())
+    await asyncio.wait_for(full.wait(), 2)
+    review_task = asyncio.create_task(svc.analyze_position('NVDAUSDT'))
+    await asyncio.sleep(0.05)
+    assert state['peak'] == 2  # the review waits for a free agent slot instead of hitting the agent's 429
+    release.set()
+    await run_task
+    await asyncio.gather(review_task, return_exceptions=True)
+    assert state['peak'] == 2 and len(svc.agent.calls) == 3

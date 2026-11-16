@@ -245,3 +245,19 @@ async def test_push_run_without_channels_keeps_events_unnotified(factory):
     res = await svc.push_run(run_id)
     assert res == {'success': False, 'status': 'failed', 'message': '未配置推送渠道'}
     assert [r['notified'] for r in await svc.store.rows('SELECT notified FROM pick_events')] == [0]
+
+
+def test_failed_or_partial_run_message_says_analysis_did_not_finish():
+    head = build_run_message({'id': 1, 'status': 'failed', 'message': 'AI 分析服务不可用：x'}, [], [], 3)[0]
+    assert head.splitlines()[0] == '【短线精选 · 1周】本轮分析未完成：AI 分析服务不可用：x'
+    assert '3 只跟踪中' in head and '本轮无新增' not in head
+    text = '\n'.join(build_run_message({'id': 2, 'status': 'partial', 'message': '部分 AI 分析未完成'}, [report()], [], 1))
+    assert text.startswith('【短线精选 · 1周】本轮分析未完成：部分 AI 分析未完成') and 'NVDA / NVDAUSDT' in text
+    ok = build_run_message({'id': 3, 'status': 'no_candidates', 'message': '不凑数'}, [], [], 0)[0]
+    assert ok.startswith('【短线精选 · 1周】本轮无新增')
+
+
+def test_run_message_lists_highest_reward_risk_first():
+    low, high = {**report('AAA'), 'reward_risk': 1.6}, {**report('BBB'), 'reward_risk': 2.5}
+    text = '\n'.join(build_run_message({'id': 1, 'status': 'completed'}, [low, high], [], 2))
+    assert text.index('BBB / BBBUSDT') < text.index('AAA / AAAUSDT')

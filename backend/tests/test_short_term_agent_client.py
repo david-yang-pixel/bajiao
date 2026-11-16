@@ -86,3 +86,8 @@ async def test_health(monkeypatch):
     assert await client().health() == {'status': 'unreachable', 'auth': 'unknown'}
     monkeypatch.setattr(httpx.AsyncClient, 'get', non200)
     assert await client().health() == {'status': 'unreachable', 'auth': 'unknown'}
+
+
+def test_default_timeout_exceeds_agent_session_deadline():
+    # agent deadline: 300 s from request start (MCP startup included) + bounded MCP close; see agent/src/session.ts
+    assert AgentClient('http://agent', lambda: 't').timeout_s >= 400

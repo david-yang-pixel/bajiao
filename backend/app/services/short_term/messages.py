@@ -41,7 +41,12 @@ def _event_line(e: dict) -> str:
 
 
 def build_run_message(run: dict, new_picks: list[dict], events: list[dict], tracking_count: int) -> list[str]:
-    if not new_picks and not events:
+    new_picks = sorted(new_picks, key=lambda p: -(p.get('reward_risk') or 0))
+    if run.get('status') in ('failed', 'partial'):
+        # Distinguish "the analysis did not run/finish" from "no opportunity this round".
+        head = (f"【短线精选 · 1周】本轮分析未完成：{run.get('message') or '原因未知'}\n"
+                f'本轮新增 {len(new_picks)} 只，{tracking_count} 只跟踪中')
+    elif not new_picks and not events:
         head = f'【短线精选 · 1周】本轮无新增，{tracking_count} 只跟踪中'
     else:
         head = f'【短线精选 · 1周】本轮新增 {len(new_picks)} 只，{tracking_count} 只跟踪中'
