@@ -214,5 +214,6 @@ class AnalysisStore:
         return status
 
     async def list_reviews(self):
-        return await self.rows('''SELECT r.*,p.symbol,json_extract(p.report_json,'$.underlying_symbol') AS underlying_symbol
+        return await self.rows('''SELECT r.*,p.symbol,json_extract(p.report_json,'$.underlying_symbol') AS underlying_symbol,
+            json_extract(p.report_json,'$.as_of') AS pick_as_of
             FROM analysis_reviews r JOIN daily_picks p ON p.id=r.pick_id ORDER BY r.id DESC LIMIT 200''')
