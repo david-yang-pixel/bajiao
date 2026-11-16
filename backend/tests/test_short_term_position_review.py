@@ -34,7 +34,7 @@ async def test_review_returns_report_with_token_prices(svc_factory):
     assert r['price_basis'] == '正股 USD（USDT 为按比例换算参考）'
     assert r['target_price'] == r['token_target_usdt'] and r['stop_loss_price'] == r['token_stop_usdt']
     assert r['token_target_usdt'] > r['token_stop_usdt'] and r['current_price_usd'] == PRICE
-    assert r['sources'][1]['url'] == 'http://n/1'
+    assert r['sources'][1]['url'] == 'http://n/1' and r['sources'][1]['summary'] == '财报超预期 http://n/1'
     sym, tok, purpose, ctx = svc.agent.calls[0]
     assert (sym, tok, purpose) == ('NVDA', 'NVDABUSDT', 'position_review')
     assert ctx['position'] == {'buy_price_usdt': 90.0, 'quantity': 2.0} and ctx['reference_price_usd'] == PRICE
@@ -77,3 +77,23 @@ async def test_agent_error_and_validation_failure(svc_factory):
     with pytest.raises(AnalysisUnavailable, match='view'):
         await svc.analyze_position('NVDABUSDT')
     assert svc._position_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_insufficient_history_raises_unavailable_without_session(svc_factory):
+    from tests.test_short_term_service import make_bars
+
+    class ShortAlpaca:
+        configured, last_errors = True, {}
+
+        async def get_daily_bars(self, symbols, days=150):
+            return {s: make_bars(20) for s in symbols}
+
+        async def get_latest_price(self, symbol):
+            return PRICE
+    svc = svc_factory({'NVDA': review()}, alpaca=ShortAlpaca())
+    svc.universe = Universe()
+    with pytest.raises(AnalysisUnavailable, match='该标的历史数据不足，暂无法分析'):
+        await svc.analyze_position('NVDABUSDT')
+    assert svc.agent.calls == []
+    assert await svc.store.rows('SELECT id FROM agent_sessions') == []

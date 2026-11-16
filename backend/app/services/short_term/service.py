@@ -51,6 +51,13 @@ def expires_after(as_of: str, sessions: int = PICK_HORIZON_SESSIONS) -> str:
     return d.isoformat()
 
 
+def _sources(pick: dict, tool_log: list[dict]) -> list[dict]:
+    """Cited tool calls; the summary is what the tool actually returned (tool_log), not the model's wording."""
+    by_id = {e.get('call_id'): e for e in tool_log}
+    return [{'call_id': c['call_id'], 'tool': by_id[c['call_id']].get('tool'), 'url': c.get('url'),
+             'summary': by_id[c['call_id']].get('summary') or ''} for c in pick['citations']]
+
+
 class ShortTermService:
     session_limit = DAILY_SESSION_LIMIT
 
@@ -276,6 +283,8 @@ class ShortTermService:
             quote = await self.token_quote_for(under)
         except (LookupError, MarketDataUnavailable) as exc:
             raise AnalysisUnavailable(str(exc))
+        if f.get('insufficient_history'):
+            raise AnalysisUnavailable('该标的历史数据不足，暂无法分析')
         since = self.now().astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
         if await self.store.sessions_started_since(since) >= self.session_limit:
             raise AnalysisUnavailable('今日 AI 分析额度已用完')
@@ -300,9 +309,7 @@ class ShortTermService:
         if errs:
             raise AnalysisUnavailable('AI 持仓复核未通过校验：' + '；'.join(errs))
         cur, tgt, stop = pick['current_price'], pick.get('target_price'), pick.get('stop_price')
-        by_id = {e.get('call_id'): e for e in res.tool_log}
-        sources = [{'call_id': c['call_id'], 'tool': by_id[c['call_id']].get('tool'), 'url': c.get('url'),
-                    'summary': c.get('summary')} for c in pick['citations']]
+        sources = _sources(pick, res.tool_log)
         tokens = to_token_prices(quote['mid_usdt'], cur, tgt, stop)
         report = {
             'symbol': pair.symbol, 'underlying_symbol': under, 'as_of': f['as_of'], 'view': pick['view'],
@@ -496,9 +503,7 @@ class ShortTermService:
             diagnostics.append({'symbol': sym, 'decision': 'rejected_by_validation', 'reason': '；'.join(errs)})
             return None
         cur, tgt, stop = pick['current_price'], pick['target_price'], pick['stop_price']
-        by_id = {e.get('call_id'): e for e in tool_log}
-        sources = [{'call_id': c['call_id'], 'tool': by_id[c['call_id']].get('tool'), 'url': c.get('url'),
-                    'summary': c.get('summary')} for c in pick['citations']]
+        sources = _sources(pick, tool_log)
         r = f.get('returns') or {}
         highlights = {'return_5d_pct': r.get('5d'), 'rsi14': f.get('rsi14'), 'volume_ratio': f.get('volume_ratio'),
                       'breakout_20d': f.get('breakout_20d'), 'ma_aligned': f.get('ma_aligned'),

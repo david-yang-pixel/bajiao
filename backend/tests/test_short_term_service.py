@@ -25,8 +25,9 @@ def make_bars(n=80):
 BARS = make_bars()
 FACTORS = compute_factors(BARS, {'SPY': BARS, 'QQQ': BARS}, None)
 PRICE, ATR = FACTORS['price'], FACTORS['atr14']
-TOOL_LOG = [{'call_id': 'c1', 'tool': 'get_factors', 'urls': []},
-            {'call_id': 'c2', 'tool': 'get_news', 'urls': ['http://n/1']}]
+TOOL_LOG = [{'call_id': 'c1', 'tool': 'get_factors', 'urls': [], 'summary': '{"price": 139.5}', 'is_error': False},
+            {'call_id': 'c2', 'tool': 'get_news', 'urls': ['http://n/1'], 'summary': '财报超预期 http://n/1',
+             'is_error': False}]
 
 
 def agent_pick(symbol, target_mult=2.0):
@@ -100,7 +101,8 @@ async def test_run_selects_validated_pick_and_ranks_by_reward_risk(svc_factory):
     assert p['strategy'] == 'short_term_1w' and p['analysis_mode'] == 'pi_agent'
     assert p['target_price'] == p['target_price_usd'] and p['reward_risk'] == pytest.approx(2.4)
     assert p['token_target_usdt'] > p['token_price_usdt'] > p['token_stop_usdt']
-    assert p['sources'][1] == {'call_id': 'c2', 'tool': 'get_news', 'url': 'http://n/1', 'summary': '新闻'}
+    # summary comes from the tool_log entry (what the tool returned), not from the model's citation text
+    assert p['sources'][1] == {'call_id': 'c2', 'tool': 'get_news', 'url': 'http://n/1', 'summary': '财报超预期 http://n/1'}
     assert p['expires_after'] > p['as_of'] and p['track_status'] == 'active'
     run = await svc.store.get_run(r['run_id'])
     assert run['count'] == 1

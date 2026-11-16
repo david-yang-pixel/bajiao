@@ -93,3 +93,51 @@ def test_non_numeric_or_non_positive_current_price_rejected():
             any('缺少必填' in e for e in run({**GOOD, 'current_price': bad}))
     assert any('现价必须为正数' in e for e in run({**GOOD, 'current_price': '100'}))
     assert any('现价必须为正数' in e for e in run({**GOOD, 'current_price': -5}))
+
+
+# Real tool names the agent exposes (prefix + name), copied from agent/src/mcpBridge.ts
+# (OPENBB_ALLOWED_TOOLS -> "openbb_*", ALPACA_ALLOWED_TOOLS -> "alpaca_*") and agent/src/internalTools.ts.
+# Keep in sync when those allowlists change. True = counts as a news/event source.
+EXPOSED_TOOLS = {
+    'openbb_equity_estimates_price_target': True,
+    'openbb_equity_estimates_consensus': True,
+    'openbb_yfinance_estimates_recommendations': True,
+    'openbb_equity_calendar_earnings': True,
+    'openbb_yfinance_company_calendar': True,
+    'openbb_equity_fundamental_historical_eps': False,
+    'openbb_derivatives_options_chains': False,
+    'openbb_index_price_historical': False,
+    'openbb_equity_fundamental_filings': True,
+    'openbb_equity_ownership_insider_trading': True,
+    'openbb_economy_calendar': True,
+    **dict.fromkeys(('alpaca_get_stock_bars', 'alpaca_get_stock_quotes', 'alpaca_get_stock_trades',
+                     'alpaca_get_stock_latest_bar', 'alpaca_get_stock_latest_quote', 'alpaca_get_stock_latest_trade',
+                     'alpaca_get_stock_snapshot', 'alpaca_get_option_bars', 'alpaca_get_option_trades',
+                     'alpaca_get_option_latest_trade', 'alpaca_get_option_latest_quote', 'alpaca_get_option_snapshot',
+                     'alpaca_get_option_chain', 'alpaca_get_option_exchange_codes', 'alpaca_get_market_movers',
+                     'alpaca_get_most_active_stocks'), False),
+    'alpaca_get_news': True,
+    **dict.fromkeys(('get_factors', 'get_token_quote', 'get_crypto_context', 'get_market_context'), False),
+}
+
+
+def test_news_markers_over_real_exposed_tool_names():
+    from backend.app.services.short_term.validation import is_news_tool
+    assert {name: is_news_tool(name) for name in EXPOSED_TOOLS} == EXPOSED_TOOLS
+
+
+def test_rating_tool_citation_satisfies_news_requirement():
+    log = [LOG[0], {'call_id': 'c2', 'tool': 'openbb_equity_estimates_price_target', 'urls': []}]
+    pick = {**GOOD, 'citations': [{'call_id': 'c1'}, {'call_id': 'c2'}]}
+    assert validate_pick(pick, log, symbol='NVDA', reference_price_usd=100.5, atr14=3.0, token_quote=Q,
+                         purpose='pick') == []
+
+
+def test_errored_tool_calls_do_not_satisfy_citation_requirements():
+    log = [{**LOG[0], 'is_error': True}, {**LOG[1], 'is_error': True}]
+    errs = validate_pick(GOOD, log, symbol='NVDA', reference_price_usd=100.5, atr14=3.0, token_quote=Q,
+                         purpose='pick')
+    assert any('get_factors' in e for e in errs) and any('新闻' in e for e in errs)
+    ok = [{**LOG[0], 'is_error': False}, {**LOG[1], 'is_error': False}]
+    assert validate_pick(GOOD, ok, symbol='NVDA', reference_price_usd=100.5, atr14=3.0, token_quote=Q,
+                         purpose='pick') == []

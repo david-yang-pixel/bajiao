@@ -349,3 +349,17 @@ async def test_successful_history_survives_restart(tmp_path, alert_type):
     assert await restarted.check_single_position(pos) == []
     notify.send_position_alert.assert_awaited_once()
     assert await statuses(monitor) == ["success"]
+
+
+@pytest.mark.asyncio
+async def test_supplement_prints_placeholder_for_missing_levels(tmp_path):
+    monitor, pos, notify = await make_monitor(tmp_path, include_ai_analysis=True)
+    monitor.get_symbol_trend_analysis = AsyncMock(return_value={
+        "view": "hold", "reason": "r", "target_price": None, "stop_loss_price": None})
+    try:
+        await asyncio.wait_for(monitor.check_single_position(pos), .5)
+        await asyncio.gather(*monitor._supplement_tasks.values())
+        text = notify.send_text.await_args.args[0]
+        assert "None" not in text and "研判目标价: -- | 防守止损价: --" in text
+    finally:
+        await monitor.close()

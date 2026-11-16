@@ -321,8 +321,8 @@ class PositionMonitor:
                 f"风险提醒时现价 ${curr_price:.2f}\n"
                 f"分析价格基准: {analysis.get('price_basis') or 'Binance 代币报价（非正股报价）'}\n"
                 f"分析理由 (reason): {analysis.get('reason') or '暂无'}\n"
-                f"研判目标价: {analysis.get('target_price', '--')} | "
-                f"防守止损价: {analysis.get('stop_loss_price', '--')}\n"
+                f"研判目标价: {analysis.get('target_price') or '--'} | "
+                f"防守止损价: {analysis.get('stop_loss_price') or '--'}\n"
                 "补充分析不改变已发送的风险提醒。"
             )
             # Re-read authoritative state after AI completes, not the scan snapshot.

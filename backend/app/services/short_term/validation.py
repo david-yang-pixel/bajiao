@@ -3,12 +3,17 @@ from .constants import (MAX_STOP_ATR_MULT, MAX_TARGET_ATR_MULT, MIN_REWARD_RISK,
                         PRICE_TOLERANCE)
 
 REQUIRED = ('symbol', 'decision', 'current_price', 'rationale', 'invalidation', 'risks', 'citations')
-NEWS_MARKERS = ('news', 'grade', 'earning', 'calendar', 'filing', 'insider')
+# News / event sources: news, analyst ratings & price targets, earnings & release calendars, SEC filings, insiders.
+NEWS_MARKERS = ('news', 'grade', 'estimates', 'recommend', 'price_target', 'earning', 'calendar', 'filing', 'insider')
 VIEWS = {'hold', 'reduce', 'exit'}
 
 
 def _num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def is_news_tool(name: str) -> bool:
+    return any(m in name for m in NEWS_MARKERS)
 
 
 def _check_citations(pick, tool_log, purpose, errs):
@@ -19,12 +24,13 @@ def _check_citations(pick, tool_log, purpose, errs):
         if entry is None:
             errs.append(f"引用的工具调用不存在：{c.get('call_id') if isinstance(c, dict) else c}")
             continue
-        tools.add(str(entry.get('tool') or ''))
+        if not entry.get('is_error'):  # a failed call is not evidence
+            tools.add(str(entry.get('tool') or ''))
         if c.get('url') and c['url'] not in (entry.get('urls') or []):
             errs.append(f"引用链接不在对应工具调用返回中：{c['url']}")
     if 'get_factors' not in tools:
         errs.append('至少需要引用一次 get_factors 的结果')
-    if purpose == 'pick' and not any(m in t for t in tools for m in NEWS_MARKERS):
+    if purpose == 'pick' and not any(is_news_tool(t) for t in tools):
         errs.append('至少需要引用一次新闻/事件类工具的结果')
 
 
