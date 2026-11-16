@@ -16,6 +16,9 @@ from backend.app.services.analysis_agent import AnalysisAgent
 logger = logging.getLogger(__name__)
 
 
+VIEW_LABELS = {'hold': '持有', 'reduce': '减仓', 'exit': '离场'}
+
+
 class PositionMonitor:
     """Price-risk alerts first; optional 2–4 week AI supplements run separately."""
 
@@ -310,8 +313,9 @@ class PositionMonitor:
             if not analysis or self._closed:
                 return
             content = (
-                f"AI 波段分析补充 | Binance 标的: {symbol}\n"
-                f"持有周期: 2–4 周 (2–4 weeks)\n"
+                f"AI 持仓复核 | Binance 标的: {symbol}\n"
+                f"持有周期: 1 周以内\n"
+                f"观点: {VIEW_LABELS.get(analysis.get('view'), '暂无')}\n"
                 f"提醒原因: {note}\n"
                 f"价格基准 (price basis): Binance 代币报价；买入成本 ${buy_price:.2f}；"
                 f"风险提醒时现价 ${curr_price:.2f}\n"

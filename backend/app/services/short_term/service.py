@@ -1,6 +1,7 @@
 """Orchestration of the 1-week short-term pick workflow (prescreen -> pi agent -> hard validation)."""
 import asyncio
 import logging
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -37,6 +38,8 @@ AGENT_ERRORS = {
     'no_submission': 'AI 未提交结论',
 }
 TZ = ZoneInfo(SCHEDULE_TZ)
+POSITION_CACHE_TTL = 600
+POSITION_PRICE_BASIS = '正股 USD（USDT 为按比例换算参考）'
 
 
 def expires_after(as_of: str, sessions: int = PICK_HORIZON_SESSIONS) -> str:
@@ -60,6 +63,7 @@ class ShortTermService:
         self._lock = asyncio.Lock()
         self._push_lock = asyncio.Lock()
         self._bars: dict[str, list] = {}
+        self._position_cache: dict[str, tuple[float, dict]] = {}
 
     @property
     def is_running(self) -> bool:
@@ -256,6 +260,58 @@ class ShortTermService:
         rows = await self.store.rows("SELECT id FROM analysis_runs WHERE push_requested=1 AND push_status IN ('pending','failed','partial') ORDER BY id DESC LIMIT 20")
         for row in rows:
             await self.push_run(row['id'], force=False)
+
+    # ---- position review ----
+    async def analyze_position(self, symbol: str, buy_price_usdt: float | None = None,
+                               quantity: float | None = None) -> dict | None:
+        cached = self._position_cache.get(symbol)
+        if cached and time.monotonic() - cached[0] < POSITION_CACHE_TTL:
+            return cached[1]
+        pair = next((p for p in (await self._pairs()).values() if p.symbol == symbol), None)
+        if pair is None:
+            raise AnalysisUnavailable('该持仓不在币安美股代币现货标的池内')
+        under = pair.underlying
+        try:
+            f = await self.factors_for(under)
+            quote = await self.token_quote_for(under)
+        except (LookupError, MarketDataUnavailable) as exc:
+            raise AnalysisUnavailable(str(exc))
+        since = self.now().astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+        if await self.store.sessions_started_since(since) >= self.session_limit:
+            raise AnalysisUnavailable('今日 AI 分析额度已用完')
+        position = {'buy_price_usdt': buy_price_usdt, 'quantity': quantity} if buy_price_usdt is not None or quantity is not None else None
+        context = {'as_of': f['as_of'], 'reference_price_usd': f['price'], 'position': position}
+        sid = await self.store.start_session(None, under, 'position_review')
+        try:
+            res = await self.agent.analyze(under, pair.symbol, 'position_review', context)
+        except Exception:
+            logger.exception('持仓复核 agent 调用异常')
+            from .agent_client import AgentResult
+            res = AgentResult(status='error', error_code='exception', error_message='AI 分析调用异常')
+        message = '' if res.status == 'ok' else (AGENT_ERRORS.get(res.error_code) or res.error_message)
+        await self.store.finish_session(
+            sid, 'ok' if res.status == 'ok' else 'error', res.decision, f['price'], f['atr14'],
+            {'decision': res.decision, 'pick': res.pick, 'tool_log': res.tool_log}, message)
+        if res.status != 'ok':
+            raise AnalysisUnavailable(message or 'AI 分析未完成')
+        pick = res.pick or {}
+        errs = validate_pick(pick, res.tool_log, symbol=under, reference_price_usd=f['price'], atr14=f['atr14'],
+                             token_quote=quote, purpose='position_review')
+        if errs:
+            raise AnalysisUnavailable('AI 持仓复核未通过校验：' + '；'.join(errs))
+        cur, tgt, stop = pick['current_price'], pick.get('target_price'), pick.get('stop_price')
+        by_id = {e.get('call_id'): e for e in res.tool_log}
+        sources = [{'call_id': c['call_id'], 'tool': by_id[c['call_id']].get('tool'), 'url': c.get('url'),
+                    'summary': c.get('summary')} for c in pick['citations']]
+        tokens = to_token_prices(quote['mid_usdt'], cur, tgt, stop)
+        report = {
+            'symbol': pair.symbol, 'underlying_symbol': under, 'as_of': f['as_of'], 'view': pick['view'],
+            'reason': pick['rationale'], 'invalidation': pick['invalidation'], 'risks': pick['risks'],
+            'sources': sources, 'current_price_usd': cur, 'target_price_usd': tgt, 'stop_price_usd': stop,
+            **tokens, 'price_basis': POSITION_PRICE_BASIS, 'target_price': tokens['token_target_usdt'],
+            'stop_loss_price': tokens['token_stop_usdt'], 'analysis_mode': 'pi_agent'}
+        self._position_cache[symbol] = (time.monotonic(), report)
+        return report
 
     # ---- orchestration ----
     async def _result(self, run_id) -> dict:

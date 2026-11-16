@@ -92,7 +92,7 @@ async def test_risk_alert_precedes_blocked_ai(tmp_path, alert_type):
         assert notify.send_position_alert.await_count == 1
         started.set()
         await release.wait()
-        return {"reason": "trend reason", "target_price": 130, "stop_loss_price": 95,
+        return {"view": "reduce", "reason": "trend reason", "target_price": 130, "stop_loss_price": 95,
                 "price_basis": "Binance token price"}
 
     async def send_text(content):
@@ -110,7 +110,7 @@ async def test_risk_alert_precedes_blocked_ai(tmp_path, alert_type):
         release.set()
         await asyncio.wait_for(sent.wait(), .5)
         content = notify.send_text.call_args.args[0]
-        for label in ("NVDABUSDT", "2–4", "trend reason", "Binance", "130", "95"):
+        for label in ("NVDABUSDT", "1 周以内", "AI 持仓复核", "观点: 减仓", "trend reason", "Binance", "130", "95"):
             assert label in content
     finally:
         release.set()
