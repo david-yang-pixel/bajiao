@@ -67,14 +67,26 @@ class SystemConfigSchema(BaseModel):
     feishu_app_secret: Optional[str] = None
     wecom_webhook_url: Optional[str] = None
     ai_picks_push_enabled: Optional[bool] = None
-    ai_picks_push_time: Optional[str] = Field(default=None, pattern=r'^(?:[01]\d|2[0-3]):[0-5]\d$')
     default_check_interval_hours: Optional[float] = Field(default=None, ge=0, le=168, allow_inf_nan=False)
     default_include_ai_analysis: Optional[bool] = None
-    fmp_api_key: Optional[SecretStr] = None
-    analysis_top_n: Optional[int] = Field(default=None, ge=3, le=5)
-    analysis_min_score: Optional[int] = Field(default=None, ge=40, le=100)
-    earnings_blackout_days: Optional[int] = Field(default=None, ge=0, le=14)
+    alpaca_api_key: Optional[SecretStr] = None
+    alpaca_secret_key: Optional[SecretStr] = None
+    fred_api_key: Optional[SecretStr] = None
+    agent_model: Optional[str] = Field(default=None, max_length=100)
+    ai_picks_schedule_times: Optional[str] = None
     ai_picks_push_timezone: Optional[str] = None
+    analysis_top_n: Optional[int] = Field(default=None, ge=1, le=5)
+    agent_daily_session_limit: Optional[int] = Field(default=None, ge=1, le=100)
+
+    @field_validator('ai_picks_schedule_times')
+    @classmethod
+    def valid_schedule_times(cls, value):
+        if value is None:
+            return value
+        items = [item.strip() for item in value.split(',') if item.strip()]
+        if not items or not all(re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', item) for item in items):
+            raise ValueError('运行时间格式应为 HH:MM，多个时间用逗号分隔')
+        return ','.join(sorted(set(items)))
 
     @field_validator('ai_picks_push_timezone')
     @classmethod

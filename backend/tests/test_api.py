@@ -18,14 +18,19 @@ async def test_health_check(monkeypatch):
         assert res.json() == {"status": "ok", "service": "binance-bstocks-bot", "revision": "fixture-revision"}
 
 @pytest.mark.asyncio
-async def test_symbols_endpoint():
+async def test_symbols_endpoint_falls_back_to_builtin_list(monkeypatch):
+    from backend.app.services.short_term.universe import MarketDataUnavailable
+
+    async def unavailable(force=False):
+        raise MarketDataUnavailable('币安标的池读取失败，且无可用缓存')
+    monkeypatch.setattr(main.short_term.universe, 'get', unavailable)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         res = await ac.get("/api/bstocks/symbols")
         assert res.status_code == 200
         data = res.json()
-        assert "symbols" in data
-        assert "NVDABUSDT" in data["symbols"]
+        assert data["fallback"] is True
+        assert {"symbol": "NVDABUSDT", "underlying_symbol": "NVDA"} in data["symbols"]
 
 @pytest.mark.asyncio
 async def test_positions_crud(tmp_path, monkeypatch):
@@ -296,12 +301,12 @@ async def test_system_config_ai_picks_push_schedule(tmp_path, monkeypatch):
         cfg_res = await ac.get("/api/config")
         assert cfg_res.status_code == 200
         assert cfg_res.json()["ai_picks_push_enabled"] is False
-        assert cfg_res.json()["ai_picks_push_time"] == "21:30"
+        assert cfg_res.json()["ai_picks_schedule_times"] == "09:00,21:00"
 
         # Update schedule config
         save_res = await ac.post("/api/config", json={
             "ai_picks_push_enabled": True,
-            "ai_picks_push_time": "21:20"
+            "ai_picks_schedule_times": "21:20,08:45"
         })
         assert save_res.status_code == 200
 
@@ -309,7 +314,7 @@ async def test_system_config_ai_picks_push_schedule(tmp_path, monkeypatch):
         cfg_res2 = await ac.get("/api/config")
         assert cfg_res2.status_code == 200
         assert cfg_res2.json()["ai_picks_push_enabled"] is True
-        assert cfg_res2.json()["ai_picks_push_time"] == "21:20"
+        assert cfg_res2.json()["ai_picks_schedule_times"] == "08:45,21:20"
 
 @pytest.mark.asyncio
 async def test_feishu_events_endpoint(tmp_path, monkeypatch):

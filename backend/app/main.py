@@ -9,6 +9,7 @@ import hmac
 import math
 import logging
 import os
+import tempfile
 import time
 from typing import Any, Dict, List
 import aiosqlite
@@ -31,16 +32,23 @@ from backend.app.models.schemas import (
     TestConnectionRequest,
     BinanceCredentialsUpdate,
 )
-from backend.app.services.binance_client import BinanceAccountError, BinanceClient, is_equity_asset, position_market
+from backend.app.services.binance_client import (BinanceAccountError, BinanceClient, SUPPORTED_BSTOCKS,
+                                                 is_equity_asset, position_market)
 from backend.app.services.quant_screener import QuantScreener
 from backend.app.services.analysis_agent import AnalysisAgent
 from backend.app.services.notification import NotificationService
 from backend.app.services.position_monitor import PositionMonitor
 from backend.app.services.feishu_bot_service import FeishuBotService
-from backend.app.services.us_market_data import USMarketData, MarketDataError
-from backend.app.services.swing_analysis import SwingAnalysisService, AnalysisUnavailable, AnalysisBusy
-from backend.app.services.swing_screener import STOCK_UNIVERSE, HORIZON
-from backend.app.services.analysis_skills import skill_metadata
+from backend.app.services.analysis_errors import AnalysisUnavailable, AnalysisBusy
+from backend.app.services.analysis_store import AnalysisStore
+from backend.app.services.short_term.agent_client import AgentClient
+from backend.app.services.short_term.agent_token import get_or_create_token
+from backend.app.services.short_term.alpaca_data import AlpacaData
+from backend.app.services.short_term.constants import (DAILY_SESSION_LIMIT, SCHEDULE_CATCHUP_HOURS, SCHEDULE_TIMES,
+                                                       SCHEDULE_TZ)
+from backend.app.services.short_term.internal_api import InternalDeps, build_internal_router
+from backend.app.services.short_term.service import ShortTermService
+from backend.app.services.short_term.universe import MarketDataUnavailable
 
 logging.basicConfig(level=logging.INFO)
 # HTTPX logs signed request URLs at INFO, including short-lived signatures.
@@ -64,11 +72,35 @@ feishu_bot_service = FeishuBotService(
     analysis_agent=analysis_agent,
     position_monitor=position_monitor
 )
-us_market_data = USMarketData()
-swing_service = SwingAnalysisService(us_market_data, analysis_agent, notification_service)
-position_monitor.trend_provider = swing_service.analyze_position
+
+# Short-term (1 week) picks: the pi agent container does the research, this process validates and stores.
+def _agent_token() -> str:
+    return get_or_create_token(settings.AGENT_DATA_DIR)
+
+
+# Data keys handed to the agent per session via /internal/agent-config; refreshed on every config reload.
+_agent_runtime = {'alpaca_api_key': '', 'alpaca_secret_key': '', 'fred_api_key': '', 'model': ''}
+
+
+async def _agent_config() -> dict:
+    return dict(_agent_runtime)
+
+
+analysis_store = AnalysisStore()
+alpaca_data = AlpacaData()
+agent_client = AgentClient(settings.AGENT_URL, _agent_token)
+short_term = ShortTermService(binance_client, alpaca_data, agent_client, notification_service, analysis_store,
+                              config_provider=_agent_config)
+position_monitor.trend_provider = short_term.analyze_position
 
 _runtime_config_lock = asyncio.Lock()
+
+
+def _int_config(cfg: dict, key: str, default: int) -> int:
+    try:
+        return int(cfg.get(key) or default)
+    except (TypeError, ValueError):
+        return default
 
 
 async def apply_runtime_config():
@@ -106,8 +138,14 @@ async def _load_runtime_config():
         analysis_agent.api_key = oa_key
         analysis_agent.base_url = oa_base
         analysis_agent.model = oa_model
-        us_market_data.api_key = cfg.get('fmp_api_key') or settings.FMP_API_KEY
-        swing_service._position_cache.clear()
+
+        # Short-term picks: Alpaca market data, agent data keys, model and daily session quota
+        alpaca_data.api_key = cfg.get('alpaca_api_key') or ''
+        alpaca_data.secret_key = cfg.get('alpaca_secret_key') or ''
+        _agent_runtime.update(alpaca_api_key=alpaca_data.api_key, alpaca_secret_key=alpaca_data.secret_key,
+                              fred_api_key=cfg.get('fred_api_key') or '', model=cfg.get('agent_model') or '')
+        short_term.session_limit = _int_config(cfg, 'agent_daily_session_limit', DAILY_SESSION_LIMIT)
+        short_term._position_cache.clear()
 
         # Update notification service
         notification_service.feishu_webhook = feishu_url or ""
@@ -133,27 +171,55 @@ _background_tasks = []
 
 
 async def _stored_config():
-    return {r['key']:r['value'] for r in await swing_service.store.rows('SELECT key,value FROM system_configs')}
+    return {r['key']:r['value'] for r in await analysis_store.rows('SELECT key,value FROM system_configs')}
 
 
-async def _run_swing(push_notifications=False, run_key=None):
+def _push_enabled(cfg: dict) -> bool:
+    return cfg.get('ai_picks_push_enabled') in ('1', 'true', 'True')
+
+
+def _schedule_times(cfg: dict) -> list[str]:
+    raw = cfg.get('ai_picks_schedule_times') or ','.join(SCHEDULE_TIMES)
+    times = []
+    for item in raw.split(','):
+        try:
+            times.append(datetime.strptime(item.strip(), '%H:%M').strftime('%H:%M'))
+        except ValueError:
+            continue  # stale/invalid stored entries are ignored rather than breaking the scheduler
+    return sorted(set(times)) or list(SCHEDULE_TIMES)
+
+
+def _schedule_timezone(cfg: dict) -> str:
+    name = cfg.get('ai_picks_push_timezone') or SCHEDULE_TZ
+    try:
+        ZoneInfo(name)
+        return name
+    except (ValueError, KeyError):
+        return SCHEDULE_TZ
+
+
+async def _run_short_term(push_notifications=False, run_key=None):
     cfg = await _stored_config()
-    return await swing_service.run(top_n=int(cfg.get('analysis_top_n',3)),
-        min_score=int(cfg.get('analysis_min_score',60)),
-        earnings_blackout_days=int(cfg.get('earnings_blackout_days',3)),
-        push_notifications=push_notifications, run_key=run_key)
+    top_n = min(max(_int_config(cfg, 'analysis_top_n', 5), 1), 5)
+    return await short_term.run(top_n=top_n, push_notifications=push_notifications, run_key=run_key)
 
 
 async def scheduled_analysis_tick(now=None):
     cfg = await _stored_config()
-    if cfg.get('ai_picks_push_enabled') not in ('1','true','True'):
+    if not _push_enabled(cfg):
         return None
-    zone = ZoneInfo(cfg.get('ai_picks_push_timezone') or 'Asia/Shanghai')
+    zone = ZoneInfo(_schedule_timezone(cfg))
     local = (now or datetime.now(timezone.utc)).astimezone(zone)
-    if local.strftime('%H:%M') < (cfg.get('ai_picks_push_time') or '21:30'):
-        return None
-    # >= catches up after a missed minute; DB run_key survives process restarts.
-    return await _run_swing(push_notifications=True,run_key=f'schedule:{local.date().isoformat()}')
+    result = None
+    for slot in _schedule_times(cfg):
+        hour, minute = map(int, slot.split(':'))
+        # A slot late in the evening can still be inside its catch-up window after local midnight.
+        for day in (local.date(), local.date() - timedelta(days=1)):
+            start = datetime(day.year, day.month, day.day, hour, minute, tzinfo=zone)
+            if start <= local < start + timedelta(hours=SCHEDULE_CATCHUP_HOURS):
+                # The DB run_key claim makes each slot run once, across restarts.
+                result = await _run_short_term(push_notifications=True, run_key=f'schedule:{day.isoformat()}:{slot}')
+    return result
 
 
 async def background_monitoring_loop():
@@ -191,10 +257,10 @@ async def background_maintenance_loop():
     while True:
         await asyncio.sleep(60)
         try:
-            await swing_service.retry_pushes()
+            await short_term.retry_pushes()
             ticks += 1
-            if ticks % 60 == 0 and us_market_data.api_key:
-                await swing_service.review()
+            if ticks % 60 == 0 and alpaca_data.configured:
+                await short_term.review()
         except Exception:
             logger.warning('Delivery/review maintenance unavailable; will retry')
 
@@ -204,7 +270,12 @@ async def lifespan(app: FastAPI):
     global _monitor_task, _background_tasks
     await init_db()
     await apply_runtime_config()
-    await swing_service.store.recover_interrupted()
+    await analysis_store.recover_interrupted()
+    try:
+        get_or_create_token(settings.AGENT_DATA_DIR)  # token file lives on the shared volume, never in system_configs
+    except OSError:
+        # Position monitoring must keep working; short-term analysis reports the agent as unavailable.
+        logger.warning('Agent data directory is not writable; internal agent token unavailable')
     _background_tasks = [asyncio.create_task(worker()) for worker in (
         background_monitoring_loop, background_sync_loop, background_analysis_loop, background_maintenance_loop)]
     _monitor_task = _background_tasks[0]
@@ -224,6 +295,10 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+app.include_router(build_internal_router(InternalDeps(
+    token_provider=_agent_token, factors=lambda symbol: short_term.factors_for(symbol),
+    token_quote=lambda symbol: short_term.token_quote_for(symbol), crypto_context=lambda: short_term.crypto_context(),
+    market_context=lambda: short_term.market_context(), agent_config=lambda: short_term.agent_config())))
 @app.middleware('http')
 async def console_access(request: Request, call_next):
     if settings.ADMIN_PASSWORD and request.url.path != '/api/health' and not request.url.path.startswith('/internal/'):
@@ -256,7 +331,7 @@ async def analysis_busy(request, exc):
     return JSONResponse(status_code=409,content={'detail':str(exc)})
 
 
-@app.exception_handler(MarketDataError)
+@app.exception_handler(MarketDataUnavailable)
 async def market_unavailable(request, exc):
     return JSONResponse(status_code=503,content={'detail':str(exc)})
 
@@ -272,10 +347,18 @@ async def safe_config_validation_error(request: Request, exc: RequestValidationE
 async def health_check():
     return {"status": "ok", "service": "binance-bstocks-bot", "revision": os.environ.get('APP_REVISION', 'unknown')}
 
+def _universe_rows(pairs) -> list[dict]:
+    return [{'symbol': p.symbol, 'underlying_symbol': p.underlying} for p in pairs]
+
+
 @app.get("/api/bstocks/symbols")
 async def get_symbols():
-    symbols = binance_client.get_supported_bstocks()
-    return {"symbols": symbols}
+    try:
+        return {"symbols": _universe_rows(await short_term.universe.get())}
+    except MarketDataUnavailable:
+        # Built-in list keeps the position form usable while Binance is unreachable.
+        fallback = [{'symbol': s, 'underlying_symbol': s.removesuffix('BUSDT')} for s in SUPPORTED_BSTOCKS]
+        return {"symbols": fallback, "fallback": True}
 
 @app.get("/api/bstocks/ticker")
 async def get_ticker(symbol: str = Query(..., description="e.g. NVDABUSDT")):
@@ -295,65 +378,151 @@ async def get_klines(symbol: str = Query(...), interval: str = "1d", limit: int 
 
 @app.post('/api/analysis/run')
 async def run_daily_analysis(push_notifications: bool = False):
-    return await _run_swing(push_notifications=push_notifications)
+    return await _run_short_term(push_notifications=push_notifications)
+
+
+def _agent_ready(health: dict) -> bool:
+    return health.get('status') == 'ok' and health.get('auth') == 'valid'
+
+
+async def _sessions_today() -> int:
+    midnight = datetime.now(ZoneInfo(SCHEDULE_TZ)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return await analysis_store.sessions_started_since(midnight.astimezone(timezone.utc).isoformat())
 
 
 @app.get('/api/analysis/status')
 async def analysis_status():
-    runs = await swing_service.store.list_runs(1)
-    running = await swing_service.store.rows("SELECT id FROM analysis_runs WHERE status='running'")
-    return {'horizon':HORIZON,'universe':[{'symbol':s,'underlying_symbol':u} for s,u in STOCK_UNIVERSE.items()],
-        'skills':skill_metadata(),'configured':{'market_data':bool(us_market_data.api_key),
-        'model':bool(analysis_agent.api_key),'notifications':bool(notification_service.feishu_webhook or notification_service.wecom_webhook)},
-        'latest_run':runs[0] if runs else None,'is_running':bool(running) or swing_service.is_running}
+    async def universe():
+        try:
+            return _universe_rows(await short_term.universe.get()), None
+        except MarketDataUnavailable as exc:
+            return [], str(exc)
+    cfg = await _stored_config()
+    health, (pairs, universe_error) = await asyncio.gather(agent_client.health(), universe())
+    runs = await analysis_store.list_runs(1)
+    running = await analysis_store.rows("SELECT id FROM analysis_runs WHERE status='running'")
+    status = {'strategy': 'short_term_1w', 'universe': pairs,
+              'configured': {'alpaca': alpaca_data.configured, 'binance': bool(binance_client.api_key),
+                             'agent': _agent_ready(health),
+                             'notifications': bool(notification_service.feishu_webhook or notification_service.wecom_webhook)},
+              'agent': {'status': health.get('status'), 'auth': health.get('auth')},
+              'schedule': {'times': _schedule_times(cfg), 'timezone': _schedule_timezone(cfg), 'enabled': _push_enabled(cfg)},
+              'sessions_today': await _sessions_today(), 'session_limit': short_term.session_limit,
+              'latest_run': runs[0] if runs else None, 'is_running': bool(running) or short_term.is_running}
+    if universe_error:
+        status['universe_error'] = universe_error
+    return status
 
 
 @app.get('/api/analysis/runs')
 async def analysis_runs(limit: int = Query(default=20,ge=1,le=100)):
-    return await swing_service.store.list_runs(limit)
+    return await analysis_store.list_runs(limit)
 
 
 @app.post('/api/analysis/runs/{run_id}/push')
 async def push_analysis_run(run_id: int):
     try:
-        return await swing_service.push_run(run_id)
+        return await short_term.push_run(run_id)
     except LookupError:
         raise HTTPException(status_code=404,detail='分析记录不存在') from None
 
 
 @app.post('/api/analysis/review')
 async def review_analysis():
-    return await swing_service.review()
+    return await short_term.review()
 
 
 @app.get('/api/analysis/reviews')
 async def analysis_reviews():
-    return await swing_service.store.list_reviews()
+    return await analysis_store.list_reviews()
+
+
+@app.get('/api/analysis/reviews/summary')
+async def analysis_reviews_summary():
+    rows = await analysis_store.rows(
+        'SELECT outcome,return_pct,excess_return_pct FROM analysis_reviews WHERE outcome IS NOT NULL')
+    total = len(rows)
+    counts = {k: sum(r['outcome'] == k for r in rows) for k in ('target', 'stop', 'open')}
+    avg = lambda key: round(sum(r[key] for r in rows) / total, 2) if total else None
+    return {'total': total, **counts, 'hit_rate_pct': round(counts['target'] / total * 100, 2) if total else None,
+            'avg_return_pct': avg('return_pct'), 'avg_excess_pct': avg('excess_return_pct')}
 
 
 @app.get('/api/analysis/picks')
 async def get_latest_picks():
-    return await swing_service.store.list_picks()
+    return await analysis_store.list_picks()
 
 
 @app.delete('/api/analysis/picks')
 async def clear_all_picks():
-    await swing_service.store.hide_picks()
+    await analysis_store.hide_picks()
     return {'message':'已隐藏当前候选，历史报告与复盘仍保留'}
 
 
 @app.delete('/api/analysis/picks/{pick_id}')
 async def delete_single_pick(pick_id: int):
-    await swing_service.store.hide_picks(pick_id)
+    await analysis_store.hide_picks(pick_id)
     return {'message':'已隐藏该候选，历史报告仍保留'}
+
+
+@app.get('/api/agent/status')
+async def agent_status():
+    return await agent_client.health()
+
+
+CREDENTIALS_MAX_BYTES = 64 * 1024
+CREDENTIALS_FORMAT_ERROR = '凭据文件格式不正确，请上传 pi 登录后生成的 auth.json'
+
+
+@app.post('/api/agent/credentials')
+async def upload_agent_credentials(request: Request):
+    """Store the pi ChatGPT auth.json on the shared agent volume. JSON body only (python-multipart is not installed)."""
+    if request.headers.get('content-type', '').lower().startswith('multipart/'):
+        raise HTTPException(status_code=415, detail='请以 JSON 正文上传 auth.json 内容')
+    try:
+        declared = int(request.headers.get('content-length') or 0)
+    except ValueError:
+        declared = 0
+    if declared > CREDENTIALS_MAX_BYTES:
+        raise HTTPException(status_code=413, detail='凭据文件过大（上限 64 KB）')
+    body = b''
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > CREDENTIALS_MAX_BYTES:
+            raise HTTPException(status_code=413, detail='凭据文件过大（上限 64 KB）')
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        data = None
+    if not isinstance(data, dict) or 'openai-codex' not in data:
+        raise HTTPException(status_code=400, detail=CREDENTIALS_FORMAT_ERROR)
+    directory = settings.AGENT_DATA_DIR
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    path = os.path.join(directory, 'auth.json')
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix='.auth.', suffix='.tmp')  # created 0600
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return {'success': True, 'message': 'ChatGPT 凭据已保存，agent 下次会话生效'}
 
 
 @app.post('/api/positions/{position_id}/analyze')
 async def analyze_held_position(position_id: int):
-    positions = await swing_service.store.rows('SELECT symbol FROM positions WHERE id=? AND is_active=1',(position_id,))
+    positions = await analysis_store.rows(
+        'SELECT symbol,buy_price,quantity,cost_currency FROM positions WHERE id=? AND is_active=1', (position_id,))
     if not positions:
         raise HTTPException(status_code=404,detail='未找到正在监控的持仓')
-    return await swing_service.analyze_position(positions[0]['symbol'])
+    pos = positions[0]
+    cost = pos['buy_price'] if (pos['cost_currency'] or 'USDT') == 'USDT' and (pos['buy_price'] or 0) > 0 else None
+    return await short_term.analyze_position(pos['symbol'], buy_price_usdt=cost, quantity=pos['quantity'])
 
 @app.get("/api/positions", response_model=List[Dict[str, Any]])
 async def list_positions():
@@ -793,7 +962,7 @@ async def get_system_config():
     raw_binance_secret = cfg.get("binance_api_secret") or settings.BINANCE_API_SECRET
     raw_openai_key = cfg.get("openai_api_key") or settings.OPENAI_API_KEY
     raw_feishu_secret = cfg.get("feishu_app_secret") or settings.FEISHU_APP_SECRET
-    raw_fmp_key = cfg.get('fmp_api_key') or settings.FMP_API_KEY
+    raw_alpaca_key = cfg.get('alpaca_api_key') or ''
 
     return {
         "binance_api_key": mask(raw_binance_key),
@@ -812,14 +981,16 @@ async def get_system_config():
         "feishu_bot_connected": feishu_bot_service.is_connected,
         "wecom_webhook_url": cfg.get("wecom_webhook_url") or settings.WECOM_WEBHOOK_URL or "",
         "ai_picks_push_enabled": cfg.get("ai_picks_push_enabled") in ("1", "true", "True", True),
-        "ai_picks_push_time": cfg.get("ai_picks_push_time") or "21:30",
         "default_check_interval_hours": float(cfg.get("default_check_interval_hours", DEFAULT_CHECK_INTERVAL_HOURS)),
         "default_include_ai_analysis": cfg["default_include_ai_analysis"] == "1" if "default_include_ai_analysis" in cfg else DEFAULT_INCLUDE_AI_ANALYSIS,
-        'fmp_api_key':'','has_fmp_key':bool(raw_fmp_key),
-        'analysis_horizon':HORIZON,'analysis_top_n':int(cfg.get('analysis_top_n',3)),
-        'analysis_min_score':int(cfg.get('analysis_min_score',60)),
-        'earnings_blackout_days':int(cfg.get('earnings_blackout_days',3)),
-        'ai_picks_push_timezone':cfg.get('ai_picks_push_timezone') or 'Asia/Shanghai'
+        'alpaca_api_key': mask(raw_alpaca_key), 'has_alpaca_key': bool(raw_alpaca_key),
+        'alpaca_secret_key': '', 'has_alpaca_secret': bool(cfg.get('alpaca_secret_key')),
+        'fred_api_key': '', 'has_fred_key': bool(cfg.get('fred_api_key')),
+        'agent_model': cfg.get('agent_model') or '',
+        'ai_picks_schedule_times': ','.join(_schedule_times(cfg)),
+        'ai_picks_push_timezone': _schedule_timezone(cfg),
+        'analysis_top_n': min(max(_int_config(cfg, 'analysis_top_n', 5), 1), 5),
+        'agent_daily_session_limit': _int_config(cfg, 'agent_daily_session_limit', DAILY_SESSION_LIMIT),
     }
 
 @app.post("/api/config")
@@ -834,7 +1005,7 @@ async def save_system_config(payload: SystemConfigSchema):
         if value and "******" not in value:
             raise HTTPException(status_code=400, detail="普通设置保存不会修改币安凭据，请使用“验证并更新币安凭据”操作")
 
-    for k in ["binance_mcp_url", "openai_base_url", "openai_model", "feishu_webhook_url", "wecom_webhook_url", "ai_picks_push_time", "feishu_app_id", "default_check_interval_hours", 'analysis_top_n','analysis_min_score','earnings_blackout_days','ai_picks_push_timezone']:
+    for k in ["binance_mcp_url", "openai_base_url", "openai_model", "feishu_webhook_url", "wecom_webhook_url", "feishu_app_id", "default_check_interval_hours", 'analysis_top_n', 'ai_picks_push_timezone', 'ai_picks_schedule_times', 'agent_daily_session_limit']:
         if k in dumped and dumped[k] is not None:
             val = str(dumped[k]).strip()
             if val:
@@ -848,10 +1019,14 @@ async def save_system_config(payload: SystemConfigSchema):
     for secret_k in ["openai_api_key", "feishu_app_secret"]:
         if secret_k in dumped and dumped[secret_k] and "******" not in str(dumped[secret_k]):
             fields_to_update[secret_k] = str(dumped[secret_k]).strip()
-    if payload.fmp_api_key is not None:
-        value = payload.fmp_api_key.get_secret_value().strip()
+    for secret_k in ('alpaca_api_key', 'alpaca_secret_key', 'fred_api_key'):
+        secret = getattr(payload, secret_k)
+        value = secret.get_secret_value().strip() if secret is not None else ''
         if value and '*' not in value:
-            fields_to_update['fmp_api_key'] = value
+            fields_to_update[secret_k] = value
+    # Optional model override: an explicit empty value clears it back to the agent default.
+    if 'agent_model' in dumped:
+        fields_to_update['agent_model'] = (dumped['agent_model'] or '').strip()
 
     async with aiosqlite.connect(settings.DB_PATH) as db:
         for k, v in fields_to_update.items():
@@ -909,20 +1084,27 @@ async def update_binance_credentials(payload: BinanceCredentialsUpdate, request:
 async def test_connection(req: TestConnectionRequest):
     """Test connectivity for Binance, LLM, Feishu, or WeCom."""
     svc = req.service.lower()
-    if svc == 'fmp':
-        key = req.api_key
-        if not key or '*' in key:
-            cfg = await _stored_config()
-            key = cfg.get('fmp_api_key') or settings.FMP_API_KEY
-        provider = USMarketData(api_key=key or '')
+    if svc == 'alpaca':
+        key = req.api_key if req.api_key and '*' not in req.api_key else alpaca_data.api_key
+        secret = req.api_secret.get_secret_value() if req.api_secret else ''
+        if not secret or '*' in secret:
+            secret = alpaca_data.secret_key
+        if not key or not secret:
+            return {'success': False, 'message': '请先填写 Alpaca API Key 和 Secret'}
         try:
-            history = await provider.get_history('NVDA')
-            research = await provider.get_research('NVDA')
-            if len(history) < 252 or not research['financials']:
-                return {'success':False,'message':'FMP 已连接，但完整波段分析所需历史或财务数据不足'}
-            return {'success':True,'message':'FMP 日线、季度财务、新闻和财报日历读取成功'}
-        except MarketDataError as exc:
-            return {'success':False,'message':str(exc)}
+            bars = await AlpacaData(api_key=key, secret_key=secret).get_daily_bars(['SPY'], days=10)
+        except MarketDataUnavailable as exc:
+            return {'success': False, 'message': str(exc)}
+        if not bars.get('SPY'):
+            return {'success': False, 'message': 'Alpaca 已连接，但未返回 SPY 近 5 日日线'}
+        return {'success': True, 'message': 'Alpaca 美股日线读取成功（SPY 近 5 日）'}
+    if svc == 'agent':
+        health = await agent_client.health()
+        if health.get('status') != 'ok':
+            return {'success': False, 'message': 'AI 分析服务不可达，请检查 agent 容器'}
+        if health.get('auth') != 'valid':
+            return {'success': False, 'message': 'AI 服务在线，但 ChatGPT 凭据缺失或已过期，请上传 auth.json'}
+        return {'success': True, 'message': 'AI 分析服务在线，ChatGPT 凭据有效'}
     if svc == "binance":
         api_key = req.api_key
         if not api_key or "******" in api_key:

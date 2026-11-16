@@ -119,9 +119,15 @@ async def test_bad_symbol_422(sym):
 
 
 @pytest.mark.asyncio
-async def test_main_middleware_skips_basic_auth_for_internal(monkeypatch):
+async def test_main_middleware_skips_basic_auth_for_internal(monkeypatch, tmp_path):
     from backend.app.main import app
     monkeypatch.setattr(settings, 'ADMIN_PASSWORD', 'pw')
+    monkeypatch.setattr(settings, 'AGENT_DATA_DIR', str(tmp_path / 'agent'))
+    token = get_or_create_token(str(tmp_path / 'agent'))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://t') as c:
-        assert (await c.get('/internal/agent-config')).status_code == 404
+        # The internal router (mounted in main) answers with its own bearer check, not Basic auth.
+        r = await c.get('/internal/agent-config')
+        assert r.status_code == 401 and r.json()['detail'] == '内网令牌无效'
+        r = await c.get('/internal/agent-config', headers={'Authorization': f'Bearer {token}'})
+        assert r.status_code == 200 and set(r.json()) == {'alpaca_api_key', 'alpaca_secret_key', 'fred_api_key', 'model'}
         assert (await c.get('/api/stocks')).status_code == 401
