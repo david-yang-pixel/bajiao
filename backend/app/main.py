@@ -226,7 +226,7 @@ app = FastAPI(
 )
 @app.middleware('http')
 async def console_access(request: Request, call_next):
-    if settings.ADMIN_PASSWORD and request.url.path != '/api/health':
+    if settings.ADMIN_PASSWORD and request.url.path != '/api/health' and not request.url.path.startswith('/internal/'):
         authorized = False
         try:
             scheme, credentials = request.headers.get('authorization','').split(' ',1)

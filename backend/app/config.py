@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     FMP_API_KEY: str = ""
     ADMIN_PASSWORD: str = ""
     DB_PATH: str = "sqlite.db"
+    AGENT_DATA_DIR: str = "/app/data/agent"
+    AGENT_URL: str = "http://bajiao-agent:8080"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
