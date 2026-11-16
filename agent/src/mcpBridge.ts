@@ -56,9 +56,19 @@ export const OPENBB_FRED_KEY_TOOLS: ReadonlySet<string> = new Set();
 
 // Alpaca — measured against alpaca-mcp-server 2.4.1 (pins fastmcp 3.4.7). It cannot share a venv with
 // openbb-mcp-server (fastmcp>=4.0.9): pip then falls back to alpaca-mcp-server 2.3.0, which crashes at
-// import under fastmcp 4 — the image needs two venvs. With ALPACA_TOOLSETS below it lists 25 read-only
-// tools (stock/crypto/option data, news, docs); the regex is a second guard against trading tools.
-const ALPACA_BLOCKED = /order|position|account|watchlist|cancel|close|exercise|replace/i;
+// import under fastmcp 4 — the image needs two venvs. With ALPACA_TOOLSETS below it lists 25 tools;
+// the allowlist keeps the stock/option market-data and news ones (docs and crypto tools left out).
+// Fail-closed: a tool must be in ALPACA_ALLOWED_TOOLS AND not match ALPACA_DENY (second gate).
+export const ALPACA_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
+  "get_stock_bars", "get_stock_quotes", "get_stock_trades",
+  "get_stock_latest_bar", "get_stock_latest_quote", "get_stock_latest_trade", "get_stock_snapshot",
+  "get_option_bars", "get_option_trades", "get_option_latest_trade", "get_option_latest_quote",
+  "get_option_snapshot", "get_option_chain", "get_option_exchange_codes",
+  "get_news",
+  "get_market_movers", "get_most_active_stocks",
+]);
+export const ALPACA_DENY = /order|position|account|watchlist|cancel|close|exercise|replace|locate|portfolio/i;
+
 const CONNECT_TIMEOUT_MS = 60_000;
 
 export function buildServerSpecs(keys: McpKeys): McpServerSpec[] {
@@ -83,7 +93,7 @@ export function buildServerSpecs(keys: McpKeys): McpServerSpec[] {
         ALPACA_TOOLSETS: "stock-data,options-data,news",
         ALPACA_MCP_USER_AGENT: "",
       },
-      allow: (n) => !ALPACA_BLOCKED.test(n),
+      allow: (n) => ALPACA_ALLOWED_TOOLS.has(n) && !ALPACA_DENY.test(n),
     });
   }
   return specs;

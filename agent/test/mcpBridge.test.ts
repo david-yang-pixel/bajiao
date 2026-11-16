@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { fileURLToPath } from "node:url";
 import { ToolLog } from "../src/toolLog.js";
 import {
-  buildServerSpecs, openMcpTools, OPENBB_ALLOWED_TOOLS, OPENBB_ARGS, OPENBB_FRED_ENV, OPENBB_FRED_KEY_TOOLS,
+  ALPACA_ALLOWED_TOOLS, ALPACA_DENY, buildServerSpecs, openMcpTools, OPENBB_ALLOWED_TOOLS, OPENBB_ARGS, OPENBB_FRED_ENV, OPENBB_FRED_KEY_TOOLS,
   type McpServerSpec,
 } from "../src/mcpBridge.js";
 
@@ -34,13 +34,29 @@ describe("buildServerSpecs (alpaca)", () => {
       ALPACA_MCP_USER_AGENT: "",
     });
   });
-  it("blocks trading/account tools", () => {
+  it("allows only the explicit read-only allowlist", () => {
     const { allow } = buildServerSpecs(KEYS).find((s) => s.name === "alpaca")!;
-    for (const n of ["place_stock_order", "get_all_positions", "get_account_info", "create_watchlist",
-      "cancel_all_orders", "close_position", "exercise_options_position", "replace_order_by_id", "GetOrders"]) {
+    expect([...ALPACA_ALLOWED_TOOLS].sort()).toEqual([
+      "get_market_movers", "get_most_active_stocks", "get_news",
+      "get_option_bars", "get_option_chain", "get_option_exchange_codes", "get_option_latest_quote",
+      "get_option_latest_trade", "get_option_snapshot", "get_option_trades",
+      "get_stock_bars", "get_stock_latest_bar", "get_stock_latest_quote", "get_stock_latest_trade",
+      "get_stock_quotes", "get_stock_snapshot", "get_stock_trades",
+    ]);
+    for (const n of ALPACA_ALLOWED_TOOLS) expect(allow(n), n).toBe(true);
+    // Every non-allowlisted tool the real server can expose (with or without ALPACA_TOOLSETS) is rejected.
+    for (const n of ["place_stock_order", "place_option_order", "get_all_positions", "get_account_info", "create_watchlist",
+      "cancel_all_orders", "close_position", "exercise_options_position", "replace_order_by_id", "GetOrders",
+      "create_locate", "get_locates", "get_locate", "get_locate_quotes", "get_portfolio_history", "update_account_config",
+      "fetch_alpaca_doc", "search_alpaca_docs", "get_crypto_bars", "get_asset", "some_future_tool"]) {
       expect(allow(n), n).toBe(false);
     }
-    for (const n of ["get_news", "get_stock_bars", "get_option_chain", "get_stock_snapshot"]) expect(allow(n), n).toBe(true);
+  });
+  it("allowlist contains nothing the deny regex would block", () => {
+    for (const n of ALPACA_ALLOWED_TOOLS) expect(ALPACA_DENY.test(n), n).toBe(false);
+    for (const n of ["create_locate", "get_portfolio_history", "place_stock_order", "get_all_positions"]) {
+      expect(ALPACA_DENY.test(n), n).toBe(true);
+    }
   });
   it("skips alpaca when keys are missing", () => {
     expect(buildServerSpecs({ alpaca_api_key: "", alpaca_secret_key: "sk", fred_api_key: "" }).map((s) => s.name)).toEqual(["openbb"]);
@@ -81,7 +97,7 @@ describe("buildServerSpecs (openbb)", () => {
 });
 
 describe("openMcpTools", () => {
-  it("exposes allowed tools with server prefix and filters trading tools", async () => {
+  it("exposes allowed tools with server prefix and filters place_order / create_locate", async () => {
     const log = new ToolLog();
     const r = await openMcpTools([alpacaSpec()], log);
     closers.push(r.close);
