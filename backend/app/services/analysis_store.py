@@ -67,6 +67,70 @@ class AnalysisStore:
                 message=?,finished_at=? WHERE id=?''', (status,len(picks),encode(errors),encode(diagnostics),message,timestamp(),run_id))
             await db.commit()
 
+    async def insert_short_term_picks(self, run_id, picks):
+        ids = []
+        async with aiosqlite.connect(self.db_path, timeout=15) as db:
+            for pick in picks:
+                cursor = await db.execute('''INSERT INTO daily_picks
+                    (symbol,reason,target_price,run_id,report_json,strategy,track_status,expires_after)
+                    VALUES (?,?,?,?,?,'short_term_1w','active',?)''',
+                    (pick['symbol'],pick['reason'],pick.get('target_price_usd'),run_id,encode(pick),pick.get('expires_after')))
+                ids.append(cursor.lastrowid)
+            await db.commit()
+        return ids
+
+    async def active_short_term_picks(self):
+        rows = await self.rows("SELECT * FROM daily_picks WHERE strategy='short_term_1w' AND track_status='active' AND hidden=0 ORDER BY id")
+        result = []
+        for row in rows:
+            report = json.loads(row['report_json']) if row.get('report_json') else {}
+            result.append({**row,**report,'id':row['id'],'run_id':row['run_id']})
+            result[-1].pop('report_json',None)
+        return result
+
+    async def record_pick_event(self, pick_id, event, price_usd, detail):
+        status = {'target_hit':'target_hit','stopped':'stopped','expired':'expired'}.get(event)
+        async with aiosqlite.connect(self.db_path, timeout=15) as db:
+            now = timestamp()
+            cursor = await db.execute('''INSERT OR IGNORE INTO pick_events (pick_id,event,price_usd,detail,created_at)
+                VALUES (?,?,?,?,?)''', (pick_id,event,price_usd,detail,now))
+            if cursor.rowcount != 1:
+                return False
+            if status:
+                await db.execute('UPDATE daily_picks SET track_status=?,track_updated_at=? WHERE id=?', (status,now,pick_id))
+            await db.commit()
+            return True
+
+    async def unnotified_events(self):
+        return await self.rows('SELECT * FROM pick_events WHERE notified=0 ORDER BY id')
+
+    async def mark_events_notified(self, ids):
+        if ids:
+            await self.execute(f"UPDATE pick_events SET notified=1 WHERE id IN ({','.join('?'*len(ids))})", tuple(ids))
+
+    async def start_session(self, run_id, symbol, purpose):
+        async with aiosqlite.connect(self.db_path, timeout=15) as db:
+            cursor = await db.execute("INSERT INTO agent_sessions (run_id,symbol,purpose,status,started_at) VALUES (?,?,?,'running',?)",
+                (run_id,symbol,purpose,timestamp()))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def finish_session(self, session_id, status, decision, price_usd, atr14, result, error):
+        await self.execute('''UPDATE agent_sessions SET status=?,decision=?,price_usd=?,atr14=?,finished_at=?,
+            result_json=?,error=? WHERE id=?''', (status,decision,price_usd,atr14,timestamp(),encode(result),error,session_id))
+
+    async def sessions_started_since(self, since_iso):
+        rows = await self.rows('SELECT count(*) AS n FROM agent_sessions WHERE started_at>=?', (since_iso,))
+        return rows[0]['n']
+
+    async def last_ok_session(self, symbol, purpose):
+        rows = await self.rows("SELECT * FROM agent_sessions WHERE symbol=? AND purpose=? AND status='ok' ORDER BY finished_at DESC,id DESC LIMIT 1", (symbol,purpose))
+        if not rows:
+            return None
+        row = rows[0]
+        row['result'] = json.loads(row.pop('result_json') or '{}')
+        return row
+
     async def recover_interrupted(self):
         # One application worker is the supported deployment mode.
         await self.execute("UPDATE analysis_runs SET status='failed',message='服务重启中断分析，可重新运行',finished_at=? WHERE status='running'", (timestamp(),))
