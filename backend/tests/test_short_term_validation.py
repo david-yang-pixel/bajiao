@@ -85,3 +85,11 @@ def test_token_conversion():
     assert to_token_prices(101.0, 100.0, 106.0, 97.0) == {
         'token_price_usdt': 101.0, 'token_target_usdt': 107.06, 'token_stop_usdt': 97.97}
     assert to_token_prices(101.0, 100.0, None, None)['token_target_usdt'] is None
+
+
+def test_non_numeric_or_non_positive_current_price_rejected():
+    for bad in ('100', -5, 0):
+        assert any('现价必须为正数' in e for e in run({**GOOD, 'current_price': bad})) or \
+            any('缺少必填' in e for e in run({**GOOD, 'current_price': bad}))
+    assert any('现价必须为正数' in e for e in run({**GOOD, 'current_price': '100'}))
+    assert any('现价必须为正数' in e for e in run({**GOOD, 'current_price': -5}))

@@ -42,6 +42,7 @@ def validate_pick(pick, tool_log, *, symbol, reference_price_usd, atr14, token_q
 
     cur = pick.get('current_price')
     if not _num(cur) or cur <= 0:
+        errs.append('现价必须为正数')
         return errs
     if reference_price_usd and abs(cur / reference_price_usd - 1) > PRICE_TOLERANCE:
         errs.append('现价与主服务行情偏差超过 2%（可能误用代币 USDT 价）')
