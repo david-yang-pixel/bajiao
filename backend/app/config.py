@@ -14,7 +14,6 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
     OPENAI_MODEL: str = "gpt-4o-mini"
-    FMP_API_KEY: str = ""
     ADMIN_PASSWORD: str = ""
     DB_PATH: str = "sqlite.db"
     AGENT_DATA_DIR: str = "/app/data/agent"

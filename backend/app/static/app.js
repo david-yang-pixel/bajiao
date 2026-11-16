@@ -164,7 +164,7 @@
     document.querySelectorAll('[data-view]').forEach((n) => { if (n.dataset.view === view) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current'); });
     $('page-title').textContent = views[view][0];
     $('breadcrumb-current').textContent = views[view][0]; $('page-description').textContent = views[view][1];
-    document.title = `${views[view][0]} · 八角波段工作台`; renderHeading();
+    document.title = `${views[view][0]} · 八角短线工作台`; renderHeading();
     if (changed) { window.scrollTo(0, 0); loadView(); }
   }
   function renderHeading() {

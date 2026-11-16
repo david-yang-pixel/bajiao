@@ -17,8 +17,7 @@ def application_files(repo):
     for path in (repo / 'backend/app').rglob('*'):
         if not path.is_file() or '__pycache__' in path.parts:
             continue
-        if path.suffix == '.py' or ('static' in path.parts and path.suffix in assets) or (
-                'analysis_skills' in path.parts and path.suffix == '.md'):
+        if path.suffix == '.py' or ('static' in path.parts and path.suffix in assets):
             if path.is_symlink():
                 raise RuntimeError('Deployment refuses symlinked source files')
             files.append(path)

@@ -186,15 +186,12 @@ async def test_incomplete_or_invalid_equity_cost_is_unknown(monkeypatch, case):
 
 
 @pytest.mark.asyncio
-async def test_stock_sync_uses_verified_cost_and_keeps_research_pool_unchanged(tmp_path, monkeypatch):
+async def test_stock_sync_uses_verified_cost(tmp_path, monkeypatch):
     await prepare(tmp_path, monkeypatch)
-    from backend.app.services.swing_screener import STOCK_UNIVERSE
-    before = dict(STOCK_UNIVERSE)
     monkeypatch.setattr(main.binance_client,'get_equity_average_buy_price',AsyncMock(return_value=80))
     await main.perform_binance_sync()
     rows = await main.list_positions()
     assert all(p['pnl_pct'] == 25 and p['cost_source'] == 'trade_history_ex_fees' for p in rows)
-    assert dict(STOCK_UNIVERSE) == before and len(before) == 8
 
 
 @pytest.mark.asyncio

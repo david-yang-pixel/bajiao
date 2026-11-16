@@ -31,6 +31,8 @@ SHARED_NETWORK = 'bajiao-net'
 MAIN_URL = 'http://' + CONTAINER + ':8000'
 AGENT_URL = 'http://' + AGENT_CONTAINER + ':8080'
 ROLLBACK_NAME = r'\.rollback-[1-9][0-9]*-[0-9]+'
+# FMP_API_KEY is no longer used by the app; it stays listed only so an existing
+# value in a running container's runtime env file is migrated, not dropped.
 APP_ENV = {
     'BINANCE_API_KEY', 'BINANCE_API_SECRET', 'BINANCE_MCP_URL',
     'FEISHU_WEBHOOK_URL', 'FEISHU_APP_ID', 'FEISHU_APP_SECRET',
