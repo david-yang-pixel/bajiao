@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG } from "../src/config.js";
@@ -46,6 +46,7 @@ beforeEach(() => {
   writeFileSync(join(CONFIG.dataDir, "internal_token"), `${TOKEN}\n`);
   agentState.lastAuthState = "unknown";
   agentState.lastModel = null;
+  agentState.authMtimeMs = undefined;
 });
 afterEach(async () => {
   await new Promise<void>((r) => server.close(() => r()));
@@ -166,6 +167,25 @@ describe("GET /health", () => {
     const body = await (await fetch(`${base}/health`)).json();
     expect(body.auth).toBe("expired");
     expect(body.model).toBe("openai-codex/gpt-first");
+  });
+
+  it("clears a stale expired state once a new auth.json is uploaded", async () => {
+    const authPath = join(CONFIG.dataDir, "auth.json");
+    const at = (ms: number) => utimesSync(authPath, new Date(ms), new Date(ms));
+    writeFileSync(authPath, CODEX_AUTH);
+    at(1_700_000_000_000);
+    await start(async () => {
+      agentState.lastAuthState = "expired";
+      return { ...OK, status: "error", decision: null, pick: null, error: { code: "auth_expired", message: "x" } };
+    });
+    await analyze(REQ);
+    const auth = async () => (await (await fetch(`${base}/health`)).json()).auth;
+    expect(await auth()).toBe("expired");
+    expect(await auth()).toBe("expired"); // same file: still expired
+    writeFileSync(authPath, CODEX_AUTH); // user re-logged in and uploaded a new auth.json
+    at(1_700_000_100_000);
+    expect(await auth()).toBe("valid");
+    expect(agentState.lastAuthState).not.toBe("expired");
   });
 
   it("returns 404 for unknown routes", async () => {

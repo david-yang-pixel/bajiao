@@ -51,6 +51,8 @@ export function createInternalTools(
     mk("get_factors", "获取因子", "获取标的的技术/动量/波动率等因子与 ATR、参考价（正股 USD）", SYMBOL, true),
     mk("get_token_quote", "获取代币报价", "获取该标的币安代币现货报价、可交易性与折算参考（USDT）", SYMBOL, true),
     mk("get_crypto_context", "加密市场环境", "获取加密市场整体环境", EMPTY, false),
-    mk("get_market_context", "美股市场环境", "获取美股大盘/板块基准环境（SPY/QQQ/板块 ETF）", EMPTY, false),
+    mk("get_market_context", "美股市场环境",
+      "获取美股大盘环境：SPY/QQQ 近 5/20 日涨跌与是否站上 20 日均线，以及未来 7 天的宏观事件日程（FOMC 利率决议）",
+      EMPTY, false),
   ];
 }

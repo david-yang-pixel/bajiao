@@ -212,6 +212,41 @@ describe("runAnalysis", () => {
     expect(mcp.close).toHaveBeenCalledOnce();
   });
 
+  it("counts MCP startup against the session deadline (deadline starts at request start)", async () => {
+    vi.useFakeTimers();
+    const { create, prompted } = fakeCreate(() => new Promise<void>(() => {}));
+    const { deps: d, mcp } = deps(create);
+    const realOpen = mcp.open.getMockImplementation()!;
+    mcp.open.mockImplementation(async (specs: any, log: ToolLog) => {
+      await new Promise((r) => setTimeout(r, 200_000)); // slow MCP server start-up
+      return realOpen(specs, log);
+    });
+    let done = false;
+    const pending = runAnalysis(REQ, d).finally(() => (done = true));
+    await vi.advanceTimersByTimeAsync(200_000);
+    await prompted;
+    await vi.advanceTimersByTimeAsync(100_000); // 300 s since the request started
+    expect(done).toBe(true);
+    if (!done) await vi.advanceTimersByTimeAsync(400_000);
+    const res = await pending;
+    expect(res.error?.code).toBe("timeout");
+    expect(res.usage.duration_ms).toBeLessThanOrEqual(CONFIG.sessionTimeoutMs);
+  });
+
+  it("does not let a hanging MCP shutdown hold the response past the deadline", async () => {
+    vi.useFakeTimers();
+    const { create } = fakeCreate(happy);
+    const { deps: d, mcp } = deps(create);
+    mcp.close.mockImplementation(() => new Promise<void>(() => {}));
+    let done = false;
+    const pending = runAnalysis(REQ, d).finally(() => (done = true));
+    await vi.advanceTimersByTimeAsync(CONFIG.sessionTimeoutMs);
+    expect(done).toBe(true);
+    if (!done) return;
+    expect((await pending).status).toBe("ok");
+    expect(mcp.close).toHaveBeenCalledOnce();
+  });
+
   it("returns tool_limit when the tool budget is exhausted without a submission", async () => {
     const { create } = fakeCreate(async (tools, emit) => {
       for (let i = 0; i < CONFIG.maxToolCalls + 3; i++) await call(tools, emit, "get_factors", { symbol: "NVDA" });

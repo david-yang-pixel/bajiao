@@ -31,6 +31,12 @@ describe("internal tools", () => {
     expect(r.content[0].text).toContain("[call_id=c1]");
     expect(r.content[0].text).toContain('"rsi":55');
   });
+  it("describes get_market_context as what it returns (SPY/QQQ + macro events, no sector ETFs)", () => {
+    const d = mk(200, {}).get("get_market_context").description;
+    expect(d).toContain("SPY/QQQ");
+    expect(d).toContain("宏观");
+    expect(d).not.toContain("板块");
+  });
   it("context tools post empty object", async () => {
     const calls: any[] = [];
     const { get } = mk(200, { ok: 1 }, calls);

@@ -54,7 +54,24 @@ export interface RunDeps {
 export const agentState: {
   lastAuthState: "unknown" | "valid" | "missing" | "expired";
   lastModel: string | null;
+  /** auth.json mtime when lastAuthState was last determined (server.ts); a newer upload clears "expired". */
+  authMtimeMs?: number | null;
 } = { lastAuthState: "unknown", lastModel: null };
+
+/**
+ * Upper bound for closing the MCP servers. Together with CONFIG.sessionTimeoutMs it bounds every /analyze:
+ * the deadline runs from request start (config fetch and MCP startup included), the prompt gets whatever
+ * is left minus this reserve, and close never waits past the deadline. The main service's HTTP timeout
+ * (backend AgentClient, 400 s) is set above this 300 s total.
+ */
+export const MCP_CLOSE_RESERVE_MS = 5_000;
+
+/** Waits for `p` (errors ignored) for at most `ms`; a promise that never settles is left behind. */
+async function settleWithin(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([p.catch(() => {}), new Promise((r) => (timer = setTimeout(r, Math.max(0, ms))))]);
+  clearTimeout(timer);
+}
 
 // Brief's /auth|login|401|token/i with "token" as a whole word, so "max_tokens"/"272000 tokens"
 // (context-length errors) are not mistaken for credential failures.
@@ -122,6 +139,7 @@ function errorText(err: unknown): string {
 
 export async function runAnalysis(req: AnalyzeRequest, deps: RunDeps): Promise<AnalyzeResponse> {
   const started = Date.now();
+  const deadline = started + CONFIG.sessionTimeoutMs;
   const say = deps.logger ?? ((line: string) => console.log(line));
   const createSession = deps.createSession ?? createAgentSession;
   const openMcp = deps.openMcp ?? openMcpTools;
@@ -220,7 +238,7 @@ export async function runAnalysis(req: AnalyzeRequest, deps: RunDeps): Promise<A
     });
 
     const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), CONFIG.sessionTimeoutMs);
+      timer = setTimeout(() => resolve("timeout"), Math.max(0, deadline - MCP_CLOSE_RESERVE_MS - Date.now()));
     });
     let outcome: "done" | "timeout";
     try {
@@ -261,6 +279,6 @@ export async function runAnalysis(req: AnalyzeRequest, deps: RunDeps): Promise<A
   } finally {
     clearTimeout(timer);
     session?.dispose();
-    await mcp?.close();
+    if (mcp) await settleWithin(mcp.close(), deadline - Date.now());
   }
 }

@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
@@ -101,9 +101,27 @@ function hasCredential(): boolean {
   }
 }
 
+function authMtimeMs(): number | null {
+  try {
+    return statSync(`${CONFIG.dataDir}/auth.json`).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 function authState(): "missing" | "expired" | "valid" {
   if (!hasCredential()) return "missing";
-  return agentState.lastAuthState === "expired" ? "expired" : "valid";
+  if (agentState.lastAuthState !== "expired") return "valid";
+  const mtime = authMtimeMs();
+  if (agentState.authMtimeMs === undefined) {
+    agentState.authMtimeMs = mtime; // state set without a recorded file version: pin the current one
+  } else if (agentState.authMtimeMs !== mtime) {
+    // auth.json was replaced since the failure (re-login + upload): the old verdict no longer applies.
+    agentState.lastAuthState = "unknown";
+    agentState.authMtimeMs = mtime;
+    return "valid";
+  }
+  return "expired";
 }
 
 export function createAgentServer(deps: ServerDeps = {}): Server {
@@ -151,6 +169,8 @@ export function createAgentServer(deps: ServerDeps = {}): Server {
       } catch (err) {
         result = errorResponse("model_error", `AI 分析服务内部错误：${err instanceof Error ? err.message : String(err)}`);
       }
+      // The auth verdict of this request belongs to the auth.json version it ran with (incl. refresh writes).
+      agentState.authMtimeMs = authMtimeMs();
       say(
         `[server] analyze ${parsed.purpose} ${parsed.symbol} → ${result.status}` +
           `${result.error ? ` ${result.error.code}` : ""} tools=${result.usage.tool_calls} ${result.usage.duration_ms}ms` +
