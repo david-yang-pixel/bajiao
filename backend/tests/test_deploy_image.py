@@ -2,6 +2,7 @@
 import copy
 import json
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 from unittest.mock import Mock
@@ -14,13 +15,16 @@ NEW = 'sha256:' + '2' * 64
 OTHER = 'sha256:' + '3' * 64
 STOPPED = 'sha256:' + '4' * 64
 UNUSED = 'sha256:' + '5' * 64
+AGENT_NEW = 'sha256:' + '6' * 64
+AGENT_OLD = 'sha256:' + '7' * 64
 REV = 'a' * 40
 
 
 def request(**changes):
     return dict(revision=REV, image=cd.REPOSITORY + '@sha256:' + 'b' * 64,
+                agent_image=cd.AGENT_REPOSITORY + '@sha256:' + 'c' * 64,
                 registry_user='fixture-user', registry_token='fixture-not-a-real-token',
-                run_number=10, **changes)
+                **{'run_number': 10, **changes})
 
 
 def image(identity, *, project=True, tags=None, revision=REV):
@@ -37,6 +41,7 @@ class FakeDocker:
                        for folder in ('data', 'logs', 'backend')],
             'HostConfig': {'NetworkMode': 'bstocks-bot_default', 'PortBindings': {
                 '8000/tcp': [{'HostIp': '', 'HostPort': '8000'}]}},
+            'NetworkSettings': {'Networks': {'bstocks-bot_default': {}}},
             'Config': {'Image': cd.LEGACY_REPOSITORY, 'Env': [
                 'DB_PATH=/app/data/bstocks.db', 'BINANCE_API_SECRET=fixture-keep-me', 'PATH=/old/base'],
                 'Labels': {'com.docker.compose.project': 'bstocks-bot', 'com.docker.compose.service': 'bstocks-bot'}},
@@ -45,11 +50,14 @@ class FakeDocker:
         self.images = {
             OLD: image(OLD, project=False, tags=[cd.LEGACY_REPOSITORY + ':latest']),
             NEW: image(NEW), OTHER: image(OTHER, tags=['other-project:latest']),
-            STOPPED: image(STOPPED), UNUSED: image(UNUSED),
+            STOPPED: image(STOPPED), UNUSED: image(UNUSED), AGENT_NEW: image(AGENT_NEW),
         }
+        self.networks = {}
         self.target_ref = request()['image']
+        self.agent_ref = request()['agent_image']
         self.failure = None
         self.new_healthy = True
+        self.agent_new_healthy = True
         self.on_new_start = lambda: None
         self.registry_directories = []
         self.stopped_image_users = {STOPPED}
@@ -60,7 +68,22 @@ class FakeDocker:
         return copy.deepcopy(self.containers.get(name))
 
     def image(self, ref):
-        return copy.deepcopy(self.images.get(NEW if ref == self.target_ref else ref))
+        ref = {self.target_ref: NEW, self.agent_ref: AGENT_NEW}.get(ref, ref)
+        return copy.deepcopy(self.images.get(ref))
+
+    def network(self, name):
+        return copy.deepcopy(self.networks.get(name))
+
+    def add_previous_agent(self, *, project=True):
+        labels = {cd.PROJECT_LABEL: 'bajiao'} if project else {}
+        self.images[AGENT_OLD] = dict(image(AGENT_OLD, revision='e' * 40),
+                                      RepoDigests=[cd.AGENT_REPOSITORY + '@' + AGENT_OLD])
+        self.containers[cd.AGENT_CONTAINER] = {
+            'Image': AGENT_OLD, 'Config': {'Image': cd.AGENT_REPOSITORY + '@' + AGENT_OLD, 'Labels': labels},
+            'State': {'Running': True, 'Status': 'running', 'Health': {'Status': 'healthy'}},
+            'NetworkSettings': {'Networks': {cd.SHARED_NETWORK: {}}},
+        }
+        self.networks[cd.SHARED_NETWORK] = {'Name': cd.SHARED_NETWORK, 'Labels': {cd.PROJECT_LABEL: 'bajiao'}}
 
     def project_images(self):
         return {key for key, value in self.images.items()
@@ -86,21 +109,41 @@ class FakeDocker:
             if self.uncertain_operation == 'rename':
                 self.uncertain_operation = None
                 raise cd.DeploymentError('fixture lost rename acknowledgement')
+        elif args[:2] == ['container', 'create'] and args[args.index('--name') + 1] == cd.AGENT_CONTAINER:
+            assert cd.AGENT_CONTAINER not in self.containers
+            self.containers[cd.AGENT_CONTAINER] = {
+                'Image': AGENT_NEW, 'Config': {'Image': self.agent_ref, 'Labels': {cd.PROJECT_LABEL: 'bajiao'}},
+                'State': {'Running': False, 'Status': 'created', 'Health': {'Status': 'starting'}},
+                'NetworkSettings': {'Networks': {cd.SHARED_NETWORK: {}}},
+            }
         elif args[:2] == ['container', 'create']:
+            assert cd.CONTAINER not in self.containers
             created = copy.deepcopy(self.old)
             created['Image'] = NEW
             created['Config']['Image'] = self.target_ref
             created['Mounts'] = [m for m in created['Mounts'] if m['Destination'] != '/app/backend']
             created['State'] = {'Running': False, 'Status': 'created', 'Health': {'Status': 'starting'}}
+            network = args[args.index('--network') + 1]
+            created['HostConfig']['NetworkMode'] = network
+            created['NetworkSettings'] = {'Networks': {network: {}}}
             self.containers[cd.CONTAINER] = created
             if self.partial_create_failure:
                 raise cd.DeploymentError('fixture partial create')
         elif args[:2] == ['container', 'start']:
             target = self.containers[args[2]]
-            target['State'].update(Running=True, Status='running', Health={'Status':
-                'healthy' if target['Image'] != NEW or self.new_healthy else 'unhealthy'})
+            healthy = ((target['Image'] != NEW or self.new_healthy)
+                       and (target['Image'] != AGENT_NEW or self.agent_new_healthy))
+            target['State'].update(Running=True, Status='running',
+                                   Health={'Status': 'healthy' if healthy else 'unhealthy'})
             if target['Image'] == NEW:
                 self.on_new_start()
+        elif args[:2] == ['network', 'create']:
+            assert args[-1] not in self.networks
+            self.networks[args[-1]] = {'Name': args[-1], 'Labels': {cd.PROJECT_LABEL: 'bajiao'}}
+        elif args[:2] == ['network', 'connect']:
+            networks = self.containers[args[3]]['NetworkSettings']['Networks']
+            assert args[2] in self.networks and args[2] not in networks  # Docker rejects duplicates
+            networks[args[2]] = {}
         elif args[:2] == ['container', 'rm']:
             assert not self.containers[args[2]]['State']['Running']
             del self.containers[args[2]]
@@ -135,6 +178,8 @@ def setup(tmp_path):
     ('image', 'ghcr.io/other/project@sha256:' + 'b' * 64),
     ('image', cd.REPOSITORY + ':latest'), ('registry_user', '-option'),
     ('registry_token', 'secret\nleak'), ('run_number', True), ('run_number', 0),
+    ('agent_image', cd.REPOSITORY + '@sha256:' + 'c' * 64), ('agent_image', cd.AGENT_REPOSITORY + ':latest'),
+    ('agent_image', None),
 ])
 def test_invalid_request_is_rejected_before_any_docker(setup, field, value):
     runner, docker, _ = setup
@@ -157,8 +202,8 @@ def test_success_keeps_data_and_cleans_only_unused_project_images(setup, capsys)
     removed = runner.deploy(request())
     assert set(removed) == {OLD, UNUSED}
     assert docker.containers[cd.CONTAINER]['Image'] == NEW
-    assert set(docker.images) == {NEW, OTHER, STOPPED}
-    assert list(docker.containers) == [cd.CONTAINER]
+    assert set(docker.images) == {NEW, OTHER, STOPPED, AGENT_NEW}
+    assert set(docker.containers) == {cd.CONTAINER, cd.AGENT_CONTAINER}
     assert (root / '.env').read_bytes() == env
     assert cd.application_state(root / 'data/bstocks.db') == before
     marker = json.loads(runner.marker.read_text())
@@ -226,7 +271,7 @@ def test_cleanup_failure_does_not_roll_back_healthy_release(setup):
         runner.deploy(request())
     assert docker.containers[cd.CONTAINER]['Image'] == NEW
     assert runner.marker.exists()
-    assert not any(args[:2] == ['container', 'start'] and args[-1] != cd.CONTAINER
+    assert not any(args[:2] == ['container', 'start'] and args[-1] not in {cd.CONTAINER, cd.AGENT_CONTAINER}
                    for args, _ in docker.commands)
 
 
@@ -368,7 +413,7 @@ def test_failed_rollback_container_cleanup_is_reconciled_on_next_deploy(setup):
     docker.failure = None
     removed = runner.deploy(request())
     assert OLD in removed and OLD not in docker.images
-    assert list(docker.containers) == [cd.CONTAINER]
+    assert set(docker.containers) == {cd.CONTAINER, cd.AGENT_CONTAINER}
     assert json.loads(runner.marker.read_text())['pending_cleanup'] == []
     assert OTHER in docker.images and STOPPED in docker.images
 
@@ -383,3 +428,279 @@ def test_pending_cleanup_cannot_delete_other_service(setup):
         runner.deploy(request())
     assert 'another-service' in docker.containers
     assert not any(args == ['container', 'rm', 'another-service'] for args, _ in docker.commands)
+
+
+def test_request_without_agent_image_is_rejected():
+    payload = request()
+    del payload['agent_image']
+    with pytest.raises(cd.DeploymentError, match='Invalid deployment request fields'):
+        cd.validate_request(payload)
+
+
+def commands(docker, *prefix):
+    return [args for args, _ in docker.commands if args[:len(prefix)] == list(prefix)]
+
+
+def test_first_deploy_creates_network_agent_dir_and_agent(setup):
+    runner, docker, root = setup
+    runner.deploy(request())
+    assert commands(docker, 'network', 'create') == [
+        ['network', 'create', '--label', 'io.bajiao.project=bajiao', 'bajiao-net']]
+    agent_dir = root / 'data/agent'
+    assert agent_dir.is_dir() and agent_dir.stat().st_mode & 0o777 == 0o700
+    creates = commands(docker, 'container', 'create')
+    assert creates[0] == [
+        'container', 'create', '--name', 'bajiao-agent', '--restart', 'unless-stopped',
+        '--network', 'bajiao-net', '--label', 'io.bajiao.project=bajiao',
+        '--label', 'org.opencontainers.image.revision=' + REV, '--env', 'APP_REVISION=' + REV,
+        '--env', 'MAIN_URL=http://binance-bstocks-analysis-bot:8000',
+        '--mount', f'type=bind,src={agent_dir},dst=/agent-data', request()['agent_image']]
+    app_create = creates[1]
+    assert 'AGENT_URL=http://bajiao-agent:8080' in app_create
+    assert app_create[app_create.index('--network') + 1] == 'bstocks-bot_default'
+    order = [args[:2] + args[-1:] for args, _ in docker.commands if args[0] in {'container', 'network'}
+             and args[1] in {'create', 'start', 'connect'}]
+    assert order == [
+        ['network', 'create', 'bajiao-net'],
+        ['container', 'create', request()['agent_image']], ['container', 'start', cd.AGENT_CONTAINER],
+        ['container', 'create', request()['image']],
+        ['network', 'connect', cd.CONTAINER], ['container', 'start', cd.CONTAINER]]
+    assert commands(docker, 'network', 'connect') == [['network', 'connect', 'bajiao-net', cd.CONTAINER]]
+    assert docker.containers[cd.AGENT_CONTAINER]['Image'] == AGENT_NEW
+    assert docker.containers[cd.AGENT_CONTAINER]['State']['Running']
+    assert cd.SHARED_NETWORK in docker.containers[cd.CONTAINER]['NetworkSettings']['Networks']
+    marker = json.loads(runner.marker.read_text())
+    assert marker['agent_image'] == request()['agent_image']
+    assert marker['agent_image_id'] == AGENT_NEW
+    assert marker['managed_agent_images'] == [AGENT_NEW]
+    assert marker['pending_cleanup'] == []
+
+
+def test_agent_container_receives_no_env_file_or_published_port(setup):
+    runner, docker, _ = setup
+    runner.deploy(request())
+    agent = commands(docker, 'container', 'create')[0]
+    assert '--env-file' not in agent and '--publish' not in agent and '-p' not in agent
+
+
+def test_redeploy_replaces_previous_agent_and_cleans_its_image(setup):
+    runner, docker, _ = setup
+    docker.add_previous_agent()
+    removed = runner.deploy(request())
+    assert AGENT_OLD in removed and AGENT_OLD not in docker.images
+    assert AGENT_NEW in docker.images and NEW in docker.images
+    assert set(docker.containers) == {cd.CONTAINER, cd.AGENT_CONTAINER}
+    assert docker.containers[cd.AGENT_CONTAINER]['Image'] == AGENT_NEW
+    assert commands(docker, 'network', 'create') == []
+    renames = commands(docker, 'container', 'rename')
+    assert re.fullmatch(r'bajiao-agent\.rollback-10-[0-9]+', renames[0][3])
+    assert renames[0][2] == cd.AGENT_CONTAINER
+    stop_agent = docker.commands.index((['container', 'stop', '--time', '30', cd.AGENT_CONTAINER], None))
+    assert stop_agent < docker.commands.index((renames[0], None))
+    marker = json.loads(runner.marker.read_text())
+    assert marker['managed_agent_images'] == [AGENT_NEW]
+
+
+def test_agent_health_failure_restores_previous_agent_without_touching_app(setup):
+    runner, docker, root = setup
+    docker.add_previous_agent()
+    docker.agent_new_healthy = False
+    with pytest.raises(cd.DeploymentError, match='previous agent'):
+        runner.deploy(request())
+    assert not any(args[:2] == ['container', 'stop'] and args[-1] == cd.CONTAINER
+                   for args, _ in docker.commands)
+    assert docker.containers[cd.CONTAINER] == docker.old
+    assert set(docker.containers) == {cd.CONTAINER, cd.AGENT_CONTAINER}
+    agent = docker.containers[cd.AGENT_CONTAINER]
+    assert agent['Image'] == AGENT_OLD and agent['State']['Running']
+    assert not runner.marker.exists()
+    assert not any(args[:2] == ['image', 'rm'] for args, _ in docker.commands)
+
+
+def test_first_deploy_agent_failure_removes_new_agent(setup):
+    runner, docker, _ = setup
+    docker.agent_new_healthy = False
+    with pytest.raises(cd.DeploymentError, match='previous agent'):
+        runner.deploy(request())
+    assert list(docker.containers) == [cd.CONTAINER]
+    assert docker.containers[cd.CONTAINER] == docker.old
+
+
+def test_app_health_failure_rolls_back_app_and_agent(setup):
+    runner, docker, root = setup
+    docker.add_previous_agent()
+    docker.new_healthy = False
+    with pytest.raises(cd.DeploymentError, match='previous container restored'):
+        runner.deploy(request())
+    assert set(docker.containers) == {cd.CONTAINER, cd.AGENT_CONTAINER}
+    assert docker.containers[cd.CONTAINER]['Image'] == OLD
+    assert docker.containers[cd.CONTAINER]['State']['Running']
+    agent = docker.containers[cd.AGENT_CONTAINER]
+    assert agent['Image'] == AGENT_OLD and agent['State']['Running']
+    assert not runner.marker.exists()
+    assert not any(args[:2] == ['image', 'rm'] for args, _ in docker.commands)
+
+
+def test_first_deploy_app_failure_removes_new_agent_and_restores_old_app(setup):
+    runner, docker, _ = setup
+    docker.new_healthy = False
+    with pytest.raises(cd.DeploymentError, match='previous container restored'):
+        runner.deploy(request())
+    assert list(docker.containers) == [cd.CONTAINER]
+    assert docker.containers[cd.CONTAINER]['Image'] == OLD
+    assert docker.containers[cd.CONTAINER]['State']['Running']
+
+
+def test_partial_agent_create_is_removed_and_previous_agent_restored(setup):
+    runner, docker, _ = setup
+    docker.add_previous_agent()
+    original = docker.run
+    def run(args, **kwargs):
+        result = original(args, **kwargs)
+        if args[:2] == ['container', 'create'] and cd.AGENT_CONTAINER in args:
+            raise cd.DeploymentError('fixture partial agent create')
+        return result
+    docker.run = run
+    with pytest.raises(cd.DeploymentError, match='previous agent'):
+        runner.deploy(request())
+    assert docker.containers[cd.AGENT_CONTAINER]['Image'] == AGENT_OLD
+    assert docker.containers[cd.AGENT_CONTAINER]['State']['Running']
+    assert docker.containers[cd.CONTAINER] == docker.old
+
+
+def test_unlabeled_shared_network_is_refused(setup):
+    runner, docker, _ = setup
+    docker.networks[cd.SHARED_NETWORK] = {'Name': cd.SHARED_NETWORK, 'Labels': None}
+    with pytest.raises(cd.DeploymentError, match='network'):
+        runner.deploy(request())
+    assert not commands(docker, 'container', 'stop')
+    assert not commands(docker, 'container', 'create')
+    assert not commands(docker, 'network', 'create')
+    assert docker.containers[cd.CONTAINER]['State']['Running']
+
+
+def test_foreign_agent_container_is_never_touched(setup):
+    runner, docker, _ = setup
+    docker.add_previous_agent(project=False)
+    with pytest.raises(cd.DeploymentError, match='agent'):
+        runner.deploy(request())
+    assert not any(args[:2] in (['container', 'stop'], ['container', 'rename'], ['container', 'rm'],
+                                ['container', 'create']) for args, _ in docker.commands)
+    assert docker.containers[cd.AGENT_CONTAINER]['Image'] == AGENT_OLD
+
+
+def test_agent_image_identity_mismatch_leaves_everything_untouched(setup):
+    runner, docker, _ = setup
+    docker.images[AGENT_NEW]['Config']['Labels']['org.opencontainers.image.revision'] = 'f' * 40
+    with pytest.raises(cd.DeploymentError, match='identity'):
+        runner.deploy(request())
+    assert not commands(docker, 'container', 'stop')
+    assert not commands(docker, 'network', 'create')
+
+
+def test_symlinked_agent_data_directory_is_refused(setup, tmp_path_factory):
+    runner, docker, root = setup
+    outside = tmp_path_factory.mktemp('outside')
+    (root / 'data/agent').symlink_to(outside, target_is_directory=True)
+    with pytest.raises(cd.DeploymentError, match='symlink'):
+        runner.deploy(request())
+    assert not commands(docker, 'container', 'stop')
+    assert not commands(docker, 'container', 'create')
+
+
+def test_existing_agent_dir_is_kept(setup):
+    runner, docker, root = setup
+    (root / 'data/agent').mkdir(mode=0o700)
+    (root / 'data/agent/internal_token').write_text('fixture-token')
+    runner.deploy(request())
+    assert (root / 'data/agent/internal_token').read_text() == 'fixture-token'
+
+
+def test_network_connect_is_skipped_when_app_already_on_shared_network(setup):
+    runner, docker, _ = setup
+    docker.add_previous_agent()
+    for container in (docker.old, docker.containers[cd.CONTAINER]):
+        container['NetworkSettings']['Networks'][cd.SHARED_NETWORK] = {}
+    docker.old['HostConfig']['NetworkMode'] = cd.SHARED_NETWORK
+    docker.containers[cd.CONTAINER]['HostConfig']['NetworkMode'] = cd.SHARED_NETWORK
+    runner.deploy(request())
+    assert commands(docker, 'network', 'connect') == []
+    assert docker.containers[cd.CONTAINER]['Image'] == NEW
+
+
+def test_second_deploy_reconnects_new_app_container(setup):
+    runner, docker, _ = setup
+    runner.deploy(request())
+    docker.old = copy.deepcopy(docker.containers[cd.CONTAINER])
+    docker.commands.clear()
+    runner.deploy(request(run_number=11))
+    assert commands(docker, 'network', 'connect') == [['network', 'connect', 'bajiao-net', cd.CONTAINER]]
+    assert set(docker.containers) == {cd.CONTAINER, cd.AGENT_CONTAINER}
+
+
+def test_failed_agent_rollback_container_cleanup_is_reconciled(setup):
+    runner, docker, _ = setup
+    docker.add_previous_agent()
+    docker.failure = lambda args: args[:2] == ['container', 'rm']
+    with pytest.raises(cd.DeploymentError, match='healthy.*cleanup failed'):
+        runner.deploy(request())
+    pending = json.loads(runner.marker.read_text())['pending_cleanup']
+    assert {entry['image_id'] for entry in pending} == {OLD, AGENT_OLD}
+    assert any(re.fullmatch(r'bajiao-agent\.rollback-10-[0-9]+', entry['name']) for entry in pending)
+    docker.failure = None
+    removed = runner.deploy(request(run_number=11))
+    assert AGENT_OLD in removed and AGENT_OLD not in docker.images
+    assert set(docker.containers) == {cd.CONTAINER, cd.AGENT_CONTAINER}
+
+
+@pytest.mark.parametrize('name', ['bajiao-agent', 'bajiao-agent.rollback-0-1', 'bajiao-agentx.rollback-1-1',
+                                  'bajiao-agent.rollback-1-1;rm'])
+def test_pending_agent_cleanup_names_are_strict(setup, name):
+    runner, docker, _ = setup
+    with pytest.raises(cd.DeploymentError, match='Invalid pending'):
+        runner.cleanup_containers([{'name': name, 'image_id': AGENT_OLD}])
+
+
+def test_pending_agent_rollback_with_changed_image_is_not_removed(setup):
+    runner, docker, _ = setup
+    name = cd.AGENT_CONTAINER + '.rollback-3-1'
+    docker.containers[name] = {'Image': OTHER, 'State': {'Running': False}}
+    with pytest.raises(cd.DeploymentError, match='identity'):
+        runner.cleanup_containers([{'name': name, 'image_id': AGENT_OLD}])
+    assert name in docker.containers
+
+
+def test_cleanup_removes_old_agent_images_but_keeps_current(setup):
+    runner, docker, _ = setup
+    stale = 'sha256:' + '8' * 64
+    docker.images[stale] = dict(image(stale), RepoTags=[cd.AGENT_REPOSITORY + ':old'],
+                                RepoDigests=[cd.AGENT_REPOSITORY + '@' + stale])
+    docker.images[AGENT_NEW]['RepoDigests'] = [cd.AGENT_REPOSITORY + '@' + AGENT_NEW]
+    removed = runner.deploy(request())
+    assert stale in removed and stale not in docker.images
+    assert AGENT_NEW not in removed and AGENT_NEW in docker.images
+    assert NEW in docker.images
+
+
+@pytest.mark.parametrize('operation', ['stop', 'rename'])
+def test_lost_agent_acknowledgement_recovers_previous_agent(setup, operation):
+    runner, docker, _ = setup
+    docker.add_previous_agent()
+    docker.uncertain_operation = operation  # first stop/rename of the run is the agent's
+    with pytest.raises(cd.DeploymentError, match='previous agent'):
+        runner.deploy(request())
+    assert set(docker.containers) == {cd.CONTAINER, cd.AGENT_CONTAINER}
+    agent = docker.containers[cd.AGENT_CONTAINER]
+    assert agent['Image'] == AGENT_OLD and agent['State']['Running']
+    assert docker.containers[cd.CONTAINER] == docker.old
+
+
+def test_unconfirmed_agent_rollback_is_reported(setup):
+    runner, docker, _ = setup
+    docker.add_previous_agent()
+    docker.new_healthy = False
+    docker.failure = lambda args: args[:2] == ['container', 'rename'] and args[-1] == cd.AGENT_CONTAINER
+    with pytest.raises(cd.DeploymentError, match='rollback could not be confirmed'):
+        runner.deploy(request())
+    assert docker.containers[cd.CONTAINER]['Image'] == OLD  # application still restored first
+    assert docker.containers[cd.CONTAINER]['State']['Running']
