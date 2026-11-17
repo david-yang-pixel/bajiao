@@ -44,8 +44,12 @@ class AnalysisStore:
                 if row:
                     if row[1] != 'failed' or not row[2] or datetime.now(timezone.utc)-datetime.fromisoformat(row[2]) < timedelta(minutes=5):
                         return row[0], False
+                    # A keyed (scheduled) run that already started agent sessions spent quota: never auto-retry it.
+                    if await (await db.execute('SELECT 1 FROM agent_sessions WHERE run_id=? LIMIT 1', (row[0],))).fetchone():
+                        return row[0], False
                     try:
-                        await db.execute("UPDATE analysis_runs SET status='running',started_at=?,finished_at=NULL WHERE id=?", (timestamp(),row[0]))
+                        await db.execute('''UPDATE analysis_runs SET status='running',started_at=?,finished_at=NULL,
+                            push_status='not_requested' WHERE id=?''', (timestamp(),row[0]))
                     except sqlite3.IntegrityError:
                         raise AnalysisBusy('已有分析正在运行，请稍后查看结果') from None
                     await db.commit()
@@ -66,6 +70,71 @@ class AnalysisStore:
             await db.execute('''UPDATE analysis_runs SET status=?,count=?,errors_json=?,diagnostics_json=?,
                 message=?,finished_at=? WHERE id=?''', (status,len(picks),encode(errors),encode(diagnostics),message,timestamp(),run_id))
             await db.commit()
+
+    async def insert_short_term_picks(self, run_id, picks):
+        ids = []
+        async with aiosqlite.connect(self.db_path, timeout=15) as db:
+            for pick in picks:
+                cursor = await db.execute('''INSERT INTO daily_picks
+                    (symbol,reason,target_price,run_id,report_json,strategy,track_status,expires_after)
+                    VALUES (?,?,?,?,?,'short_term_1w','active',?)''',
+                    (pick['symbol'],pick['reason'],pick.get('target_price_usd'),run_id,encode(pick),pick.get('expires_after')))
+                ids.append(cursor.lastrowid)
+            await db.commit()
+        return ids
+
+    async def active_short_term_picks(self):
+        rows = await self.rows("SELECT * FROM daily_picks WHERE strategy='short_term_1w' AND track_status='active' AND hidden=0 ORDER BY id")
+        result = []
+        for row in rows:
+            report = json.loads(row['report_json']) if row.get('report_json') else {}
+            result.append({**row,**report,'id':row['id'],'run_id':row['run_id']})
+            result[-1].pop('report_json',None)
+        return result
+
+    async def record_pick_event(self, pick_id, event, price_usd, detail):
+        status = {'target_hit':'target_hit','stopped':'stopped','expired':'expired'}.get(event)
+        async with aiosqlite.connect(self.db_path, timeout=15) as db:
+            now = timestamp()
+            cursor = await db.execute('''INSERT OR IGNORE INTO pick_events (pick_id,event,price_usd,detail,created_at)
+                VALUES (?,?,?,?,?)''', (pick_id,event,price_usd,detail,now))
+            if cursor.rowcount != 1:
+                return False
+            if status:
+                await db.execute('UPDATE daily_picks SET track_status=?,track_updated_at=? WHERE id=?', (status,now,pick_id))
+            await db.commit()
+            return True
+
+    async def unnotified_events(self):
+        return await self.rows('''SELECT e.*,p.symbol AS symbol,json_extract(p.report_json,'$.underlying_symbol') AS underlying_symbol
+            FROM pick_events e JOIN daily_picks p ON p.id=e.pick_id WHERE e.notified=0 ORDER BY e.id''')
+
+    async def mark_events_notified(self, ids):
+        if ids:
+            await self.execute(f"UPDATE pick_events SET notified=1 WHERE id IN ({','.join('?'*len(ids))})", tuple(ids))
+
+    async def start_session(self, run_id, symbol, purpose):
+        async with aiosqlite.connect(self.db_path, timeout=15) as db:
+            cursor = await db.execute("INSERT INTO agent_sessions (run_id,symbol,purpose,status,started_at) VALUES (?,?,?,'running',?)",
+                (run_id,symbol,purpose,timestamp()))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def finish_session(self, session_id, status, decision, price_usd, atr14, result, error):
+        await self.execute('''UPDATE agent_sessions SET status=?,decision=?,price_usd=?,atr14=?,finished_at=?,
+            result_json=?,error=? WHERE id=?''', (status,decision,price_usd,atr14,timestamp(),encode(result),error,session_id))
+
+    async def sessions_started_since(self, since_iso):
+        rows = await self.rows('SELECT count(*) AS n FROM agent_sessions WHERE started_at>=?', (since_iso,))
+        return rows[0]['n']
+
+    async def last_ok_session(self, symbol, purpose):
+        rows = await self.rows("SELECT * FROM agent_sessions WHERE symbol=? AND purpose=? AND status='ok' ORDER BY finished_at DESC,id DESC LIMIT 1", (symbol,purpose))
+        if not rows:
+            return None
+        row = rows[0]
+        row['result'] = json.loads(row.pop('result_json') or '{}')
+        return row
 
     async def recover_interrupted(self):
         # One application worker is the supported deployment mode.
@@ -149,5 +218,6 @@ class AnalysisStore:
         return status
 
     async def list_reviews(self):
-        return await self.rows('''SELECT r.*,p.symbol,json_extract(p.report_json,'$.underlying_symbol') AS underlying_symbol
+        return await self.rows('''SELECT r.*,p.symbol,json_extract(p.report_json,'$.underlying_symbol') AS underlying_symbol,
+            json_extract(p.report_json,'$.as_of') AS pick_as_of
             FROM analysis_reviews r JOIN daily_picks p ON p.id=r.pick_id ORDER BY r.id DESC LIMIT 200''')

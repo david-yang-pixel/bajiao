@@ -13,6 +13,7 @@ from typing import Mapping
 
 
 IMAGE_PATTERN = r"ghcr\.io/david-yang-pixel/bajiao@sha256:[0-9a-f]{64}"
+AGENT_IMAGE_PATTERN = r"ghcr\.io/david-yang-pixel/bajiao-agent@sha256:[0-9a-f]{64}"
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -29,9 +30,12 @@ def _matches(value: str, pattern: str, name: str) -> str:
 
 
 def build_request(env: Mapping[str, str]) -> dict[str, str | int]:
-    """Validate and return exactly the receiver's five-field JSON schema."""
+    """Validate and return exactly the receiver's six-field JSON schema."""
     revision = _matches(_required(env, "GITHUB_SHA"), r"[0-9a-f]{40}", "GITHUB_SHA")
     image = _matches(_required(env, "IMAGE_DIGEST"), IMAGE_PATTERN, "IMAGE_DIGEST")
+    agent_image = _matches(
+        _required(env, "AGENT_IMAGE_DIGEST"), AGENT_IMAGE_PATTERN, "AGENT_IMAGE_DIGEST"
+    )
     actor = _matches(
         _required(env, "GITHUB_ACTOR"),
         r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}(?:\[bot\])?",
@@ -46,6 +50,7 @@ def build_request(env: Mapping[str, str]) -> dict[str, str | int]:
     return {
         "revision": revision,
         "image": image,
+        "agent_image": agent_image,
         "registry_user": actor,
         "registry_token": token,
         "run_number": int(run_number),

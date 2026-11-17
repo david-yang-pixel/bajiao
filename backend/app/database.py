@@ -36,7 +36,9 @@ async def init_db(db_path: str = None):
             target_price REAL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         await _add_columns(db, 'daily_picks', {'run_id':'INTEGER', 'report_json':'TEXT',
-            'hidden':'INTEGER NOT NULL DEFAULT 0'})
+            'hidden':'INTEGER NOT NULL DEFAULT 0',
+            'strategy':"TEXT NOT NULL DEFAULT 'swing_2_4w'", 'track_status':"TEXT NOT NULL DEFAULT 'legacy'",
+            'track_updated_at':'TEXT', 'expires_after':'TEXT'})
         await db.execute('''CREATE TABLE IF NOT EXISTS alert_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, position_id INTEGER, symbol TEXT NOT NULL,
             message TEXT NOT NULL, alert_type TEXT NOT NULL,
@@ -71,4 +73,17 @@ async def init_db(db_path: str = None):
             excess_return_pct REAL NOT NULL, UNIQUE(pick_id,horizon_sessions),
             FOREIGN KEY(pick_id) REFERENCES daily_picks(id)
         )''')
+        await _add_columns(db, 'analysis_reviews', {'outcome':'TEXT'})
+        await db.execute('''CREATE TABLE IF NOT EXISTS pick_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, pick_id INTEGER NOT NULL, event TEXT NOT NULL,
+            price_usd REAL, detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+            notified INTEGER NOT NULL DEFAULT 0, UNIQUE(pick_id,event)
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS agent_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, symbol TEXT NOT NULL,
+            purpose TEXT NOT NULL, status TEXT NOT NULL, decision TEXT, price_usd REAL, atr14 REAL,
+            started_at TEXT NOT NULL, finished_at TEXT, result_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT NOT NULL DEFAULT ''
+        )''')
+        await db.execute('CREATE INDEX IF NOT EXISTS agent_sessions_symbol ON agent_sessions(symbol,finished_at)')
         await db.commit()

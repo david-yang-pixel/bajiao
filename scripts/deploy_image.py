@@ -25,6 +25,14 @@ CONTAINER = 'binance-bstocks-analysis-bot'
 REPOSITORY = 'ghcr.io/david-yang-pixel/bajiao'
 PROJECT_LABEL = 'io.bajiao.project'
 LEGACY_REPOSITORY = 'bstocks-bot-bstocks-bot'
+AGENT_CONTAINER = 'bajiao-agent'
+AGENT_REPOSITORY = 'ghcr.io/david-yang-pixel/bajiao-agent'
+SHARED_NETWORK = 'bajiao-net'
+MAIN_URL = 'http://' + CONTAINER + ':8000'
+AGENT_URL = 'http://' + AGENT_CONTAINER + ':8080'
+ROLLBACK_NAME = r'\.rollback-[1-9][0-9]*-[0-9]+'
+# FMP_API_KEY is no longer used by the app; it stays listed only so an existing
+# value in a running container's runtime env file is migrated, not dropped.
 APP_ENV = {
     'BINANCE_API_KEY', 'BINANCE_API_SECRET', 'BINANCE_MCP_URL',
     'FEISHU_WEBHOOK_URL', 'FEISHU_APP_ID', 'FEISHU_APP_SECRET',
@@ -40,12 +48,13 @@ class DeploymentError(RuntimeError):
 
 def validate_request(payload):
     if not isinstance(payload, dict) or set(payload) != {
-        'revision', 'image', 'registry_user', 'registry_token', 'run_number'
+        'revision', 'image', 'agent_image', 'registry_user', 'registry_token', 'run_number'
     }:
         raise DeploymentError('Invalid deployment request fields')
     rules = {
         'revision': r'[0-9a-f]{40}',
         'image': re.escape(REPOSITORY) + r'@sha256:[0-9a-f]{64}',
+        'agent_image': re.escape(AGENT_REPOSITORY) + r'@sha256:[0-9a-f]{64}',
         'registry_user': r'[A-Za-z0-9][A-Za-z0-9_\[\]-]{0,99}',
         'registry_token': r'[A-Za-z0-9_.-]{8,2048}',
     }
@@ -78,6 +87,10 @@ class Docker:
 
     def image(self, image):
         data = self.run(['image', 'inspect', image], optional=True)
+        return json.loads(data)[0] if data is not None else None
+
+    def network(self, name):
+        data = self.run(['network', 'inspect', name], optional=True)
         return json.loads(data)[0] if data is not None else None
 
     def project_images(self):
@@ -191,6 +204,49 @@ class Deployment:
             time.sleep(2)
         raise DeploymentError('Application health verification timed out')
 
+    def wait_agent_ready(self, expected_image):
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            current = self.docker.container(AGENT_CONTAINER)
+            if (not current or current['Image'] != expected_image
+                    or current['State'].get('Status') in {'exited', 'dead'}):
+                raise DeploymentError('Agent exited or image identity changed')
+            health = current['State'].get('Health', {}).get('Status')
+            if health == 'unhealthy':
+                raise DeploymentError('Agent container is unhealthy')
+            if health == 'healthy':
+                return
+            time.sleep(2)
+        raise DeploymentError('Agent health verification timed out')
+
+    def validate_agent(self, agent):
+        # First deployment has no agent; an existing one must belong to this project.
+        if agent is None:
+            return
+        labels = agent.get('Config', {}).get('Labels') or {}
+        if labels.get(PROJECT_LABEL) != 'bajiao' or not image_id(agent.get('Image')):
+            raise DeploymentError('Existing agent container is not owned by this project')
+
+    def ensure_network(self):
+        network = self.docker.network(SHARED_NETWORK)
+        if network is None:
+            self.docker.run(['network', 'create', '--label', f'{PROJECT_LABEL}=bajiao', SHARED_NETWORK])
+        elif (network.get('Labels') or {}).get(PROJECT_LABEL) != 'bajiao':
+            raise DeploymentError('Shared network exists but is not owned by this project')
+
+    def agent_dir(self):
+        return self.root / 'data' / 'agent'
+
+    def ensure_agent_dir(self):
+        directory = self.agent_dir()
+        if not directory.parent.is_dir() or directory.parent.is_symlink() or directory.is_symlink():
+            raise DeploymentError('Agent data directory or its parent cannot be missing or a symlink')
+        if not directory.exists():
+            directory.mkdir(mode=0o700)
+            directory.chmod(0o700)
+        elif not directory.is_dir():
+            raise DeploymentError('Agent data path is not a directory')
+
     def pull(self, request):
         with tempfile.TemporaryDirectory(prefix='registry-', dir=self.ci) as directory:
             os.chmod(directory, 0o700)
@@ -198,12 +254,16 @@ class Deployment:
                              request['registry_user'], '--password-stdin'],
                             input=request['registry_token'] + '\n')
             self.docker.run(['--config', directory, 'pull', request['image']])
-        image = self.docker.image(request['image'])
-        labels = (image or {}).get('Config', {}).get('Labels') or {}
-        if (not image or not image_id(image['Id']) or labels.get(PROJECT_LABEL) != 'bajiao'
-                or labels.get('org.opencontainers.image.revision') != request['revision']):
-            raise DeploymentError('Image project or revision identity does not match')
-        return image['Id']
+            self.docker.run(['--config', directory, 'pull', request['agent_image']])
+        identities = []
+        for reference in (request['image'], request['agent_image']):
+            image = self.docker.image(reference)
+            labels = (image or {}).get('Config', {}).get('Labels') or {}
+            if (not image or not image_id(image['Id']) or labels.get(PROJECT_LABEL) != 'bajiao'
+                    or labels.get('org.opencontainers.image.revision') != request['revision']):
+                raise DeploymentError('Image project or revision identity does not match')
+            identities.append(image['Id'])
+        return identities[0], identities[1]
 
     def write_runtime(self, old, target):
         values = {}
@@ -232,7 +292,7 @@ class Deployment:
             args.extend(['--env-file', str(env_file)])
         # Effective existing application env remains authoritative. Never rewrite .env.
         args.extend(['--env-file', str(runtime), '--env', 'DB_PATH=/app/data/bstocks.db',
-                     '--env', 'APP_REVISION=' + request['revision']])
+                     '--env', 'APP_REVISION=' + request['revision'], '--env', 'AGENT_URL=' + AGENT_URL])
         for directory in ('data', 'logs'):
             target = self.root / directory
             if not target.is_dir() or target.is_symlink():
@@ -247,6 +307,24 @@ class Deployment:
         args.append(request['image'])
         # No backend source mount: application bytes come from the tested image.
         self.docker.run(args)
+
+    def connect_shared_network(self):
+        current = self.docker.container(CONTAINER)
+        if not current:
+            raise DeploymentError('Created application container could not be located')
+        if SHARED_NETWORK not in ((current.get('NetworkSettings') or {}).get('Networks') or {}):
+            self.docker.run(['network', 'connect', SHARED_NETWORK, CONTAINER])
+
+    def create_agent(self, request):
+        directory = self.agent_dir()
+        if not directory.is_dir() or directory.is_symlink():
+            raise DeploymentError('Missing or symlinked agent data directory')
+        # Internal only: no published port and no production .env (agent reads /agent-data).
+        self.docker.run(['container', 'create', '--name', AGENT_CONTAINER, '--restart', 'unless-stopped',
+                         '--network', SHARED_NETWORK, '--label', f'{PROJECT_LABEL}=bajiao',
+                         '--label', 'org.opencontainers.image.revision=' + request['revision'],
+                         '--env', 'APP_REVISION=' + request['revision'], '--env', 'MAIN_URL=' + MAIN_URL,
+                         '--mount', f'type=bind,src={directory},dst=/agent-data', request['agent_image']])
 
     def rollback(self, old, backup_name, renamed, candidate):
         # Reconcile actual state: a successful stop/rename may lose its CLI acknowledgement.
@@ -268,12 +346,36 @@ class Deployment:
         self.wait_ready(old['Image'])
         # Do not restore SQLite automatically: preserve writes accepted by the new app.
 
-    def cleanup_images(self, current_image, managed):
-        candidates = self.docker.project_images() | set(managed)
+    def rollback_agent(self, previous, backup_name, candidate):
+        # Same reconciliation as the application: trust inspected state, not CLI acknowledgements.
+        backup = self.docker.container(backup_name) if previous else None
+        current = self.docker.container(AGENT_CONTAINER)
+        if previous and not backup and current and current['Image'] == previous['Image']:
+            current = None  # never renamed: the inspected container is still the previous agent
+            restore = False
+        else:
+            restore = bool(previous)
+        if current:
+            if not candidate:
+                raise DeploymentError('Unexpected agent container appeared during rollback')
+            if current['State'].get('Running'):
+                self.docker.run(['container', 'stop', '--time', '30', AGENT_CONTAINER])
+            self.docker.run(['container', 'rm', AGENT_CONTAINER])
+        if not previous:
+            return  # first agent deployment: nothing to restore, old app does not need it
+        if restore:
+            if not backup or backup['Image'] != previous['Image']:
+                raise DeploymentError('Previous agent could not be located for rollback')
+            self.docker.run(['container', 'rename', backup_name, AGENT_CONTAINER])
+        self.docker.run(['container', 'start', AGENT_CONTAINER])
+        self.wait_agent_ready(previous['Image'])
+
+    def cleanup_images(self, current_images, managed, managed_agent=()):
+        candidates = self.docker.project_images() | set(managed) | set(managed_agent)
         used = self.docker.used_images()  # includes stopped containers, not just running ones
         removed = []
         for candidate in sorted(candidates):
-            if not image_id(candidate) or candidate == current_image or candidate in used:
+            if not image_id(candidate) or candidate in current_images or candidate in used:
                 continue
             image = self.docker.image(candidate)
             if not image:
@@ -281,10 +383,10 @@ class Deployment:
             tags = image.get('RepoTags') or []
             digests = image.get('RepoDigests') or []
             def allowed_digest(reference):
-                return (reference.startswith(REPOSITORY + '@sha256:')
+                return (reference.startswith((REPOSITORY + '@sha256:', AGENT_REPOSITORY + '@sha256:'))
                         or (candidate in managed and reference.startswith(LEGACY_REPOSITORY + '@sha256:')))
             def allowed_tag(reference):
-                return (reference.startswith(REPOSITORY + ':')
+                return (reference.startswith((REPOSITORY + ':', AGENT_REPOSITORY + ':'))
                         or reference == LEGACY_REPOSITORY + ':latest' or allowed_digest(reference))
             if (any(not allowed_tag(tag) for tag in tags)
                     or any(not allowed_digest(digest) for digest in digests)):
@@ -292,7 +394,7 @@ class Deployment:
                 continue
             labels = image.get('Config', {}).get('Labels') or {}
             if labels.get(PROJECT_LABEL) != 'bajiao' and candidate not in managed:
-                continue
+                continue  # unlabeled images are only ever the recorded legacy application image
             for tag in tags:
                 self.docker.run(['image', 'rm', tag])
             if self.docker.image(candidate):
@@ -306,7 +408,8 @@ class Deployment:
         for entry in pending:
             if (not isinstance(entry, dict) or set(entry) != {'name', 'image_id'}
                     or not isinstance(entry['name'], str)
-                    or not re.fullmatch(re.escape(CONTAINER) + r'\.rollback-[1-9][0-9]*-[0-9]+', entry['name'])
+                    or not re.fullmatch('(?:' + re.escape(CONTAINER) + '|' + re.escape(AGENT_CONTAINER) + ')'
+                                        + ROLLBACK_NAME, entry['name'])
                     or not image_id(entry['image_id'])):
                 raise DeploymentError('Invalid pending project cleanup record')
             container = self.docker.container(entry['name'])
@@ -328,10 +431,19 @@ class Deployment:
                 raise DeploymentError('Refusing an older workflow run')
             old = self.docker.container(CONTAINER)
             self.validate_current(old)
+            previous_agent = self.docker.container(AGENT_CONTAINER)
+            self.validate_agent(previous_agent)
             managed = set(marker.get('managed_images', [])) | {old['Image']}
-            target_image = self.pull(request)
+            managed_agent = set(marker.get('managed_agent_images', []))
+            if previous_agent:
+                managed_agent.add(previous_agent['Image'])
+            target_image, target_agent_image = self.pull(request)
             managed.add(target_image)
+            managed_agent.add(target_agent_image)
+            self.ensure_network()
+            self.ensure_agent_dir()
             backup_name = CONTAINER + '.rollback-' + str(request['run_number']) + '-' + str(time.time_ns())
+            agent_backup_name = AGENT_CONTAINER + '.rollback-' + str(request['run_number']) + '-' + str(time.time_ns())
             backup = self.root / 'backups' / ('cicd-' + request['revision'][:12] + '-' + str(time.time_ns()))
             backup.mkdir(mode=0o700, parents=True)
             runtime = backup / 'runtime.env'
@@ -340,8 +452,19 @@ class Deployment:
             env_file = self.root / '.env'
             env_hash = hashlib.sha256(env_file.read_bytes()).hexdigest() if env_file.exists() else None
             pending = list(marker.get('pending_cleanup', [])) + [{'name': backup_name, 'image_id': old['Image']}]
-            stopped = renamed = candidate = False
+            if previous_agent:
+                pending.append({'name': agent_backup_name, 'image_id': previous_agent['Image']})
+            stopped = renamed = candidate = agent_started = agent_candidate = False
             try:
+                # Agent first: if it cannot become healthy the application is never touched.
+                agent_started = True  # attempt agent recovery even if an acknowledgement is lost
+                if previous_agent:
+                    self.docker.run(['container', 'stop', '--time', '30', AGENT_CONTAINER])
+                    self.docker.run(['container', 'rename', AGENT_CONTAINER, agent_backup_name])
+                agent_candidate = True  # also remove a partially created agent if Docker errors
+                self.create_agent(request)
+                self.docker.run(['container', 'start', AGENT_CONTAINER])
+                self.wait_agent_ready(target_agent_image)
                 stopped = True  # attempt recovery even if the stop acknowledgement is lost
                 self.docker.run(['container', 'stop', '--time', '30', CONTAINER])
                 before = application_state(database)
@@ -350,6 +473,7 @@ class Deployment:
                 renamed = True
                 candidate = True  # also remove a partially created container if Docker errors
                 self.create(request, old, runtime)
+                self.connect_shared_network()
                 self.docker.run(['container', 'start', CONTAINER])
                 self.wait_ready(target_image, request['revision'])
                 if application_state(database) != before:
@@ -361,23 +485,37 @@ class Deployment:
                     'revision': request['revision'], 'image': request['image'],
                     'image_id': target_image, 'run_number': request['run_number'],
                     'managed_images': sorted(managed), 'deployed_at': int(time.time()),
-                    'pending_cleanup': pending,
+                    'agent_image': request['agent_image'], 'agent_image_id': target_agent_image,
+                    'managed_agent_images': sorted(managed_agent), 'pending_cleanup': pending,
                 }
                 atomic_json(self.marker, current_marker)
             except Exception:
-                if stopped:
+                confirmed = True
+                if stopped:  # old application first: it is healthy without any agent
                     try:
                         self.rollback(old, backup_name, renamed, candidate)
                     except Exception:
-                        raise DeploymentError('Deployment failed and rollback could not be confirmed; inspect server') from None
+                        confirmed = False
+                if agent_started:
+                    try:
+                        self.rollback_agent(previous_agent, agent_backup_name, agent_candidate)
+                    except Exception:
+                        confirmed = False
+                if not confirmed:
+                    raise DeploymentError('Deployment failed and rollback could not be confirmed; inspect server') from None
+                if stopped:
                     raise DeploymentError('Deployment failed; previous container restored and database kept') from None
+                if agent_started:
+                    raise DeploymentError('Deployment failed before application switch; previous agent state restored') from None
                 raise DeploymentError('Deployment failed before container switch') from None
             # Commit succeeded: never roll a healthy application back because cleanup failed.
             try:
                 self.cleanup_containers(pending)
-                removed = self.cleanup_images(target_image, managed)
+                removed = self.cleanup_images({target_image, target_agent_image}, managed, managed_agent)
                 current_marker['pending_cleanup'] = []
                 current_marker['managed_images'] = sorted(identity for identity in managed if self.docker.image(identity))
+                current_marker['managed_agent_images'] = sorted(
+                    identity for identity in managed_agent if self.docker.image(identity))
                 atomic_json(self.marker, current_marker)
             except Exception:
                 raise DeploymentError('New version is healthy, but old-container/image cleanup failed; retry cleanup') from None

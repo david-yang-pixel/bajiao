@@ -17,6 +17,7 @@ def env():
         "DEPLOY_SSH_KEY": "fixture-only-private-key\nnot-a-real-private-key",
         "DEPLOY_KNOWN_HOSTS": "deploy.example.test ssh-ed25519 fixture-host-key",
         "IMAGE_DIGEST": "ghcr.io/david-yang-pixel/bajiao@sha256:" + "b" * 64,
+        "AGENT_IMAGE_DIGEST": "ghcr.io/david-yang-pixel/bajiao-agent@sha256:" + "c" * 64,
         "GITHUB_SHA": "a" * 40,
         "GITHUB_ACTOR": "david-yang-pixel",
         "GHCR_TOKEN": "ghs_private_fixture_token",
@@ -38,6 +39,7 @@ def test_build_request_has_exact_schema(env):
     assert cd_client.build_request(env) == {
         "revision": "a" * 40,
         "image": "ghcr.io/david-yang-pixel/bajiao@sha256:" + "b" * 64,
+        "agent_image": "ghcr.io/david-yang-pixel/bajiao-agent@sha256:" + "c" * 64,
         "registry_user": "david-yang-pixel",
         "registry_token": "ghs_private_fixture_token",
         "run_number": 42,
@@ -52,7 +54,7 @@ def test_bot_actor_is_valid(env):
 
 @pytest.mark.parametrize("name", [
     "DEPLOY_HOST", "DEPLOY_SSH_KEY", "DEPLOY_KNOWN_HOSTS", "IMAGE_DIGEST",
-    "GITHUB_SHA", "GITHUB_ACTOR", "GHCR_TOKEN", "GITHUB_RUN_NUMBER",
+    "AGENT_IMAGE_DIGEST", "GITHUB_SHA", "GITHUB_ACTOR", "GHCR_TOKEN", "GITHUB_RUN_NUMBER",
 ])
 @pytest.mark.parametrize("missing", [None, "", " \n\t"])
 def test_missing_required_values_never_start_ssh(env, name, missing):
@@ -77,6 +79,12 @@ def test_missing_required_values_never_start_ssh(env, name, missing):
     ("IMAGE_DIGEST", "ghcr.io/david-yang-pixel/bajiao@sha256:" + "b" * 63),
     ("IMAGE_DIGEST", "ghcr.io/david-yang-pixel/bajiao@sha256:" + "b" * 65),
     ("IMAGE_DIGEST", "ghcr.io/david-yang-pixel/bajiao@sha256:" + "b" * 64 + "\n"),
+    ("AGENT_IMAGE_DIGEST", "ghcr.io/david-yang-pixel/bajiao-agent:latest"),
+    ("AGENT_IMAGE_DIGEST", "ghcr.io/david-yang-pixel/bajiao@sha256:" + "c" * 64),
+    ("AGENT_IMAGE_DIGEST", "ghcr.io/other/bajiao-agent@sha256:" + "c" * 64),
+    ("AGENT_IMAGE_DIGEST", "ghcr.io/david-yang-pixel/bajiao-agent@sha256:" + "C" * 64),
+    ("AGENT_IMAGE_DIGEST", "ghcr.io/david-yang-pixel/bajiao-agent@sha256:" + "c" * 63),
+    ("AGENT_IMAGE_DIGEST", "ghcr.io/david-yang-pixel/bajiao-agent@sha256:" + "c" * 64 + "\n"),
     ("GITHUB_ACTOR", "-option"),
     ("GITHUB_ACTOR", "user\nother"),
     ("GITHUB_ACTOR", "user;command"),
