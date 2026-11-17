@@ -346,6 +346,7 @@ class ShortTermService:
         if self._lock.locked():
             raise AnalysisBusy('已有分析正在运行，请稍后查看结果')
         async with self._lock:
+            prev = (await self.store.rows('SELECT id,status,message,push_status FROM analysis_runs WHERE run_key=?', (run_key,)) or [None])[0] if run_key else None
             run_id, claimed = await self.store.begin_run(run_key, push_notifications)
             if not claimed:
                 return await self._result(run_id)
@@ -368,7 +369,14 @@ class ShortTermService:
                 msg = '分析执行异常，请检查数据与模型服务'
                 await self._abort_run(run_id, [{'symbol': '*', 'stage': 'data', 'message': msg}], msg)
             if push_notifications:
-                await self.push_run(run_id)
+                final = await self.store.get_run(run_id)
+                if prev and prev['id'] == run_id and final['status'] == prev['status'] and final['message'] == prev['message']:
+                    # Re-claimed slot ended exactly as before: its message was already pushed; do not repeat it.
+                    await self.store.execute('UPDATE analysis_runs SET push_status=? WHERE id=?', (prev['push_status'], run_id))
+                else:
+                    if prev and prev['id'] == run_id:  # the earlier attempt's message is outdated; push this outcome
+                        await self.store.execute('DELETE FROM analysis_deliveries WHERE run_id=?', (run_id,))
+                    await self.push_run(run_id)
             return await self._result(run_id)
 
     async def _abort_run(self, run_id, errors, message):

@@ -329,3 +329,37 @@ async def test_position_review_shares_agent_concurrency_limit_with_runs(svc_fact
     await run_task
     await asyncio.gather(review_task, return_exceptions=True)
     assert state['peak'] == 2 and len(svc.agent.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_unchanged_failed_scheduled_run_is_not_repushed(svc_factory):
+    from backend.tests.test_short_term_tracking import FakeNotifier
+    svc = svc_factory({'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')})
+    svc.notifier = FakeNotifier()
+    svc.agent.health_state = {'status': 'ok', 'auth': 'expired'}
+    key = 'schedule:2026-11-16:09:00'
+    first = await svc.run(push_notifications=True, run_key=key)
+    for _ in range(5):
+        await _age_run(svc.store, first['run_id'])
+        again = await svc.run(push_notifications=True, run_key=key)
+        assert again['run_id'] == first['run_id'] and again['status'] == 'failed'
+    assert len(svc.notifier.sent) == 1
+    assert (await svc.store.get_run(first['run_id']))['push_status'] == 'success'
+    svc.agent.health_state = {'status': 'ok', 'auth': 'valid'}
+    await _age_run(svc.store, first['run_id'])
+    retry = await svc.run(push_notifications=True, run_key=key)
+    assert retry['status'] == 'completed' and len(svc.notifier.sent) == 2 and '本轮新增 2 只' in svc.notifier.sent[1][1]
+
+
+@pytest.mark.asyncio
+async def test_changed_failure_reason_on_retry_pushes_again(svc_factory):
+    from backend.tests.test_short_term_tracking import FakeNotifier
+    svc = svc_factory({'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')})
+    svc.notifier = FakeNotifier()
+    svc.agent.health_state = {'status': 'unreachable', 'auth': 'unknown'}
+    key = 'schedule:2026-11-16:09:00'
+    first = await svc.run(push_notifications=True, run_key=key)
+    svc.agent.health_state = {'status': 'ok', 'auth': 'expired'}
+    await _age_run(svc.store, first['run_id'])
+    await svc.run(push_notifications=True, run_key=key)
+    assert len(svc.notifier.sent) == 2 and svc.notifier.sent[0][1] != svc.notifier.sent[1][1]

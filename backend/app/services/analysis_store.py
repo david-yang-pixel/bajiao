@@ -52,8 +52,6 @@ class AnalysisStore:
                             push_status='not_requested' WHERE id=?''', (timestamp(),row[0]))
                     except sqlite3.IntegrityError:
                         raise AnalysisBusy('已有分析正在运行，请稍后查看结果') from None
-                    # The failed attempt's message may already be (partly) delivered; the re-run pushes its own result.
-                    await db.execute('DELETE FROM analysis_deliveries WHERE run_id=?', (row[0],))
                     await db.commit()
                     return row[0], True
             try:
