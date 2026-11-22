@@ -21,6 +21,7 @@ jobs:
       packages: write
     outputs:
       image: ${{ steps.publish.outputs.image }}
+      agent_image: ${{ steps.publish.outputs.agent_image }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,7 +43,17 @@ jobs:
             --mount "type=bind,src=$GITHUB_WORKSPACE/scripts,dst=/app/scripts,readonly" \
             "ghcr.io/david-yang-pixel/bajiao:$GITHUB_SHA" \
             -m pytest backend/tests -q -p no:cacheprovider
-      - name: Publish tested image
+      - name: Test agent image without network access
+        run: |
+          docker build --pull --platform linux/amd64 --target test \
+            --tag "ghcr.io/david-yang-pixel/bajiao-agent:$GITHUB_SHA-test" agent
+          docker run --rm --network none "ghcr.io/david-yang-pixel/bajiao-agent:$GITHUB_SHA-test"
+      - name: Build agent runtime image
+        run: >-
+          docker build --pull --platform linux/amd64
+          --build-arg APP_REVISION="$GITHUB_SHA"
+          --tag "ghcr.io/david-yang-pixel/bajiao-agent:$GITHUB_SHA" agent
+      - name: Publish tested images
         id: publish
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/feat/swing-analysis'
         env:
@@ -54,7 +65,9 @@ jobs:
           trap 'rm -rf "$DOCKER_CONFIG"' EXIT
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           IMAGE_TAG="ghcr.io/david-yang-pixel/bajiao:$GITHUB_SHA"
+          AGENT_TAG="ghcr.io/david-yang-pixel/bajiao-agent:$GITHUB_SHA"
           docker push "$IMAGE_TAG"
+          docker push "$AGENT_TAG"
           # Read the digest recorded by this successful push, not a mutable tag lookup.
           IMAGE="$(docker image inspect "$IMAGE_TAG" --format '{{json .RepoDigests}}' | python3 -c '
           import json, re, sys
@@ -64,7 +77,16 @@ jobs:
               raise SystemExit("Expected exactly one pushed repository digest")
           print(refs[0])
           ')"
+          AGENT_IMAGE="$(docker image inspect "$AGENT_TAG" --format '{{json .RepoDigests}}' | python3 -c '
+          import json, re, sys
+          refs = [ref for ref in json.load(sys.stdin) if re.fullmatch(
+              r"ghcr\.io/david-yang-pixel/bajiao-agent@sha256:[0-9a-f]{64}", ref)]
+          if len(refs) != 1:
+              raise SystemExit("Expected exactly one pushed agent repository digest")
+          print(refs[0])
+          ')"
           printf 'image=%s\n' "$IMAGE" >> "$GITHUB_OUTPUT"
+          printf 'agent_image=%s\n' "$AGENT_IMAGE" >> "$GITHUB_OUTPUT"
 
   deploy:
     needs: build-test
@@ -84,6 +106,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GHCR_TOKEN: ${{ github.token }}
           IMAGE_DIGEST: ${{ needs.build-test.outputs.image }}
+          AGENT_IMAGE_DIGEST: ${{ needs.build-test.outputs.agent_image }}
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'root' }}

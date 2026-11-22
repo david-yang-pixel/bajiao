@@ -2,14 +2,13 @@
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
-  const SYMBOLS = Object.freeze({ NVDABUSDT: 'NVDA', TSLABUSDT: 'TSLA', AAPLBUSDT: 'AAPL', MSFTBUSDT: 'MSFT', AMZNBUSDT: 'AMZN', GOOGBUSDT: 'GOOG', METABUSDT: 'META', COINBUSDT: 'COIN' });
   const views = {
     positions: ['持仓监控', '账户持仓与提醒设置'],
-    picks: ['每日波段精选', '8 个标的 · 2–4 周 · 最多 3–5 个候选'],
+    picks: ['短线精选', '币安美股代币 · 1 周 · 每天 09:00 / 21:00（新加坡）'],
     logs: ['推送记录', '查看通知投递状态'],
     settings: ['配置中心', '账户、数据、模型与通知']
   };
-  const state = { view: null, positions: null, picks: null, picksError: false, logs: null, runs: null, reviews: null, status: null, statusError: '', config: null, configDirty: false, launching: false, syncing: false, editing: null, positionSaving: false, detailSeq: 0, statusLoading: false, poll: null };
+  const state = { universe: new Map(), universeFallback: false, universeLoaded: false, agent: null, summary: null, view: null, positions: null, picks: null, picksError: false, logs: null, runs: null, reviews: null, status: null, statusError: '', config: null, configDirty: false, launching: false, syncing: false, editing: null, positionSaving: false, detailSeq: 0, statusLoading: false, poll: null };
   const paths = {
     portfolio: ['M4 7h16v13H4z', 'M9 7V4h6v3M4 12h16M10 12v3h4v-3'],
     compass: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18', 'm16 8-2 6-6 2 2-6 6-2Z'],
@@ -57,7 +56,7 @@
   function currencyMismatch(p) { return p?.pnl_status === 'currency_mismatch' || p?.monitor_status === 'currency_mismatch' || (knownCost(p) && costCurrency(p) !== quoteCurrency(p)); }
   function currencyMismatchNote(p) { return `原始成本为 ${costCurrency(p)}，报价为 ${quoteCurrency(p)}；未做汇率换算，盈亏及收益提醒暂停`; }
   function knownCost(p) { return p?.cost_status !== 'unknown' && num(p?.buy_price) > 0; }
-  function canAnalyze(p) { return !isEquity(p) && Object.hasOwn(SYMBOLS, p?.symbol); }
+  function canAnalyze(p) { return !isEquity(p) && state.universe.has(p?.symbol); }
   function date(value) {
     if (!value) return '日期未提供';
     if (typeof value !== 'string') return '日期未提供';
@@ -143,6 +142,20 @@
       $('confirm-accept').addEventListener('click', yes); $('confirm-cancel').addEventListener('click', no); d.addEventListener('cancel', cancel); d.showModal(); $('confirm-cancel').focus();
     });
   }
+  function underlyingOf(symbol) { return state.universe.get(symbol) || str(symbol, '').replace(/BUSDT$/, '') || '美股代码未提供'; }
+  async function loadUniverse() {
+    try {
+      const data = await api('/bstocks/symbols', { timeout: 20000 });
+      const rows = list(data?.symbols).filter((r) => r && typeof r.symbol === 'string');
+      state.universe = new Map(rows.map((r) => [r.symbol, str(r.underlying_symbol, r.symbol.replace(/BUSDT$/, ''))]));
+      state.universeFallback = data?.fallback === true; state.universeLoaded = true;
+      message('universe-note', state.universeFallback ? '标的池读取失败，暂用内置列表' : '', 'warning');
+    } catch (e) {
+      state.universeLoaded = false; message('universe-note', `标的池读取失败：${errorText(e)}`, 'warning', loadUniverse);
+    }
+    if (state.positions) renderPositions();
+    if (state.view === 'picks') renderScope();
+  }
   function route() {
     const hash = location.hash.slice(1); const view = Object.hasOwn(views, hash) ? hash : 'positions';
     if (hash === 'main') { $('main').focus(); return; }
@@ -151,7 +164,7 @@
     document.querySelectorAll('[data-view]').forEach((n) => { if (n.dataset.view === view) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current'); });
     $('page-title').textContent = views[view][0];
     $('breadcrumb-current').textContent = views[view][0]; $('page-description').textContent = views[view][1];
-    document.title = `${views[view][0]} · 八角波段工作台`; renderHeading();
+    document.title = `${views[view][0]} · 八角短线工作台`; renderHeading();
     if (changed) { window.scrollTo(0, 0); loadView(); }
   }
   function renderHeading() {
@@ -163,8 +176,8 @@
       box.append(sync, button('添加持仓', () => openPosition(), 'button primary', 'plus'));
     } else if (state.view === 'picks') {
       const run = button(state.launching || state.status?.is_running ? '研究正在运行…' : '运行今日研究', runAnalysis, 'button primary', 'play');
-      const cfg = state.status?.configured; run.disabled = state.launching || Boolean(state.status?.is_running) || !cfg?.market_data || !cfg?.model || !!state.statusError;
-      if (run.disabled) run.title = state.launching || state.status?.is_running ? '同一时间仅运行一个研究任务' : '请先配置市场数据与模型，并成功读取研究状态';
+      const cfg = state.status?.configured; run.disabled = state.launching || Boolean(state.status?.is_running) || !cfg?.alpaca || !cfg?.agent || !!state.statusError;
+      if (run.disabled) run.title = state.launching || state.status?.is_running ? '同一时间仅运行一个研究任务' : '请先配置 Alpaca 行情、确认 AI 服务可用，并成功读取研究状态';
       box.append(run);
     } else if (state.view === 'logs') box.append(button('刷新记录', (b) => busy(b, '读取中…', loadLogs), 'button', 'refresh'));
     else if (state.view === 'settings') { const n = el('a', 'button', '保存配置 ↓'); n.href = '#save-settings'; n.addEventListener('click', (e) => { e.preventDefault(); if (!$('settings-content').hidden) { $('save-settings').scrollIntoView({ block: 'center' }); $('save-settings').focus(); } }); box.append(n); }
@@ -221,7 +234,7 @@
       if (mismatch) gainCell.title = currencyMismatchNote(p);
       row.append(gainCell);
       const actions = el('div', 'row-actions');
-      const analyze = button('AI 分析', () => analyzePosition(p), 'text-button'); analyze.disabled = !canAnalyze(p); analyze.title = canAnalyze(p) ? '研究原八个代币对应美股' : '仅支持原八个代币研究映射，暂不支持 EQ 股票分析';
+      const analyze = button('AI 分析', () => analyzePosition(p), 'text-button'); analyze.disabled = !canAnalyze(p); analyze.title = canAnalyze(p) ? '复核该代币对应的美股（短线 1 周）' : '仅支持标的池内的币安美股代币，暂不支持 EQ 股票分析';
       actions.append(button('设置', () => openPosition(p), 'text-button'), analyze);
       row.append(td(actions)); body.append(row);
       const rulesRow = el('tr', 'position-detail-row'); const rulesCell = el('td'); rulesCell.colSpan = 4;
@@ -276,13 +289,15 @@
     const form = $('position-form'); form.reset(); message('position-save-error', '');
     $('position-dialog-title').textContent = position ? '编辑持仓监控' : '添加持仓';
     const select = $('position-symbol'); select.replaceChildren();
-    Object.entries(SYMBOLS).forEach(([symbol, underlying]) => { const o = el('option', '', `${symbol} · 对应 ${underlying}`); o.value = symbol; select.append(o); });
+    if (!state.universeLoaded) await loadUniverse();
+    state.universe.forEach((underlying, symbol) => { const o = el('option', '', `${symbol} · 对应 ${underlying}`); o.value = symbol; select.append(o); });
     const symbol = position?.symbol || candidateSymbol;
-    if (symbol && !Object.hasOwn(SYMBOLS, symbol)) {
-      if (!position) { toast('手动添加仅限原有 8 个代币对。', 'failed'); return; }
+    if (!position && !state.universe.size) { toast('标的池暂不可用，无法手动添加。', 'failed'); return; }
+    if (symbol && !state.universe.has(symbol)) {
+      if (!position) { toast('该代币不在当前标的池内，不能手动添加。', 'failed'); return; }
       const option = el('option', '', `${symbol} · ${isEquity(position) ? '股票' : '已同步资产'}`); option.value = symbol; select.append(option);
     }
-    select.value = symbol || Object.keys(SYMBOLS)[0]; select.disabled = !!position;
+    select.value = symbol || [...state.universe.keys()][0]; select.disabled = !!position;
     const unit = position ? quoteCurrency(position) : 'USDT';
     const costSelect = $('position-cost-currency'); costSelect.replaceChildren();
     (isEquity(position) ? ['USD', 'USDT', 'USDC'] : ['USDT']).forEach((currency) => { const o = el('option', '', currency); o.value = currency; costSelect.append(o); });
@@ -300,8 +315,8 @@
     const researchSupported = !position || canAnalyze(position);
     $('position-ai').checked = researchSupported && (position ? Boolean(position.include_ai_analysis) : state.config?.default_include_ai_analysis ?? true);
     $('position-ai').disabled = !researchSupported;
-    $('position-ai-note').textContent = researchSupported ? '仅原八个代币对应美股研究映射，不改变研究池。' : 'EQ 股票及其他非研究池资产暂不支持 AI 分析，不会转换成代币。';
-    $('position-symbol-note').textContent = position ? '已同步资产可修改真实成本、阈值与汇报周期；资产代码不可更改，不扩展研究范围。' : candidateSymbol ? '已仅带入代币对。请自行填写币安成本、数量及提醒价；没有复制任何美股研究价格。' : '手动添加仅限原有 8 个币安代币对；研究周期为 2–4 周。';
+    $('position-ai-note').textContent = researchSupported ? '仅标的池内代币可做 AI 分析，不改变标的池。' : 'EQ 股票及其他非研究池资产暂不支持 AI 分析，不会转换成代币。';
+    $('position-symbol-note').textContent = position ? '已同步资产可修改真实成本、阈值与汇报周期；资产代码不可更改，不扩展研究范围。' : candidateSymbol ? '已仅带入代币对。请自行填写币安成本、数量及提醒价；没有复制任何美股研究价格。' : (state.universeFallback ? '标的池读取失败，暂用内置列表。' : '手动添加限于当前标的池内的币安美股代币。');
     for (const input of form.querySelectorAll('input')) input.setCustomValidity('');
     $('position-dialog').showModal(); if (candidateSymbol || position) $('position-cost').focus(); else select.focus();
   }
@@ -330,7 +345,7 @@
     if (cost !== null && (!editing || !knownCost(editing) || cost !== num(editing.buy_price) || costUnit !== costCurrency(editing))) { payload.buy_price = cost; payload.cost_currency = costUnit; }
     if (!editing) payload.symbol = $('position-symbol').value;
     const selectedSymbol = editing?.symbol || payload.symbol;
-    if (!editing && !Object.hasOwn(SYMBOLS, selectedSymbol)) { message('position-save-error', '请选择原有 8 个代币对之一。'); return; }
+    if (!editing && !state.universe.has(selectedSymbol)) { message('position-save-error', '请选择标的池内的代币对。'); return; }
     state.positionSaving = true; message('position-save-error', '');
     const controls = [...form.querySelectorAll('input, select, button')]; const oldDisabled = controls.map((n) => n.disabled); controls.forEach((n) => { n.disabled = true; });
     $('save-position').textContent = '正在保存…';
@@ -346,52 +361,68 @@
     return state.detailSeq;
   }
   async function analyzePosition(p) {
-    if (!canAnalyze(p)) { toast('暂不支持此资产的 AI 分析；研究仅限原八个代币对应美股映射，不会转换 EQ 股票代码。', 'failed'); return; }
-    const seq = openDetail(`${str(p.symbol)} · 波段分析`);
-    contentState('detail-content', '正在研究底层美股', '使用真实市场数据与模型生成 2–4 周分析，可能需要一些时间。', { loading: true });
+    if (!canAnalyze(p)) { toast('暂不支持此资产的 AI 分析；仅限标的池内的币安美股代币，不会转换 EQ 股票代码。', 'failed'); return; }
+    const seq = openDetail(`${str(p.symbol)} · 短线复核`);
+    contentState('detail-content', '正在研究底层美股', '使用真实市场数据与 AI 生成 1 周短线复核，可能需要几分钟。', { loading: true });
     try {
       const data = await api(`/positions/${encodeURIComponent(p.id)}/analyze`, { method: 'POST', timeout: 180000 });
       if (seq !== state.detailSeq || !$('detail-dialog').open) return;
       renderResearchDetail(data);
     } catch (e) { if (seq === state.detailSeq && $('detail-dialog').open) contentState('detail-content', '分析未能完成', errorText(e), { action: () => analyzePosition(p), actionLabel: '重新分析', iconName: 'info' }); }
   }
+  const TRACK = { active: ['跟踪中', 'info'], target_hit: ['已到目标', 'success'], stopped: ['已止损', 'failed'], expired: ['已到期', 'neutral'] };
+  const isShortTerm = (p) => p?.strategy === 'short_term_1w';
+  const usd = (v) => (num(v) === null ? '—' : `$${fmt(v)}`);
+  const usdt = (v) => (num(v) === null ? '—' : fmt(v));
+  function pricePair(label, value, note, cls = '') { const n = el('div', 'research-price'); n.append(el('span', '', label), el('strong', '', value)); if (note) n.append(el('span', `price-note ${cls}`, note)); return n; }
   function researchPrices(p) {
-    if (p.price_basis !== 'US_EQUITY_USD') return el('p', 'message warning', '旧版或未声明价格口径的数据：研究价格已隐藏，请重新运行研究。');
-    const box = el('div', 'research-prices'); const range = list(p.entry_range);
-    const entry = range.length === 2 && range.every((x) => num(x) !== null) ? `${fmt(range[0])}–${fmt(range[1])}` : '未提供';
-    for (const [label, value] of [['入场研究区间 · USD', entry], ['研究目标 · USD', fmt(p.target_price)], ['研究止损 · USD', fmt(p.stop_loss_price)]]) { const n = el('div', 'research-price'); n.append(el('span', '', label), el('strong', '', value)); box.append(n); }
+    const box = el('div', 'research-prices four');
+    box.append(pricePair('正股现价 · USD', usd(p.current_price_usd)), pricePair('目标价 · USD', usd(p.target_price_usd), pct(p.target_pct), direction(p.target_pct)), pricePair('止损价 · USD', usd(p.stop_price_usd), pct(p.stop_pct), direction(p.stop_pct)), pricePair('盈亏比', num(p.reward_risk) === null ? '—' : `${fmt(p.reward_risk)} : 1`));
     return box;
+  }
+  function tokenLine(p) {
+    const tokens = [p.token_price_usdt, p.token_target_usdt, p.token_stop_usdt];
+    if (tokens.every((v) => num(v) === null)) return null;
+    return el('p', 'token-line', `币安代币 ${str(p.symbol)}：现价 ≈ ${usdt(p.token_price_usdt)} USDT → 目标 ≈ ${usdt(p.token_target_usdt)} / 止损 ≈ ${usdt(p.token_stop_usdt)}（按比例换算，非可成交价）`);
+  }
+  function labeled(title, content) { const n = el('div', 'pick-section'); n.append(el('h4', '', title), content); return n; }
+  function sourceList(sources) {
+    const items = list(sources).filter((s) => s && typeof s === 'object');
+    if (!items.length) return el('p', 'muted', '此记录未提供来源，请谨慎使用。');
+    const ul = el('ul', 'source-list');
+    items.forEach((s) => { const li = el('li'); li.append(sourceLink(str(s.tool, ''), s.url)); if (typeof s.summary === 'string' && s.summary.trim()) li.append(el('span', 'source-date', s.summary)); ul.append(li); });
+    return ul;
+  }
+  function reportSections(p) {
+    const frag = document.createDocumentFragment();
+    frag.append(labeled('依据', el('p', 'prose', str(p.reason, '记录未提供研究逻辑。'))), labeled('失效', el('p', 'prose', str(p.invalidation, '未单独提供；请结合风险项核验。'))));
+    const risks = list(p.risks).filter((r) => typeof r === 'string' && r.trim());
+    if (!risks.length) frag.append(labeled('风险', el('p', 'muted', '未提供风险明细；不代表没有风险。')));
+    else { const ul = el('ul', 'detail-list'); risks.forEach((r) => ul.append(el('li', '', r))); frag.append(labeled('风险', ul)); }
+    frag.append(labeled('来源', sourceList(p.sources)));
+    return frag;
   }
   function renderResearchDetail(p, candidate = false) {
     const box = $('detail-content'); box.replaceChildren();
-    box.append(el('div', 'message info', '价格口径：底层美股 USD，不是币安可执行价格。研究目标与止损不会复制到持仓配置。'), el('p', 'detail-meta', `${str(p.symbol)} → ${str(p.underlying_symbol, SYMBOLS[p.symbol] || '美股代码未提供')} · ${str(p.horizon, '周期未提供')} · 美股数据截至 ${date(p.as_of)}`), el('h3', '', '研究逻辑'), el('p', 'prose', str(p.reason, '未提供研究逻辑')), researchPrices(p));
-    const signals = list(p.signals).filter((s) => typeof s === 'string');
-    if (signals.length) { box.append(el('h3', '', `规则筛选依据${num(p.score) === null ? '' : ` · ${fmt(p.score, 0)} / 100`}`)); const ul = el('ul', 'detail-list'); signals.forEach((s) => ul.append(el('li', '', s))); box.append(ul, el('p', 'muted', '规则分用于排序，不代表上涨概率，也不是完整 VCP / CANSLIM 认证。')); }
-    if (typeof p.level_method === 'string' && p.level_method.trim()) box.append(el('h3', '', '研究价位计算'), el('p', 'prose', p.level_method));
-    box.append(el('h3', '', '失效条件'), el('p', 'prose', str(p.invalidation, '未单独提供；请结合风险项核验。')));
-    box.append(el('h3', '', '主要风险'));
-    const risks = list(p.risks); if (!risks.length) box.append(el('p', 'muted', '未提供风险明细；不代表没有风险。'));
-    else { const ul = el('ul', 'detail-list'); risks.forEach((r) => ul.append(el('li', '', typeof r === 'string' ? r : '风险项格式异常'))); box.append(ul); }
-    box.append(el('h3', '', '催化与事件'));
-    const catalysts = list(p.catalysts); if (!catalysts.length) box.append(el('p', 'muted', '未提供事件明细。'));
-    else { const ul = el('ul', 'detail-list'); catalysts.forEach((c) => { const li = el('li'); li.append(sourceLink(c.title, c.source_url), el('span', 'source-date', date(c.date))); ul.append(li); }); box.append(ul); }
-    box.append(el('h3', '', '可核验来源'));
-    if (!list(p.sources).length) box.append(el('p', 'muted', '此记录未提供来源，请谨慎使用。'));
-    else { const ul = el('ul', 'source-list'); list(p.sources).forEach((s) => { const li = el('li'); li.append(sourceLink(s.title, s.url), el('span', 'source-date', `来源日期：${date(s.as_of)}`)); ul.append(li); }); box.append(ul); }
-    if (candidate && Object.hasOwn(SYMBOLS, p.symbol)) $('detail-actions').append(button('录入币安持仓', () => { $('detail-dialog').close(); openPosition(null, p.symbol); }, 'button primary', 'plus'));
+    box.append(el('div', 'message info', '价格口径：正股 USD。代币 USDT 价格只是按比例换算的参考，不是币安可执行价格；这些价位不会复制到持仓配置。'), el('p', 'detail-meta', `${str(p.symbol)} → ${underlyingOf(p.symbol)} · 美股数据截至 ${date(p.as_of)}${typeof p.view === 'string' && p.view ? ` · 结论：${p.view}` : ''}`), researchPrices(p));
+    const token = tokenLine(p); if (token) box.append(token);
+    box.append(reportSections(p));
+    if (candidate && state.universe.has(p.symbol)) $('detail-actions').append(button('录入币安持仓', () => { $('detail-dialog').close(); openPosition(null, p.symbol); }, 'button primary', 'plus'));
   }
   async function loadResearch() { await Promise.all([loadStatus(), loadPicks(), loadRuns(), loadReviews()]); }
   function renderStatus() {
     renderHeading(); const box = $('analysis-config'); box.replaceChildren();
     if (!state.status) { box.append(badge('研究状态未知', 'warning')); $('analysis-state').textContent = state.statusError || '等待服务返回研究状态'; return; }
     const cfg = state.status.configured || {};
-    [['market_data', '市场数据'], ['model', '分析模型'], ['notifications', '通知渠道']].forEach(([key, label]) => box.append(badge(`${label} · ${cfg[key] ? '已配置' : '未配置'}`, cfg[key] ? 'success' : 'warning')));
+    [['alpaca', '美股行情（Alpaca）'], ['agent', 'AI 分析服务'], ['binance', '币安'], ['notifications', '通知渠道']].forEach(([key, label]) => box.append(badge(`${label} · ${key === 'agent' ? (cfg[key] ? '可用' : '不可用') : (cfg[key] ? '已配置' : '未配置')}`, cfg[key] ? 'success' : 'warning')));
+    const used = num(state.status.sessions_today), cap = num(state.status.session_limit);
+    box.append(badge(`今日 AI 会话 ${used === null ? '—' : used}/${cap === null ? '—' : cap}`, used !== null && cap !== null && used >= cap ? 'warning' : 'neutral'));
     const setup = el('a', 'text-link', '管理配置 ↗'); setup.href = '#settings'; box.append(setup);
     const running = state.launching || state.status.is_running;
     $('run-push').disabled = running || !cfg.notifications;
     if (!cfg.notifications) $('run-push').checked = false;
     const run = state.status.latest_run;
-    $('analysis-state').textContent = running ? '正在研究中 · 页面会自动更新，请勿重复启动' : !cfg.market_data || !cfg.model ? '配置未就绪 · 请先连接市场数据和模型' : run ? `最近运行：${runLabel(run.status)} · ${date(run.finished_at || run.started_at)}` : '尚未运行研究 · 可手动运行或配置每日调度';
+    $('analysis-state').textContent = running ? '正在研究中 · 页面会自动更新，请勿重复启动' : !cfg.alpaca || !cfg.agent ? '配置未就绪 · 请先配置 Alpaca 行情并确认 AI 服务可用' : run ? `最近运行：${runLabel(run.status)} · ${date(run.finished_at || run.started_at)}` : '尚未运行研究 · 可手动运行或配置每日调度';
     renderScope();
     if (state.picks !== null && !state.picksError && !state.picks.length) renderPicks();
     $('hide-all-picks').disabled = !state.picks?.length || state.picksError || running;
@@ -422,37 +453,44 @@
   function pushStyle(status) { return ['success', 'sent'].includes(status) ? 'success' : status === 'failed' ? 'failed' : status === 'partial' ? 'warning' : 'neutral'; }
   function renderScope() {
     const box = $('research-scope'); box.replaceChildren(); const chips = el('div', 'scope-chips');
-    const universe = list(state.status?.universe).filter((u) => u && Object.hasOwn(SYMBOLS, u.symbol));
-    if (!universe.length) chips.append(el('p', 'muted', '服务尚未返回研究范围。'));
-    else universe.forEach((u) => chips.append(badge(`${u.symbol} → ${str(u.underlying_symbol, SYMBOLS[u.symbol])}`)));
-    box.append(chips);
-    if (!list(state.status?.skills).length) box.append(el('p', 'muted', '服务尚未提供技能来源。'));
-    list(state.status?.skills).forEach((s) => { const row = el('div', 'skill-row'); row.append(sourceLink(s.name, s.source_url), el('span', 'source-date', `版本：${str(s.revision)}`), el('p', '', str(s.description, '没有描述'))); box.append(row); });
+    const universe = list(state.status?.universe).filter((u) => u && typeof u.symbol === 'string');
+    if (!universe.length) chips.append(el('p', 'muted', state.status?.universe_error ? `标的池读取失败：${state.status.universe_error}` : '服务尚未返回标的池。'));
+    else universe.forEach((u) => chips.append(badge(`${u.symbol} → ${str(u.underlying_symbol, underlyingOf(u.symbol))}`)));
+    box.append(el('p', 'muted', '标的池 = 币安美股代币 ∩ 现货 USDT 交易对（交易中）；SPY / QQQ / 板块 ETF 只作基准。'), chips);
   }
   async function loadPicks() {
     if (state.picks === null) contentState('picks-content', '正在读取候选', '只展示已存储的真实研究记录。', { loading: true });
-    try { state.picks = (await apiList('/analysis/picks')).filter((p) => p && Object.hasOwn(SYMBOLS, p.symbol)); state.picksError = false; renderPicks(); }
+    try { state.picks = (await apiList('/analysis/picks')).filter((p) => p && typeof p.symbol === 'string'); state.picksError = false; renderPicks(); }
     catch (e) { state.picksError = true; contentState('picks-content', '候选读取失败', errorText(e), { action: loadPicks }); $('hide-all-picks').disabled = true; }
   }
   function renderPicks() {
     const picks = state.picks || []; $('pick-count').textContent = `/${picks.length}`; $('hide-all-picks').disabled = !picks.length || state.launching || !!state.status?.is_running;
     if (!picks.length) {
       const latest = state.status?.latest_run; const cfg = state.status?.configured;
-      const missing = cfg && (!cfg.market_data || !cfg.model); const failed = ['failed', 'error', 'missing_config'].includes(latest?.status);
+      const missing = cfg && (!cfg.alpaca || !cfg.agent); const failed = ['failed', 'error', 'missing_config'].includes(latest?.status);
       const noOpportunity = latest && num(latest.count) === 0 && !['failed', 'error', 'running', 'pending', 'missing_config'].includes(latest.status);
-      contentState('picks-content', missing ? '先把研究基础准备好' : failed ? '最近一次研究未完成' : noOpportunity ? '本轮没有符合条件的机会' : '暂无可见研究候选', missing ? '连接 FMP 数据与分析模型后，即可开始 2–4 周波段研究。' : failed ? (latest.message || '请查看运行记录中的错误，并修复配置后重试。') : noOpportunity ? '筛选条件没有达到，不为凑数而推荐。可在运行记录中核对结果。' : '尚未生成研究，或当前候选已被隐藏。历史记录仍然保留。', { iconName: 'compass' }); return;
+      contentState('picks-content', missing ? '先把研究基础准备好' : failed ? '最近一次研究未完成' : noOpportunity ? '本轮没有符合条件的机会' : '暂无可见研究候选', missing ? '配置 Alpaca 行情并确认 AI 服务可用后，即可开始 1 周短线研究。' : failed ? (latest.message || '请查看运行记录中的错误，并修复配置后重试。') : noOpportunity ? '筛选条件没有达到，不为凑数而推荐。可在运行记录中核对结果。' : '尚未生成研究，或当前候选已被隐藏。历史记录仍然保留。每天 09:00 / 21:00（新加坡）自动运行。', { iconName: 'compass' }); return;
     }
     const box = $('picks-content'); box.replaceChildren();
-    picks.forEach((p, i) => {
+    // The API lists newest-first; short-term picks are ranked by reward/risk, best first.
+    const ordered = [...picks.filter(isShortTerm).sort((a, b) => (num(b.reward_risk) ?? -Infinity) - (num(a.reward_risk) ?? -Infinity)), ...picks.filter((p) => !isShortTerm(p))];
+    ordered.forEach((p, i) => {
       const card = el('article', 'pick-card'); card.style.setProperty('--stagger', `${Math.min(i, 5) * 24}ms`);
-      const identity = el('div', 'pick-identity'); identity.append(el('span', 'eyebrow', 'UNDERLYING'), el('h3', '', str(p.underlying_symbol, SYMBOLS[p.symbol])), el('p', 'token-symbol', p.symbol));
-      const score = num(p.score); identity.append(badge(score === null ? '分数未提供' : `筛选分 ${fmt(score, 0)} / 100`, 'info'), el('p', 'as-of', `美股数据截至\n${date(p.as_of)}`));
-      const main = el('div', 'pick-main'); main.append(el('p', 'pick-reason', str(p.reason, '记录未提供研究逻辑。')), researchPrices(p));
-      const risk = list(p.risks).filter((r) => typeof r === 'string'); main.append(el('p', 'risk-line', risk.length ? `风险提示：${risk[0]}` : '风险提示：未提供明细，不代表没有风险。'));
-      const footer = el('div', 'pick-footer'), actions = el('div', 'row-actions');
-      actions.append(button('逻辑、事件与来源 ↗', () => { openDetail(`${str(p.underlying_symbol, SYMBOLS[p.symbol])} · 研究详情`); renderResearchDetail(p, true); }, 'text-button'));
+      const identity = el('div', 'pick-identity'); identity.append(el('span', 'eyebrow', 'UNDERLYING'), el('h3', '', str(p.underlying_symbol, underlyingOf(p.symbol))), el('p', 'token-symbol', p.symbol));
+      const main = el('div', 'pick-main'); const footer = el('div', 'pick-footer'), actions = el('div', 'row-actions');
+      if (isShortTerm(p)) {
+        const [trackText, trackType] = TRACK[p.track_status] || ['状态未提供', 'neutral'];
+        identity.append(badge(trackText, trackType), el('p', 'as-of', `美股数据截至\n${date(p.as_of)}`));
+        main.append(researchPrices(p), el('p', 'expiry-line', `有效期至 ${date(p.expires_after)}`));
+        const token = tokenLine(p); if (token) main.append(token);
+        main.append(reportSections(p));
+        footer.append(actions, button('录入币安持仓', () => openPosition(null, p.symbol), 'button small', 'plus'));
+      } else {
+        identity.append(badge('历史策略（2–4 周）', 'neutral'), el('p', 'as-of', `记录日期\n${date(p.as_of || p.created_at)}`));
+        main.append(el('p', 'message warning', '历史策略（2–4 周）：旧版研究记录，不显示价位。'), el('p', 'pick-reason', str(p.reason, '记录未提供研究逻辑。')));
+        footer.append(actions);
+      }
       if (p.id !== undefined && p.id !== null) actions.append(button('隐藏', (b) => hidePicks(p.id, b), 'text-button'));
-      footer.append(actions, button('录入币安持仓', () => openPosition(null, p.symbol), 'button small', 'plus'));
       main.append(footer); card.append(identity, main); box.append(card);
     });
   }
@@ -464,7 +502,7 @@
     message('run-message', `${runLabel(run.status)}${count === null ? '' : ` · ${count} 个候选`}${run.message ? `。${run.message}` : ''}。${pushLabel(run.push_status)}`, failed ? 'error' : running ? 'info' : count === 0 ? 'warning' : 'success');
   }
   async function runAnalysis() {
-    if (state.launching || state.status?.is_running || !state.status?.configured?.market_data || !state.status?.configured?.model || state.statusError) return;
+    if (state.launching || state.status?.is_running || !state.status?.configured?.alpaca || !state.status?.configured?.agent || state.statusError) return;
     const previousRunId = state.status?.latest_run?.id;
     let requestFailed = false;
     let requestedRunId = null;
@@ -502,11 +540,22 @@
         if (pushable) { const n = button(['failed', 'partial'].includes(r.push_status) ? '重试推送' : '推送结果', (b) => pushRun(r, b), 'text-button'); n.dataset.runPush = 'true'; n.disabled = !state.status?.configured?.notifications || state.launching || !!state.status?.is_running; if (n.disabled) n.title = '请先配置通知渠道，并等待当前研究完成'; top.append(n); }
         row.append(top, el('p', '', `运行 #${r.id ?? '—'} · 候选 ${num(r.count) === null ? '未提供' : r.count} · ${r.message || '未提供运行说明'}`));
         if (r.finished_at) row.append(el('p', '', `结束于 ${date(r.finished_at)}`));
+        const diag = diagnosticsNode(r.diagnostics); if (diag) row.append(diag);
         const errors = list(r.errors);
         if (errors.length) { const details = el('details'); details.append(el('summary', '', `查看 ${errors.length} 条运行错误`)); const ul = el('ul', 'run-errors'); errors.forEach((err) => ul.append(el('li', '', typeof err === 'string' ? err : str(err?.message, str(err?.error, '错误明细格式异常'))))); details.append(ul); row.append(details); }
         box.append(row);
       });
     } catch (e) { contentState('runs-content', '运行历史读取失败', errorText(e), { compact: true, action: loadRuns }); }
+  }
+  const DECISIONS = { reused: ['复用上次结论', 'info'], quota_skip: ['额度保护跳过', 'warning'], rejected_by_validation: ['校验未通过', 'failed'], selected: ['入选', 'success'], rejected: ['未入选', 'neutral'], active_pick: ['已有跟踪中的推荐', 'neutral'] };
+  function diagnosticsNode(diagnostics) {
+    const items = list(diagnostics).filter((d) => d && typeof d === 'object');
+    if (!items.length) return null;
+    const count = (k) => items.filter((d) => d.decision === k).length;
+    const details = el('details'); const summary = el('summary', '', `诊断 ${items.length} 条 · 复用 ${count('reused')} · 额度跳过 ${count('quota_skip')} · 校验未通过 ${count('rejected_by_validation')}`);
+    const ul = el('ul', 'run-errors diagnostics');
+    items.forEach((d) => { const [label, type] = DECISIONS[d.decision] || [str(d.decision, '结论未提供'), 'neutral']; const li = el('li'); li.append(badge(label, type), el('strong', 'numeric', ` ${str(d.symbol, '—')} `), document.createTextNode(str(d.reason, ''))); ul.append(li); });
+    details.append(summary, ul); return details;
   }
   async function pushRun(run, b) {
     if (['success', 'sent'].includes(run.push_status)) return;
@@ -517,18 +566,32 @@
       finally { await Promise.all([loadRuns(), loadStatus()]); }
     });
   }
+  const OUTCOMES = { target: ['到目标', 'success'], stop: ['止损', 'failed'], open: ['未触及', 'neutral'] };
+  function renderReviewSummary() {
+    const box = $('reviews-summary'); box.replaceChildren(); const s = state.summary;
+    if (!s || !num(s.total)) { box.hidden = true; return; }
+    box.hidden = false;
+    [['命中率', s.hit_rate_pct === null ? '—' : `${fmt(s.hit_rate_pct)}%`, `${s.target ?? 0} / ${s.total} 到目标`], ['平均收益', pct(s.avg_return_pct), '5 日'], ['平均超额', pct(s.avg_excess_pct), '相对 SPY']].forEach(([label, value, note]) => {
+      const n = el('div', 'summary-stat'); n.append(el('span', '', label), el('strong', `numeric ${label === '命中率' ? '' : direction(label === '平均收益' ? s.avg_return_pct : s.avg_excess_pct)}`, value), el('span', 'secondary', note)); box.append(n);
+    });
+  }
   async function loadReviews() {
-    if (state.reviews === null) contentState('reviews-content', '读取到期回顾', '', { loading: true, compact: true });
+    if (state.reviews === null) contentState('reviews-content', '读取复盘', '', { loading: true, compact: true });
     try {
-      state.reviews = await apiList('/analysis/reviews');
-      if (!state.reviews.length) { contentState('reviews-content', '回顾尚未到期', '有研究记录且经过 10 或 20 个交易日后，才展示真实收益与基准比较。', { compact: true }); return; }
-      const { wrap, body } = makeTable(['底层美股 / 截至', '交易日', '收益', '基准收益', '超额收益'], '研究到期回顾，底层美股 USD 收益', 'reviews-table');
-      state.reviews.forEach((r) => { const row = el('tr'); row.append(td(str(r.underlying_symbol, SYMBOLS[r.symbol] || str(r.symbol)), date(r.as_of)), td(num(r.horizon_sessions) === null ? '—' : String(r.horizon_sessions)), td(pct(r.return_pct), undefined, `numeric ${direction(r.return_pct)}`), td(pct(r.benchmark_return_pct), undefined, 'numeric'), td(pct(r.excess_return_pct), undefined, `numeric ${direction(r.excess_return_pct)}`)); body.append(row); });
+      const [reviews, summary] = await Promise.all([apiList('/analysis/reviews'), api('/analysis/reviews/summary')]);
+      state.reviews = reviews; state.summary = summary && typeof summary === 'object' ? summary : null; renderReviewSummary();
+      if (!state.reviews.length) { contentState('reviews-content', '复盘尚未到期', '短线推荐经过 5 个交易日后，才展示真实收益与 SPY 基准比较。', { compact: true }); return; }
+      const { wrap, body } = makeTable(['标的', '推荐日', '结果', '5 日收益', 'SPY', '超额'], '短线推荐 5 日复盘，正股 USD 收益', 'reviews-table');
+      state.reviews.forEach((r) => {
+        const [label, type] = OUTCOMES[r.outcome] || ['待判定', 'neutral']; const row = el('tr');
+        row.append(td(str(r.underlying_symbol, underlyingOf(r.symbol)), str(r.symbol, '')), td(date(r.pick_as_of || r.as_of), `复盘至 ${date(r.as_of)}`), td(badge(label, type)), td(pct(r.return_pct), undefined, `numeric ${direction(r.return_pct)}`), td(pct(r.benchmark_return_pct), undefined, 'numeric'), td(pct(r.excess_return_pct), undefined, `numeric ${direction(r.excess_return_pct)}`));
+        body.append(row);
+      });
       $('reviews-content').replaceChildren(wrap);
-    } catch (e) { contentState('reviews-content', '回顾读取失败', errorText(e), { compact: true, action: loadReviews }); }
+    } catch (e) { $('reviews-summary').hidden = true; contentState('reviews-content', '复盘读取失败', errorText(e), { compact: true, action: loadReviews }); }
   }
   async function updateReviews(b) {
-    await busy(b, '更新中…', async () => { const r = await api('/analysis/review', { method: 'POST', timeout: 120000 }); toast(r.message || `已更新 ${num(r.count) ?? 0} 条到期回顾。`); await loadReviews(); });
+    await busy(b, '更新中…', async () => { const r = await api('/analysis/review', { method: 'POST', timeout: 120000 }); toast(r.message || `已更新 ${num(r.count) ?? 0} 条复盘。`); await loadReviews(); });
   }
   function schedulePoll(delay = 15000) {
     clearTimeout(state.poll); state.poll = setTimeout(async () => { await loadStatus(); schedulePoll(state.launching || state.status?.is_running ? 4000 : 15000); }, delay);
@@ -551,16 +614,16 @@
   }
 
   // Settings: explicit allowlists; account credentials NEVER enter generic config payloads.
-  const textFields = ['binance_mcp_url', 'openai_base_url', 'openai_model', 'feishu_app_id', 'ai_picks_push_time', 'ai_picks_push_timezone'];
-  const secretFields = ['fmp_api_key', 'openai_api_key', 'feishu_app_secret'];
+  const textFields = ['binance_mcp_url', 'agent_model', 'feishu_app_id', 'ai_picks_push_timezone'];
+  const secretFields = ['alpaca_api_key', 'alpaca_secret_key', 'fred_api_key', 'feishu_app_secret'];
   const webhookFields = ['feishu_webhook_url', 'wecom_webhook_url'];
-  const numberFields = ['analysis_top_n', 'analysis_min_score', 'earnings_blackout_days', 'default_check_interval_hours'];
+  const numberFields = ['analysis_top_n', 'agent_daily_session_limit', 'default_check_interval_hours'];
   const flagFields = ['ai_picks_push_enabled', 'default_include_ai_analysis'];
-  const defaults = { ai_picks_push_time: '21:30', ai_picks_push_timezone: 'Asia/Shanghai', analysis_top_n: 3, analysis_min_score: 60, earnings_blackout_days: 3, default_check_interval_hours: 4, ai_picks_push_enabled: false, default_include_ai_analysis: true };
+  const defaults = { ai_picks_schedule_times: '09:00,21:00', ai_picks_push_timezone: 'Asia/Singapore', analysis_top_n: 5, agent_daily_session_limit: 24, agent_model: '', default_check_interval_hours: 4, ai_picks_push_enabled: false, default_include_ai_analysis: true };
   const masked = (v) => typeof v === 'string' && /\*{3,}|•{3,}/.test(v);
   function sanitizedConfig(data) {
     const clean = {};
-    [...textFields, ...numberFields, ...flagFields, ...webhookFields, 'has_fmp_key', 'has_openai_key', 'has_feishu_app_secret', 'has_binance_key', 'has_binance_secret', 'feishu_bot_connected'].forEach((k) => { if (data[k] !== undefined) clean[k] = data[k]; });
+    [...textFields, ...numberFields, ...flagFields, ...webhookFields, 'ai_picks_schedule_times', 'has_alpaca_key', 'has_alpaca_secret', 'has_fred_key', 'has_feishu_app_secret', 'has_binance_key', 'has_binance_secret', 'feishu_bot_connected'].forEach((k) => { if (data[k] !== undefined) clean[k] = data[k]; });
     return { ...defaults, ...clean };
   }
   function applyConfig(cfg) {
@@ -569,12 +632,15 @@
     if (typeof zone === 'string' && zone && ![...zones.options].some((o) => o.value === zone)) { const option = el('option', '', zone); option.value = zone; zones.append(option); }
     [...textFields, ...numberFields, ...webhookFields].forEach((k) => { $(k).value = masked(cfg[k]) ? '' : cfg[k] ?? ''; });
     flagFields.forEach((k) => { $(k).checked = Boolean(cfg[k]); }); secretFields.forEach((k) => { $(k).value = ''; });
-    ['fmp-status', 'model-status', 'binance-status'].forEach((id, i) => { const configured = i === 0 ? cfg.has_fmp_key : i === 1 ? cfg.has_openai_key : cfg.has_binance_key && cfg.has_binance_secret; const n = $(id); n.textContent = configured ? '凭据已保存 · 请测试连接' : '尚未配置'; n.className = `badge ${configured ? 'success' : 'warning'}`; });
+    const times = String(cfg.ai_picks_schedule_times || '').split(',').map((t) => t.trim()).filter(Boolean);
+    $('schedule_time_1').value = times[0] || ''; $('schedule_time_2').value = times[1] || '';
+    ['alpaca-status', 'fred-status', 'binance-status'].forEach((id, i) => { const configured = i === 0 ? cfg.has_alpaca_key && cfg.has_alpaca_secret : i === 1 ? cfg.has_fred_key : cfg.has_binance_key && cfg.has_binance_secret; const n = $(id); n.textContent = configured ? '凭据已保存 · 请测试连接' : i === 1 ? '未配置 · 可选' : '尚未配置'; n.className = `badge ${configured ? 'success' : i === 1 ? 'neutral' : 'warning'}`; });
     $('feishu-bot-status').textContent = `应用 Secret ${cfg.has_feishu_app_secret ? '已保存' : '未配置'} · 长连接${cfg.feishu_bot_connected ? '已连接' : '未连接'}。`;
     state.configDirty = false; $('save-status').textContent = '配置已读取，密钥留空表示保留';
   }
   async function loadConfig() {
     message('settings-error', ''); $('settings-loading').hidden = !!state.config;
+    loadAgentStatus();
     try {
       const data = await api('/config'); if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('配置格式异常，请刷新重试。');
       state.config = sanitizedConfig(data); applyConfig(state.config); $('settings-content').hidden = false;
@@ -587,6 +653,8 @@
     numberFields.forEach((k) => { payload[k] = num($(k).value); });
     flagFields.forEach((k) => { payload[k] = $(k).checked; });
     [...secretFields, ...webhookFields].forEach((k) => { const v = $(k).value.trim(); if (v && !masked(v)) payload[k] = v; });
+    payload.ai_picks_schedule_times = [...new Set([$('schedule_time_1').value, $('schedule_time_2').value].filter(Boolean))].sort().join(',');
+    if (!payload.ai_picks_schedule_times) delete payload.ai_picks_schedule_times;
     return payload;
   }
   function lockForm(form, locked) {
@@ -600,7 +668,7 @@
     try {
       const r = await api('/config', { method: 'POST', body: payload });
       secretFields.forEach((k) => { $(k).value = ''; }); state.configDirty = false;
-      state.config = sanitizedConfig({ ...state.config, ...payload, ...(payload.fmp_api_key ? { has_fmp_key: true } : {}), ...(payload.openai_api_key ? { has_openai_key: true } : {}), ...(payload.feishu_app_secret ? { has_feishu_app_secret: true } : {}) });
+      state.config = sanitizedConfig({ ...state.config, ...payload, ...(payload.alpaca_api_key ? { has_alpaca_key: true } : {}), ...(payload.alpaca_secret_key ? { has_alpaca_secret: true } : {}), ...(payload.fred_api_key ? { has_fred_key: true } : {}), ...(payload.feishu_app_secret ? { has_feishu_app_secret: true } : {}) });
       $('save-status').textContent = '已保存 · 配置实时生效'; toast(r.message || '配置已保存。'); await loadStatus();
       // Re-read server flags without overwriting the user's fields with masks.
       try { state.config = sanitizedConfig(await api('/config')); applyConfig(state.config); $('save-status').textContent = '已保存 · 配置实时生效'; }
@@ -613,13 +681,38 @@
     await busy(b, '测试中…', async () => {
       const payload = { service };
       const add = (key, value) => { if (value && !masked(value)) payload[key] = value; };
-      if (service === 'fmp') add('api_key', $('fmp_api_key').value.trim());
-      if (service === 'llm') { add('api_key', $('openai_api_key').value.trim()); add('base_url', $('openai_base_url').value.trim()); add('model', $('openai_model').value.trim()); }
+      if (service === 'alpaca') { add('api_key', $('alpaca_api_key').value.trim()); add('api_secret', $('alpaca_secret_key').value.trim()); }
       if (service === 'feishu' || service === 'wecom') add('webhook_url', $(`${service}_webhook_url`).value.trim());
       if (service === 'feishu_bot') { add('app_id', $('feishu_app_id').value.trim()); add('app_secret', $('feishu_app_secret').value.trim()); }
       // Binance tests use only the saved pair, never the in-progress replacement draft.
-      try { const r = await api('/config/test', { method: 'POST', body: payload, timeout: 120000 }); out.className = 'test-result positive'; out.textContent = `测试成功 · ${r.message || '服务已响应'}`; }
+      try { const r = await api('/config/test', { method: 'POST', body: payload, timeout: 120000 }); out.className = 'test-result positive'; out.textContent = `测试成功 · ${r.message || '服务已响应'}`; if (service === 'agent') await loadAgentStatus(); }
       catch (err) { out.className = 'test-result negative'; out.textContent = `测试失败 · ${errorText(err)}`; }
+    });
+  }
+  const AUTH_LABEL = { valid: ['有效', 'success'], missing: ['缺失', 'warning'], expired: ['过期', 'warning'] };
+  function renderAgentStatus() {
+    const box = $('agent-status'); box.replaceChildren(); const a = state.agent;
+    if (!a) { box.append(badge('AI 服务状态未知', 'warning')); return; }
+    const online = a.status === 'ok'; const [authText, authType] = AUTH_LABEL[a.auth] || ['未知', 'warning'];
+    box.append(badge(`AI 服务 · ${online ? '在线' : '离线'}`, online ? 'success' : 'failed'), badge(`ChatGPT 凭据 · ${online ? authText : '无法确认'}`, online ? authType : 'neutral'));
+  }
+  async function loadAgentStatus() {
+    try { const data = await api('/agent/status', { timeout: 20000 }); state.agent = data && typeof data === 'object' ? data : null; }
+    catch { state.agent = { status: 'unreachable', auth: 'unknown' }; }
+    renderAgentStatus();
+  }
+  async function uploadCredentials(b) {
+    const file = $('agent-credentials-file').files[0]; const out = $('agent-upload-result');
+    if (!file) { out.className = 'test-result negative'; out.textContent = '请先选择 auth.json 文件'; return; }
+    out.className = 'test-result'; out.textContent = '正在上传…';
+    await busy(b, '上传中…', async () => {
+      try {
+        const body = await file.text();
+        const response = await fetch('/api/agent/credentials', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body });
+        let data = null; try { data = await response.json(); } catch { /* handled below */ }
+        if (!response.ok || data?.success === false) throw new Error(apiDetail(data, `上传失败（HTTP ${response.status}）`));
+        out.className = 'test-result positive'; out.textContent = str(data?.message, '凭据已保存'); $('agent-credentials-file').value = ''; await loadAgentStatus();
+      } catch (e) { out.className = 'test-result negative'; out.textContent = `上传失败 · ${e instanceof TypeError ? '无法连接服务器，请重试。' : errorText(e)}`; }
     });
   }
   async function saveBinance(e) {
@@ -645,6 +738,7 @@
   $('settings-form').addEventListener('submit', saveConfig);
   $('settings-form').addEventListener('input', () => { state.configDirty = true; $('save-status').textContent = '有未保存的修改'; });
   $('binance-form').addEventListener('submit', saveBinance);
+  $('upload-credentials').addEventListener('click', (e) => uploadCredentials(e.currentTarget).catch((err) => toast(errorText(err), 'failed')));
   document.querySelectorAll('[data-test]').forEach((n) => n.addEventListener('click', () => testConnection(n.dataset.test, n).catch((e) => toast(errorText(e), 'failed'))));
   $('refresh-view').addEventListener('click', async () => {
     if (state.view === 'settings' && state.configDirty && !await ask('丢弃未保存的修改？', '刷新配置会清空当前未保存的输入。服务器中已经保存的配置不变。', '丢弃并刷新')) return;
@@ -653,7 +747,7 @@
   window.addEventListener('hashchange', route);
   window.addEventListener('beforeunload', (e) => { if (state.configDirty) { e.preventDefault(); e.returnValue = ''; } });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { loadStatus(); if (state.view === 'positions' && !$('position-dialog').open) loadPositions(); } });
-  route(); if (state.view !== 'picks') loadStatus(); schedulePoll();
+  route(); loadUniverse(); if (state.view !== 'picks') loadStatus(); schedulePoll();
   // Read defaults without rendering or persisting any credentials into inputs.
   if (state.view !== 'settings') api('/config').then((cfg) => { if (!state.config && !state.configDirty) { state.config = sanitizedConfig(cfg); applyConfig(state.config); } }).catch(() => { /* Settings shows its own retryable error on first visit. */ });
   setInterval(() => { if (!document.hidden && state.view === 'positions' && !$('position-dialog').open && !state.syncing && !$('positions-content').contains(document.activeElement)) loadPositions(); }, 60000);

@@ -28,18 +28,36 @@ def mock_holdings(monkeypatch):
     monkeypatch.setattr(main.binance_client, "get_average_buy_price", AsyncMock(return_value=90.0))
 
 
+async def short_term_runner(tmp_path, monkeypatch):
+    """Real ShortTermService over fake data/agent boundaries, wired into main."""
+    from backend.app.services.analysis_store import AnalysisStore
+    from backend.app.services.short_term import service as svc_mod
+    from backend.app.services.short_term.service import ShortTermService
+    from backend.tests.test_short_term_service import FakeAgent, FakeAlpaca, FakeBinance, FakeUniverse, PRICE, selected
+    from backend.tests.test_short_term_tracking import FakeNotifier
+
+    async def quote(client, pair, price):
+        return {'symbol': pair.symbol, 'mid_usdt': PRICE, 'tradable': True, 'status': 'TRADING'}
+    monkeypatch.setattr(svc_mod, 'get_token_quote', quote)
+    path = await prepare_db(tmp_path, monkeypatch)
+    notifier = FakeNotifier()
+    runner = ShortTermService(FakeBinance(), FakeAlpaca(), FakeAgent({'NVDA': selected('NVDA'), 'TSLA': selected('TSLA')}),
+                              notifier, AnalysisStore())
+    runner.universe = FakeUniverse()
+    monkeypatch.setattr(main, 'short_term', runner)
+    return runner, notifier, path
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("push", [False, True])
 async def test_manual_analysis_only_sends_when_requested(tmp_path, monkeypatch, push):
-    from backend.tests.test_swing_analysis import service
-    runner, market, agent, notifier, path = await service(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, 'swing_service', runner)
+    runner, notifier, path = await short_term_runner(tmp_path, monkeypatch)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://test') as client:
         response = await client.post('/api/analysis/run' + ('?push_notifications=true' if push else ''))
         assert response.status_code == 200
-        assert response.json()['count'] == 3
-        assert len((await client.get('/api/analysis/picks')).json()) == 3
-    assert bool(notifier.send_channel_text.await_count) is push
+        assert response.json()['count'] == 2
+        assert len((await client.get('/api/analysis/picks')).json()) == 2
+    assert bool(notifier.sent) is push
 
 
 @pytest.mark.asyncio
@@ -224,18 +242,40 @@ async def test_confirmed_empty_balance_still_closes_position(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_daily_schedule_explicitly_pushes_only_once(tmp_path, monkeypatch):
-    from backend.tests.test_swing_analysis import service
     from datetime import timezone
-    runner, market, agent, notifier, path = await service(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, 'swing_service', runner)
+    runner, notifier, path = await short_term_runner(tmp_path, monkeypatch)
     async with aiosqlite.connect(path) as db:
         await db.executemany('INSERT INTO system_configs (key,value) VALUES (?,?)', [
-            ('ai_picks_push_enabled','1'), ('ai_picks_push_time','21:30')])
+            ('ai_picks_push_enabled','1'), ('ai_picks_schedule_times','21:30')])
         await db.commit()
-    now = datetime(2026,10,2,13,31,tzinfo=timezone.utc)
+    now = datetime(2026,10,2,13,31,tzinfo=timezone.utc)  # 21:31 Asia/Singapore
     await main.scheduled_analysis_tick(now)
-    count = notifier.send_channel_text.await_count
+    count = len(notifier.sent)
     assert count > 0
     await main.scheduled_analysis_tick(now)
-    assert notifier.send_channel_text.await_count == count
-    assert len(await runner.store.list_runs()) == 1
+    assert len(notifier.sent) == count
+    runs = await runner.store.list_runs()
+    assert len(runs) == 1 and runs[0]['run_key'] == 'schedule:2026-10-02:21:30'
+
+
+@pytest.mark.asyncio
+async def test_scheduled_slot_with_fast_failing_agent_runs_once_and_reports_failure(tmp_path, monkeypatch):
+    from datetime import timedelta, timezone
+    from backend.app.services.short_term.agent_client import AgentResult
+    runner, notifier, path = await short_term_runner(tmp_path, monkeypatch)
+    err = AgentResult(status='error', error_code='auth_expired', error_message='x')
+    runner.agent.results = {'NVDA': err, 'TSLA': err}
+    async with aiosqlite.connect(path) as db:
+        await db.executemany('INSERT INTO system_configs (key,value) VALUES (?,?)', [
+            ('ai_picks_push_enabled','1'), ('ai_picks_schedule_times','21:30')])
+        await db.commit()
+    start = datetime(2026,10,2,13,31,tzinfo=timezone.utc)  # 21:31 Asia/Singapore
+    for minutes in range(0, 150, 10):  # ticks through the 3 h catch-up window, each past the 5-minute guard
+        await main.scheduled_analysis_tick(start + timedelta(minutes=minutes))
+        old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        await runner.store.execute('UPDATE analysis_runs SET finished_at=? WHERE finished_at IS NOT NULL', (old,))
+    runs = await runner.store.list_runs()
+    assert len(runs) == 1 and runs[0]['status'] == 'failed' and '凭据已过期' in runs[0]['message']
+    assert len(runner.agent.calls) == 2  # one attempt per candidate, no auto-retry of the slot
+    assert await runner.store.sessions_started_since('') == 2
+    assert len(notifier.sent) == 1 and '本轮分析未完成' in notifier.sent[0][1]

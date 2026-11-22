@@ -273,3 +273,28 @@ dialog[open] { animation: enter 220ms cubic-bezier(.2,.8,.2,1); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* Short-term picks */
+.research-prices.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.research-price .price-note { font: 11px var(--mono); color: var(--muted); }
+.research-price .price-note.positive { color: var(--teal); }
+.research-price .price-note.negative { color: var(--danger); }
+.expiry-line { font-size: 11px; color: var(--muted); margin: -4px 0 8px; }
+.token-line { font: 11px/1.8 var(--mono); color: var(--muted); overflow-wrap: anywhere; margin-bottom: 8px; }
+.pick-section { margin-top: 16px; }
+.pick-section h4 { margin: 0 0 4px; font-size: 12px; font-weight: 650; color: var(--muted); }
+.pick-section .prose { font-size: 13px; line-height: 1.9; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pick-section .source-list li { padding: 6px 0; }
+.pick-section .detail-list { margin: 4px 0; }
+.summary-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--border); }
+.summary-stat { display: flex; flex-direction: column; gap: 2px; padding: 14px 20px; }
+.summary-stat + .summary-stat { border-left: 1px solid var(--border); }
+.summary-stat > span:first-child { font-size: 10px; color: var(--muted); }
+.summary-stat strong { font: 500 18px var(--mono); }
+.summary-stat strong.positive { color: var(--teal); }
+.summary-stat strong.negative { color: var(--danger); }
+.agent-status { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.diagnostics li { margin: 6px 0; }
+input[type=file] { padding: 7px 12px; font-size: 12px; }
+@media (max-width: 960px) { .research-prices.four { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 12px; } .research-prices.four .research-price:nth-child(3) { border-left: 0; } }
+@media (max-width: 680px) { .agent-status { justify-content: flex-start; } .summary-stat { padding: 12px 10px; } .summary-stat strong { font-size: 15px; } }

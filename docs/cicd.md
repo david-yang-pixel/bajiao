@@ -6,6 +6,8 @@
 - 向当前默认分支 `feat/swing-analysis` 推送，自动测试、构建并部署；支持 Actions 页面手动运行。
 - Pull Request 仅构建与测试，不访问部署密钥或发布生产镜像。
 - 目标服务器使用既有 SSH 配置首次接入，项目目录固定 `/opt/bstocks-bot`，容器固定 `binance-bstocks-analysis-bot`，端口 8000 与现有 Nginx 保持一致。
+- 生产运行**两个容器**：主服务 `binance-bstocks-analysis-bot` 与 pi agent `bajiao-agent`。二者加入 Docker 网络 `bajiao-net`；agent 挂载 `data/agent`（ChatGPT `auth.json`、内网令牌），不发布任何端口，主服务经 `http://bajiao-agent:8080` 访问。两个镜像来自同一 revision，按摘要部署。
+- agent 镜像约 1.9 GB（Node、pi、OpenBB、Alpaca MCP），首次拉取较慢；agent 内的 OpenBB 服务在首次分析时约需 12 秒启动。
 - 生产单实例、单 worker；切换容器存在短暂服务中断，不是零停机方案。
 
 ## 流程
@@ -16,7 +18,7 @@
 4. 仅发布分支可用工作流临时 `GITHUB_TOKEN` 推送至 GHCR；部署使用完整 `@sha256:...`，不是 `latest`。
 5. 检查分支仍指向本次提交，过期运行不得覆盖更新版本。工作流与服务器端均串行化部署，不主动取消正在发布的运行。
 6. 专用受限 SSH 密钥发送版本、摘要与临时拉取凭据；不获得通用 shell，不接受用户指定路径或其他项目镜像。
-7. 服务器先拉取并验证镜像标签，再暂停旧容器，备份 SQLite 和有效环境配置，切换至镜像内的代码（不再挂载旧 `backend` 源码）。
+7. 服务器先拉取并验证两个镜像标签，再暂停旧容器；先切换 agent、后切换主服务，任一失败两者一起恢复旧版本，备份 SQLite 和有效环境配置，切换至镜像内的代码（不再挂载旧 `backend` 源码）。
 8. 确认 Docker 健康状态、HTTP 健康返回的 revision、数据库配置/持仓及 `.env` 均符合预期。
 9. 成功后删除旧容器，再清理本项目未被任何容器引用的旧镜像。失败则恢复旧容器，不做镜像清理。
 
@@ -41,13 +43,23 @@ python3 scripts/setup_cicd.py --ssh-host zendesk-agent-server
 
 发布器是服务器预安装的受限入口。修改 `scripts/deploy_image.py` 后，应先测试、重新执行接入脚本更新入口，再推送触发发布；普通应用更新不需要重复接入。更换部署分支时，需要同时修改 workflow 的 push 分支、发布 guard 与过期提交检查。
 
+### 升级到双容器版本前必须重新接入
+
+服务器上的接收端 `/opt/bstocks-bot/ci/deploy_image.py` 由 `scripts/setup_cicd.py` 安装。本版本的发布请求包含 agent 镜像字段，**首次部署本版本之前**，须在本机重新运行：
+
+```bash
+python3 scripts/setup_cicd.py --ssh-host <host>
+```
+
+以安装新的接收端；否则旧接收端会拒绝新请求，部署安全失败并提示 “Invalid deployment request fields”，不会改动运行中的服务。此后普通应用更新不需要重复接入。首次部署后，还需在控制台配置中心上传 ChatGPT `auth.json` 并填写 Alpaca/FRED Key（见 README）。
+
 ## 保留内容与回滚边界
 
 - 不覆盖服务器 `.env`、`data/`、`logs/` 或旧源码目录；数据库采用 SQLite backup API 备份，文件权限 0600，备份目录位于 `backups/cicd-*`。
 - 原有容器的有效应用环境优先保留；新增配置可从服务器 `.env` 或页面填写。数据库配置仍优先于环境变量。
-- 新容器只挂载 data/logs，代码来自已经测试的镜像。不要再用旧目录的 `docker compose up --build` 或旧代码热更新脚本覆盖 CI 管理的生产容器。
+- 新容器只挂载 data/logs（agent 仅挂载 data/agent），代码来自已经测试的镜像。不要再用旧目录的 `docker compose up --build` 或旧代码热更新脚本覆盖 CI 管理的生产容器。
 - 切换失败时恢复旧容器，但**不会自动回灌数据库备份**，避免丢弃新版本已接收的用户写入。数据库迁移必须保持向后兼容；破坏性迁移不能直接走本流程。
-- 健康检查证明进程、版本、配置保留与持仓保留，不证明 FMP、模型或消息供应商实际可用，也不验证策略收益；不会通过测试接口向真实渠道发测试消息。
+- 健康检查证明进程、版本、配置保留与持仓保留，不证明 ChatGPT 登录、Alpaca/FRED、模型或消息供应商实际可用，也不验证策略收益；不会通过测试接口向真实渠道发测试消息。
 - 若新版本已健康、仅后续清理失败，流水线失败并明确说明，不会因此把健康应用回滚。待清理容器的名称和镜像身份会持久化，下次发布按身份核对后重试，不会永久遗留占用旧镜像的回滚容器。
 
 ## 旧镜像清理范围

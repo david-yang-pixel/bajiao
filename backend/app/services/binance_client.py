@@ -296,6 +296,33 @@ class BinanceClient:
             logger.warning('转换成本链路暂不可完整核对 (%s)', symbol)
             return None
 
+    async def _public_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(f"{self.rest_base_url}{path}", params=params or {})
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _apikey_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(f"{self.rest_base_url}{path}", params=params or {},
+                                    headers={"X-MBX-APIKEY": self.api_key})
+            resp.raise_for_status()
+            return resp.json()
+
+    async def get_tokenized_assets(self) -> List[Dict[str, Any]]:
+        """Raw tokenized-stock list (assetCode, underlyingEquitySymbol, multiplier); needs API key, unsigned."""
+        if not self.api_key:
+            raise ValueError("读取代币清单需要币安 API Key")
+        data = await self._apikey_get("/sapi/v1/equity/market/tokenized-assets")
+        if isinstance(data, dict):
+            data = data.get("data", data.get("assets", []))
+        return data if isinstance(data, list) else []
+
+    async def get_spot_symbols(self) -> Dict[str, str]:
+        """{symbol: status} from public spot exchangeInfo."""
+        data = await self._public_get("/api/v3/exchangeInfo")
+        return {s["symbol"]: s.get("status", "") for s in data.get("symbols", []) if "symbol" in s}
+
     async def get_klines(
         self,
         symbol: str,
